@@ -8,6 +8,9 @@ repository = "https://github.com/sirlucjan/cargo-lbin"
 license = "MIT OR Apache-2.0"
 rust-version = "1.91"
 categories = ["command-line-utilities"]
+exclude = [
+    "packages/",
+]
 
 [dependencies]
 anyhow = "1"
