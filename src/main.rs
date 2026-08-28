@@ -9,12 +9,12 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use lock::{Mode, StateLock};
 use manifest::{Entry, Manifest};
-use validate::validate_name;
 use semver::Version;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use validate::validate_name;
 
 /// Exit codes for `checkupdate`, following the pacman-contrib
 /// `checkupdates` convention: 0 = updates available, 2 = none, 1 = error.
@@ -91,9 +91,7 @@ fn main() -> ExitCode {
         && std::env::var_os("CARGO_LBIN_ALLOW_ROOT").is_none_or(|v| v != "1")
     {
         eprintln!("error: cargo-lbin must not be run as root");
-        eprintln!(
-            "run it as your normal user; sudo is requested only when required for placement"
-        );
+        eprintln!("run it as your normal user; sudo is requested only when required for placement");
         eprintln!("(set CARGO_LBIN_ALLOW_ROOT=1 only in environments where root is the only user)");
         return ExitCode::from(EXIT_ERROR);
     }
@@ -126,10 +124,7 @@ fn cache_dir() -> Result<PathBuf> {
 /// (foo only) would strand `fooctl` on disk with the manifest already
 /// having forgotten it.
 fn obsolete_bins(old: &[String], new: &[String]) -> Vec<String> {
-    old.iter()
-        .filter(|b| !new.contains(b))
-        .cloned()
-        .collect()
+    old.iter().filter(|b| !new.contains(b)).cloned().collect()
 }
 
 /// Binaries the new build introduces that the old entry did not provide —
@@ -641,7 +636,10 @@ mod tests {
         let err = check_collisions(&manifest, "intruder", &["shared".to_owned()], &dir)
             .unwrap_err()
             .to_string();
-        assert!(err.contains("owner"), "error should name the owning crate: {err}");
+        assert!(
+            err.contains("owner"),
+            "error should name the owning crate: {err}"
+        );
         // Unmanaged file on disk: error.
         std::fs::write(dir.join("stray"), b"").unwrap();
         assert!(check_collisions(&manifest, "newcrate", &["stray".to_owned()], &dir).is_err());

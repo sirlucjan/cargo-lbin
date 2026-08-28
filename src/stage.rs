@@ -52,8 +52,7 @@ pub fn build(name: &str, locked: bool, stage: &Path) -> Result<Built> {
 /// Read what the stage actually contains for `name` from `.crates2.json`.
 fn staged_info(name: &str, stage: &Path) -> Result<Built> {
     let path = stage.join(".crates2.json");
-    let raw = fs::read_to_string(&path)
-        .with_context(|| format!("reading {}", path.display()))?;
+    let raw = fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
     let parsed: Crates2 =
         serde_json::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?;
 
@@ -117,7 +116,10 @@ mod tests {
         let built = staged_info("hexyl", &dir).unwrap();
         assert_eq!(built.version, Version::parse("0.14.0").unwrap());
         assert_eq!(built.bins, vec!["hexyl"]);
-        assert!(staged_info("other", &dir).is_err(), "git source must not match");
+        assert!(
+            staged_info("other", &dir).is_err(),
+            "git source must not match"
+        );
         assert!(staged_info("absent", &dir).is_err());
 
         // Forged bookkeeping with duplicate bins must fail here, before

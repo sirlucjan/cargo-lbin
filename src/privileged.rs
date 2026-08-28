@@ -320,7 +320,9 @@ impl SealedSource {
 /// invocation per file: with a `/proc` fd path, `install -t` would name the
 /// destination after the fd number, so the destination is always explicit.
 fn install_from_proc(policy: Escalation, proc_path: &Path, dest: &Path, mode: &str) -> Result<()> {
-    let parent = dest.parent().context("destination has no parent directory")?;
+    let parent = dest
+        .parent()
+        .context("destination has no parent directory")?;
     let escalate = policy.escalate_for(parent)?;
     let mode_flag = format!("-Dm{mode}");
     run(
@@ -366,10 +368,19 @@ fn install_atomic(policy: Escalation, proc_path: &Path, dest: &Path, mode: &str)
     let moved = run(
         escalate,
         MV,
-        &["-fT".as_ref(), "--".as_ref(), tmp.as_os_str(), dest.as_os_str()],
+        &[
+            "-fT".as_ref(),
+            "--".as_ref(),
+            tmp.as_os_str(),
+            dest.as_os_str(),
+        ],
     );
     if moved.is_err() {
-        let _ = run(escalate, RM, &["-f".as_ref(), "--".as_ref(), tmp.as_os_str()]);
+        let _ = run(
+            escalate,
+            RM,
+            &["-f".as_ref(), "--".as_ref(), tmp.as_os_str()],
+        );
     }
     moved
 }
@@ -381,7 +392,12 @@ fn install_atomic(policy: Escalation, proc_path: &Path, dest: &Path, mode: &str)
 /// manifest. `install_atomic` installs into a temp in the same directory
 /// and `mv -fT`s it into place, a same-filesystem `rename(2)`: crash before
 /// the rename leaves the old manifest whole, crash after leaves the new one.
-pub fn install_sealed(policy: Escalation, src: &SealedSource, dest: &Path, mode: &str) -> Result<()> {
+pub fn install_sealed(
+    policy: Escalation,
+    src: &SealedSource,
+    dest: &Path,
+    mode: &str,
+) -> Result<()> {
     install_atomic(policy, &src.proc_path(), dest, mode)
 }
 
@@ -403,9 +419,7 @@ pub fn remove_files(policy: Escalation, paths: &[&Path]) -> Result<()> {
 /// flock on the old inode and one locking the new file would both "hold
 /// the lock" while excluding nobody.
 pub fn ensure_lock_file(policy: Escalation, path: &Path) -> Result<()> {
-    let parent = path
-        .parent()
-        .context("lock path has no parent directory")?;
+    let parent = path.parent().context("lock path has no parent directory")?;
     let escalate = policy.escalate_for(parent)?;
     run(escalate, MKDIR, &["-p".as_ref(), parent.as_os_str()])?;
     run(escalate, TOUCH, &[path.as_os_str()])?;
@@ -569,7 +583,10 @@ mod tests {
         let dir_mode = fs::metadata(&state).unwrap().permissions().mode() & 0o777;
         let lock_mode = fs::metadata(&lock).unwrap().permissions().mode() & 0o777;
         assert_eq!(dir_mode, 0o755, "state dir must be world-traversable");
-        assert_eq!(lock_mode, 0o644, "lock must be world-readable for shared flock");
+        assert_eq!(
+            lock_mode, 0o644,
+            "lock must be world-readable for shared flock"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 

@@ -68,8 +68,9 @@ impl Manifest {
                     bail!("binary `{bin}` is owned by both `{prev}` and `{name}`");
                 }
             }
-            semver::Version::parse(&entry.version)
-                .with_context(|| format!("crate `{name}` has invalid version `{}`", entry.version))?;
+            semver::Version::parse(&entry.version).with_context(|| {
+                format!("crate `{name}` has invalid version `{}`", entry.version)
+            })?;
         }
         Ok(())
     }
@@ -83,7 +84,8 @@ impl Manifest {
         // Symmetry with load(): cargo-lbin never knowingly writes state it would
         // later refuse to read back. Upstream checks should make this
         // unreachable; it exists as the last line of defense.
-        self.validate().context("refusing to store invalid manifest")?;
+        self.validate()
+            .context("refusing to store invalid manifest")?;
         let mut raw = serde_json::to_string_pretty(self)?;
         raw.push('\n');
         let sealed = privileged::SealedSource::from_bytes(raw.as_bytes())?;
