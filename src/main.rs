@@ -577,8 +577,8 @@ mod tests {
         let old = vec!["foo".to_owned(), "fooctl".to_owned()];
         let new = vec!["foo".to_owned()];
         assert_eq!(obsolete_bins(&old, &new), vec!["fooctl".to_owned()]);
-        assert!(obsolete_bins(&new, &old).is_empty());
-        assert!(obsolete_bins(&old, &old).is_empty());
+        assert_eq!(obsolete_bins(&new, &old), [] as [String; 0]);
+        assert_eq!(obsolete_bins(&old, &old), [] as [String; 0]);
     }
 
     #[test]
@@ -590,7 +590,7 @@ mod tests {
         assert_eq!(newly_introduced_bins(&[], &new), new);
         // Pure version bump: nothing is new, rollback removes nothing —
         // the overwritten binaries stay, recoverable via the manifest.
-        assert!(newly_introduced_bins(&new, &new).is_empty());
+        assert_eq!(newly_introduced_bins(&new, &new), [] as [String; 0]);
     }
 
     #[test]
@@ -611,7 +611,7 @@ mod tests {
         // `foo` is pre-owned: overwriting it is recoverable, never rolled
         // back — the manifest still claims the name.
         set.note_placed("foo", bin_dir.join("foo"));
-        assert!(set.placed.is_empty());
+        assert_eq!(set.placed, [] as [PathBuf; 0]);
         // `fooctl` is new and was placed: rollback state until the commit.
         set.note_placed("fooctl", bin_dir.join("fooctl"));
         assert_eq!(set.placed, vec![bin_dir.join("fooctl")]);
@@ -622,7 +622,7 @@ mod tests {
         // Unknown crate: a fresh install marks every name as new.
         let fresh = RollbackSet::snapshot(&Manifest::default(), "bar", &new_bins);
         assert_eq!(fresh.new_names, new_bins);
-        assert!(fresh.placed.is_empty());
+        assert_eq!(fresh.placed, [] as [PathBuf; 0]);
     }
 
     #[test]
