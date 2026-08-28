@@ -1,6 +1,6 @@
 [package]
 name = "cargo-lbin"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 authors = ["Piotr Gorski <piotrgorski@cachyos.org>"]
 description = "Thin cargo-install wrapper targeting /usr/local/bin, crates.io only"
