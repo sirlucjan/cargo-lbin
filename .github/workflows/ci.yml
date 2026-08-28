@@ -15,17 +15,6 @@ jobs:
   pre_ci:
     uses: dtolnay/.github/.github/workflows/pre_ci.yml@master
 
-  build_and_test:
-    name: Rust project - latest
-    needs: pre_ci
-    if: needs.pre_ci.outputs.continue
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-      - run: rustup update stable && rustup default stable
-      - run: cargo build --verbose
-      - run: cargo test --verbose
-
   test:
     name: Rust ${{matrix.rust}}
     needs: pre_ci
@@ -45,10 +34,24 @@ jobs:
       - run: cargo test --verbose
 
   clippy:
-    name: Clippy
+    name: Clippy (MSRV, deny)
     runs-on: ubuntu-latest
     if: github.event_name != 'pull_request'
     timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.91.0
+          components: clippy
+      - run: cargo clippy --tests -- -Dclippy::all -Dclippy::pedantic
+
+  clippy_beta:
+    name: Clippy (beta, advisory)
+    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request'
+    timeout-minutes: 45
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@beta
@@ -58,6 +61,7 @@ jobs:
 
   format:
     name: rustfmt
+    needs: pre_ci
     if: needs.pre_ci.outputs.continue
     runs-on: ubuntu-latest
     timeout-minutes: 45
