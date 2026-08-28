@@ -62,7 +62,16 @@ impl StateLock {
             (Ok(f), _) => f,
             (Err(_), Mode::Exclusive) => {
                 // Mutations must not proceed unsynchronized: prepare the
-                // lock file with escalation, then it must open.
+                // lock file with escalation, then it must open. Announce
+                // what is about to happen — this is the one code path that
+                // can put a sudo prompt on the screen before any other
+                // output, and a bare password prompt with no context looks
+                // exactly like what this tool exists to prevent.
+                eprintln!(
+                    "initializing state for {}: creating {}",
+                    prefix.display(),
+                    path.display()
+                );
                 privileged::ensure_lock_file(privileged::Escalation::for_prefix(prefix), &path)
                     .with_context(|| format!("preparing state lock {}", path.display()))?;
                 OpenOptions::new()

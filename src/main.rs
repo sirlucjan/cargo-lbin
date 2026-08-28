@@ -34,7 +34,18 @@ crates.io exclusively."
 )]
 struct Cli {
     /// Installation prefix; binaries land in <prefix>/bin
-    #[arg(long, global = true, default_value = "/usr/local")]
+    // Precedence: explicit --prefix, then $CARGO_LBIN_PREFIX, then
+    // /usr/local — clap's env support handles the ordering and appends
+    // the [env: ...] and [default: ...] annotations to --help on its
+    // own. The point: a user who never wants sudo exports
+    // CARGO_LBIN_PREFIX=~/.local once (expanded by the shell) and stops
+    // typing --prefix on every command.
+    #[arg(
+        long,
+        global = true,
+        env = "CARGO_LBIN_PREFIX",
+        default_value = "/usr/local"
+    )]
     prefix: PathBuf,
 
     #[command(subcommand)]
