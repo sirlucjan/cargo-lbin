@@ -27,7 +27,7 @@
 //!    its program, after all — but it cannot use cargo-lbin as a confused deputy
 //!    to exfiltrate root-only files.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
 use std::os::fd::AsRawFd;

@@ -6,7 +6,7 @@
 //! rename), so the write path is identical with and without privilege
 //! escalation.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;

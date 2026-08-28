@@ -5,7 +5,7 @@ mod privileged;
 mod stage;
 mod validate;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use lock::{Mode, StateLock};
 use manifest::{Entry, Manifest};

@@ -6,7 +6,7 @@
 //! identifier (and a safe path component), and a bin name is exactly one
 //! plain filename, never a path.
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use std::ffi::OsStr;
 use std::path::{Component, Path};
 

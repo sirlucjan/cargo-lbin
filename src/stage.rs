@@ -5,7 +5,7 @@
 //! `.crates2.json` is then the source of truth for what was actually built —
 //! version and binary names — regardless of what the index promised earlier.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use semver::Version;
 use serde::Deserialize;
 use std::collections::BTreeMap;

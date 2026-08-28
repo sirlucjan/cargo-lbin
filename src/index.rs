@@ -4,7 +4,7 @@
 //! per published version. No authentication, no API key. crates.io asks for a
 //! meaningful User-Agent, which we provide.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use semver::Version;
 use serde::Deserialize;
 
