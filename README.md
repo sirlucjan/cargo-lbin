@@ -100,19 +100,22 @@ some-tool 1.2.3 -> 1.3.0
 | `1` | an error occurred |
 | `2` | everything is up to date |
 
-Update all managed crates with available updates:
+Update specific crates, or every managed crate with `--all`:
 
 ```bash
-cargo lbin update
+cargo lbin update hexyl some-tool
+cargo lbin update --all
 ```
 
-Skip the confirmation prompt:
+A bare `cargo lbin update` is a usage error: the command always states what it is asked to touch. The planned changes are printed and confirmed before anything is built. Skip the confirmation prompt:
 
 ```bash
-cargo lbin update --yes
+cargo lbin update --all --yes
 # or
-cargo lbin update -y
+cargo lbin update --all -y
 ```
+
+Each crate is updated as an independent unit. If one build or placement fails, it is rolled back and reported, and the remaining crates are still processed. Successful updates are never undone because a later one failed. The command exits non-zero whenever fewer updates were applied than were confirmed — whether a build failed or a crate was skipped because the manifest changed between confirmation and execution — with a summary naming each.
 
 Remove one or more crates:
 

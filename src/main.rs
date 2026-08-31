@@ -10,6 +10,7 @@ use clap::{Parser, Subcommand};
 use lock::{Mode, StateLock};
 use manifest::{Entry, Manifest};
 use semver::Version;
+use std::collections::BTreeSet;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -73,8 +74,19 @@ enum Cmd {
     /// Check crates.io for newer versions (read-only, no sudo).
     /// Exit codes: 0 updates available, 2 none, 1 error
     Checkupdate,
-    /// Install all available updates
+    /// Update installed crates to their newest crates.io versions
+    // Either an explicit list of crates or `--all`, never neither: a bare
+    // `update` has no obvious meaning once single-crate updates exist, and
+    // "obvious" is exactly what an operation that rebuilds and replaces
+    // system binaries must not be guessed at. Cargo-lbin does what it is
+    // told, and `--all` is the user telling it.
     Update {
+        /// Crates to update (use --all for every installed crate)
+        #[arg(required_unless_present = "all", conflicts_with = "all")]
+        crates: Vec<String>,
+        /// Update every installed crate that has a newer version
+        #[arg(long)]
+        all: bool,
         /// Skip the confirmation prompt
         #[arg(long, short)]
         yes: bool,
@@ -111,7 +123,11 @@ fn main() -> ExitCode {
         Cmd::Remove { ref crates } => cmd_remove(&cli.prefix, crates),
         Cmd::List => cmd_list(&cli.prefix),
         Cmd::Checkupdate => return cmd_checkupdate(&cli.prefix),
-        Cmd::Update { yes } => cmd_update(&cli.prefix, yes),
+        Cmd::Update {
+            ref crates,
+            all,
+            yes,
+        } => cmd_update(&cli.prefix, crates, all, yes),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -379,15 +395,16 @@ fn place_and_commit(
     }
 
     let bins_list = built.bins.join(", ");
-    manifest.crates.insert(
-        name.to_owned(),
+    commit_entry(
+        manifest,
+        prefix,
+        name,
         Entry {
             version: built.version.to_string(),
             bins: built.bins,
             locked,
         },
-    );
-    manifest.store(prefix)?;
+    )?;
     // Announced only after the manifest commit: with a rollback path in
     // play, an "installed" printed before `store` could be followed by that
     // very installation being undone.
@@ -396,6 +413,27 @@ fn place_and_commit(
         built.version,
         bin_dir.display(),
     );
+    Ok(())
+}
+
+/// Insert `entry` and persist the manifest as one unit: on a failed store the
+/// in-memory manifest is restored to what is on disk.
+///
+/// This invariant — the in-memory manifest always mirrors the last successful
+/// commit — is what makes continuing a batch after a failure sound. Without
+/// it, a store failure for crate A would leave A's new entry in memory, and
+/// the next successful commit (for crate B) would persist A's entry for
+/// binaries that were rolled back or never fully placed.
+fn commit_entry(manifest: &mut Manifest, prefix: &Path, name: &str, entry: Entry) -> Result<()> {
+    let previous = manifest.crates.insert(name.to_owned(), entry);
+    if let Err(err) = manifest.store(prefix) {
+        if let Some(old) = previous {
+            manifest.crates.insert(name.to_owned(), old);
+        } else {
+            manifest.crates.remove(name);
+        }
+        return Err(err);
+    }
     Ok(())
 }
 
@@ -462,11 +500,28 @@ struct Outdated {
     latest: Version,
 }
 
-/// Query the index for every manifest entry; network errors abort rather
-/// than silently under-reporting.
-fn find_outdated(manifest: &Manifest) -> Result<Vec<Outdated>> {
+/// Resolve an explicit crate selection against the manifest. Every name must
+/// be installed; all unknown names are reported in one error so the user
+/// fixes the command once, not once per typo. Duplicates collapse.
+fn select_targets(manifest: &Manifest, crates: &[String]) -> Result<BTreeSet<String>> {
+    let unknown: Vec<&str> = crates
+        .iter()
+        .filter(|n| !manifest.crates.contains_key(n.as_str()))
+        .map(String::as_str)
+        .collect();
+    if !unknown.is_empty() {
+        bail!("not installed: {}", unknown.join(", "));
+    }
+    Ok(crates.iter().cloned().collect())
+}
+
+/// Query the index for the given manifest entries; network errors abort
+/// rather than silently under-reporting.
+fn find_outdated<'a>(
+    entries: impl IntoIterator<Item = (&'a String, &'a Entry)>,
+) -> Result<Vec<Outdated>> {
     let mut outdated = Vec::new();
-    for (name, entry) in &manifest.crates {
+    for (name, entry) in entries {
         let current = Version::parse(&entry.version)
             .with_context(|| format!("manifest holds unparsable version for `{name}`"))?;
         let versions = index::published_versions(name)?;
@@ -492,7 +547,7 @@ fn cmd_checkupdate(prefix: &Path) -> ExitCode {
             let _lock = StateLock::acquire(prefix, &Mode::Shared)?;
             Manifest::load(prefix)?
         };
-        find_outdated(&manifest)
+        find_outdated(&manifest.crates)
     })();
     match outcome {
         Ok(outdated) if outdated.is_empty() => ExitCode::from(EXIT_NO_UPDATES),
@@ -517,24 +572,51 @@ fn confirm(prompt: &str) -> Result<bool> {
     Ok(matches!(answer.trim(), "y" | "Y" | "yes"))
 }
 
-fn cmd_update(prefix: &Path, yes: bool) -> Result<()> {
+fn cmd_update(prefix: &Path, crates: &[String], all: bool, yes: bool) -> Result<()> {
+    for name in crates {
+        validate_name(name)?;
+    }
     let cache = cache_dir()?;
     // Phase 1: read-only snapshot under a shared lock, released before any
     // network-independent interaction. The confirmation prompt must not
     // hold any lock: an unanswered "proceed?" abandoned for a coffee break
     // would otherwise block every reader and writer on the prefix.
-    let outdated = {
-        // Shared lock only for the snapshot; network runs unlocked. Phase 2
-        // reloads and re-verifies anyway, so state changing during the
-        // unlocked window is already handled.
-        let manifest = {
-            let _lock = StateLock::acquire(prefix, &Mode::Shared)?;
-            Manifest::load(prefix)?
-        };
-        find_outdated(&manifest)?
+    //
+    // Shared lock only for the snapshot; network runs unlocked. Phase 2
+    // reloads and re-verifies anyway, so state changing during the
+    // unlocked window is already handled.
+    let snapshot = {
+        let _lock = StateLock::acquire(prefix, &Mode::Shared)?;
+        Manifest::load(prefix)?
     };
+    // Selection is validated against the snapshot before any network
+    // traffic: a typo in a crate name must fail in milliseconds.
+    let targets: BTreeSet<String> = if all {
+        snapshot.crates.keys().cloned().collect()
+    } else {
+        select_targets(&snapshot, crates)?
+    };
+    let outdated = find_outdated(
+        snapshot
+            .crates
+            .iter()
+            .filter(|(name, _)| targets.contains(name.as_str())),
+    )?;
+    // Explicitly named crates that need nothing get a line each: the user
+    // asked about them by name and should not have to infer "up to date"
+    // from silence.
+    if !all {
+        for name in &targets {
+            if !outdated.iter().any(|o| &o.name == name) {
+                let version = snapshot.crates[name].version.as_str();
+                println!("{name} {version} is up to date");
+            }
+        }
+    }
     if outdated.is_empty() {
-        println!("everything is up to date");
+        if all {
+            println!("everything is up to date");
+        }
         return Ok(());
     }
     for o in &outdated {
@@ -550,20 +632,59 @@ fn cmd_update(prefix: &Path, yes: bool) -> Result<()> {
     // rather than acted on blindly.
     let _lock = StateLock::acquire(prefix, &Mode::Exclusive)?;
     let mut manifest = Manifest::load(prefix)?;
-    for o in &outdated {
+    // Each crate is its own unit of work: a failed build or placement is
+    // reported, rolled back by `install_and_commit`, and the batch moves on.
+    // The crates are independent (cargo install tracks no relation between
+    // them), so aborting the rest on one failure would only leave more
+    // binaries stale than necessary — while undoing successful ones would
+    // throw away good work for no consistency gain.
+    let total = outdated.len();
+    let mut updated = 0usize;
+    let mut skipped: Vec<&str> = Vec::new();
+    let mut failed: Vec<&str> = Vec::new();
+    for (i, o) in outdated.iter().enumerate() {
+        println!("[{}/{total}] {}", i + 1, o.name);
         match manifest.crates.get(&o.name) {
             Some(entry) if entry.version == o.current.to_string() => {
                 let locked = entry.locked;
                 // The stage may end up building something newer than
                 // `latest` if a release lands mid-update; the manifest
                 // records what was built.
-                install_and_commit(prefix, &cache, &mut manifest, &o.name, locked)?;
+                match install_and_commit(prefix, &cache, &mut manifest, &o.name, locked) {
+                    Ok(()) => updated += 1,
+                    Err(err) => {
+                        eprintln!("error: updating `{}` failed: {err:#}", o.name);
+                        failed.push(&o.name);
+                    }
+                }
             }
-            _ => eprintln!(
-                "skipping `{}`: state changed since the update was confirmed",
-                o.name
-            ),
+            _ => {
+                eprintln!(
+                    "skipping `{}`: state changed since the update was confirmed",
+                    o.name
+                );
+                skipped.push(&o.name);
+            }
         }
+    }
+    println!("updated {updated} of {total}");
+    // The command was asked for `total` updates; anything short of that is
+    // an incomplete execution and exits non-zero, whether the shortfall was
+    // a failed build or a crate the reload no longer recognized. The user
+    // reads the exit code, not the reason, and "not done" is the fact.
+    let mut shortfall = Vec::new();
+    if !failed.is_empty() {
+        shortfall.push(format!("failed: {}", failed.join(", ")));
+    }
+    if !skipped.is_empty() {
+        shortfall.push(format!("skipped: {}", skipped.join(", ")));
+    }
+    if !shortfall.is_empty() {
+        bail!(
+            "{} of {total} updates not applied ({})",
+            total - updated,
+            shortfall.join("; ")
+        );
     }
     Ok(())
 }
@@ -571,6 +692,83 @@ fn cmd_update(prefix: &Path, yes: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn manifest_with(names: &[&str]) -> Manifest {
+        let mut m = Manifest::default();
+        for n in names {
+            m.crates.insert(
+                (*n).to_owned(),
+                Entry {
+                    version: "1.0.0".to_owned(),
+                    bins: vec![(*n).to_owned()],
+                    locked: false,
+                },
+            );
+        }
+        m
+    }
+
+    #[test]
+    fn cli_shape_is_verified() {
+        use clap::CommandFactory;
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn update_requires_explicit_selection() {
+        // A bare `update` is a usage error, not "update everything".
+        assert!(Cli::try_parse_from(["cargo-lbin", "update"]).is_err());
+        // Names and --all are mutually exclusive.
+        assert!(Cli::try_parse_from(["cargo-lbin", "update", "--all", "foo"]).is_err());
+        assert!(Cli::try_parse_from(["cargo-lbin", "update", "--all"]).is_ok());
+        assert!(Cli::try_parse_from(["cargo-lbin", "update", "foo", "bar", "-y"]).is_ok());
+        // The cargo-subcommand form strips "lbin" in main(); the parser
+        // itself must not accept it.
+        assert!(Cli::try_parse_from(["cargo-lbin", "lbin", "update", "--all"]).is_err());
+    }
+
+    #[test]
+    fn select_targets_reports_all_unknown_names_at_once() {
+        let m = manifest_with(&["foo", "bar"]);
+        let err = select_targets(&m, &["foo".into(), "nope".into(), "nada".into()])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("nope") && err.contains("nada"), "{err}");
+        assert!(!err.contains("foo"), "{err}");
+    }
+
+    #[test]
+    fn select_targets_collapses_duplicates() {
+        let m = manifest_with(&["foo", "bar"]);
+        let targets = select_targets(&m, &["bar".into(), "foo".into(), "bar".into()]).unwrap();
+        assert_eq!(targets.into_iter().collect::<Vec<_>>(), ["bar", "foo"]);
+    }
+
+    #[test]
+    fn commit_entry_restores_memory_on_store_failure() {
+        let tmp = std::env::temp_dir().join("cargo-lbin-test-commit-entry");
+        let _ = std::fs::remove_dir_all(&tmp);
+        let prefix = tmp.join("prefix");
+        // A regular file where the manifest directory should be makes the
+        // store fail after the in-memory insert.
+        std::fs::create_dir_all(prefix.join("share")).unwrap();
+        std::fs::write(prefix.join("share/cargo-lbin"), b"").unwrap();
+
+        let entry = |v: &str| Entry {
+            version: v.to_owned(),
+            bins: vec!["foo".to_owned()],
+            locked: false,
+        };
+        // Update of an existing crate: the old entry must come back.
+        let mut m = manifest_with(&["foo"]);
+        assert!(commit_entry(&mut m, &prefix, "foo", entry("2.0.0")).is_err());
+        assert_eq!(m.crates["foo"].version, "1.0.0");
+        // Fresh install: the name must disappear again.
+        let mut m = Manifest::default();
+        assert!(commit_entry(&mut m, &prefix, "foo", entry("2.0.0")).is_err());
+        assert!(m.crates.is_empty());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 
     #[test]
     fn obsolete_is_old_minus_new() {
