@@ -2,6 +2,7 @@ mod index;
 mod lock;
 mod manifest;
 mod privileged;
+mod report;
 mod stage;
 mod validate;
 
@@ -9,6 +10,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use lock::{Mode, StateLock};
 use manifest::{Entry, Manifest};
+use report::{Checked, Report, Status};
 use semver::Version;
 use std::collections::BTreeSet;
 use std::fs;
@@ -483,21 +485,42 @@ fn cmd_list(prefix: &Path) -> Result<()> {
         println!("no crates installed under {}", prefix.display());
         return Ok(());
     }
+    // Purely local: the last `checkupdate` result, if any. An unreadable
+    // report is a warning — the listing itself does not depend on it.
+    let report = match cache_dir().and_then(|cache| Report::load(&cache, prefix)) {
+        Ok(report) => report,
+        Err(e) => {
+            eprintln!("warning: {e:#}");
+            None
+        }
+    };
     for (name, entry) in &manifest.crates {
         let locked = if entry.locked { " [locked]" } else { "" };
+        // Three states, and the last must stay silent rather than
+        // masquerade as either of the others: a newer version known, known
+        // current, or not covered by the last check (installed or updated
+        // since) — for which nothing is printed, because nothing is known.
+        let status = Version::parse(&entry.version)
+            .ok()
+            .and_then(|current| report.as_ref()?.status_for(name, &current))
+            .map(|status| match status {
+                Status::Outdated(latest) => format!(" -> {latest}"),
+                Status::UpToDate => " (up to date)".to_owned(),
+            })
+            .unwrap_or_default();
         println!(
-            "{name} {}{locked} ({})",
+            "{name} {}{locked} ({}){status}",
             entry.version,
             entry.bins.join(", ")
         );
     }
+    // Status goes to stderr: it is for the person reading the terminal,
+    // not for whatever may be parsing stdout.
+    match report {
+        Some(r) => eprintln!("update check: {}", report::describe_age(r.age())),
+        None => eprintln!("no update check recorded; run `cargo lbin checkupdate`"),
+    }
     Ok(())
-}
-
-struct Outdated {
-    name: String,
-    current: Version,
-    latest: Version,
 }
 
 /// Resolve an explicit crate selection against the manifest. Every name must
@@ -515,28 +538,29 @@ fn select_targets(manifest: &Manifest, crates: &[String]) -> Result<BTreeSet<Str
     Ok(crates.iter().cloned().collect())
 }
 
-/// Query the index for the given manifest entries; network errors abort
-/// rather than silently under-reporting.
-fn find_outdated<'a>(
+/// Query the index for the given manifest entries and record the answer
+/// for every one of them, current or not; network errors abort rather than
+/// silently under-reporting. A crate the index offers nothing relevant for
+/// (a stable install with only pre-releases published) counts as current:
+/// there is nothing `update` would do for it.
+fn check_versions<'a>(
     entries: impl IntoIterator<Item = (&'a String, &'a Entry)>,
-) -> Result<Vec<Outdated>> {
-    let mut outdated = Vec::new();
+) -> Result<Vec<Checked>> {
+    let mut checked = Vec::new();
     for (name, entry) in entries {
         let current = Version::parse(&entry.version)
             .with_context(|| format!("manifest holds unparsable version for `{name}`"))?;
         let versions = index::published_versions(name)?;
-        let Some(latest) = index::latest_relevant(&versions, &current) else {
-            continue;
-        };
-        if latest > current {
-            outdated.push(Outdated {
-                name: name.clone(),
-                current,
-                latest,
-            });
-        }
+        let latest = index::latest_relevant(&versions, &current)
+            .filter(|latest| *latest > current)
+            .unwrap_or_else(|| current.clone());
+        checked.push(Checked {
+            name: name.clone(),
+            current,
+            latest,
+        });
     }
-    Ok(outdated)
+    Ok(checked)
 }
 
 fn cmd_checkupdate(prefix: &Path) -> ExitCode {
@@ -547,15 +571,29 @@ fn cmd_checkupdate(prefix: &Path) -> ExitCode {
             let _lock = StateLock::acquire(prefix, &Mode::Shared)?;
             Manifest::load(prefix)?
         };
-        find_outdated(&manifest.crates)
+        check_versions(&manifest.crates)
     })();
     match outcome {
-        Ok(outdated) if outdated.is_empty() => ExitCode::from(EXIT_NO_UPDATES),
-        Ok(outdated) => {
-            for o in &outdated {
-                println!("{} {} -> {}", o.name, o.current, o.latest);
+        Ok(checked) => {
+            // Persist the full snapshot for `list` (and any later reader)
+            // before reporting. A failed write is a warning: the check
+            // itself succeeded and its exit code must say so.
+            let stored = Report::new(prefix, checked.clone())
+                .and_then(|report| cache_dir().map(|cache| (report, cache)))
+                .and_then(|(report, cache)| report.store(&cache));
+            if let Err(e) = stored {
+                eprintln!("warning: could not save update report: {e:#}");
             }
-            ExitCode::from(EXIT_UPDATES)
+            let mut any = false;
+            for o in checked.iter().filter(|c| c.is_outdated()) {
+                println!("{} {} -> {}", o.name, o.current, o.latest);
+                any = true;
+            }
+            if any {
+                ExitCode::from(EXIT_UPDATES)
+            } else {
+                ExitCode::from(EXIT_NO_UPDATES)
+            }
         }
         Err(e) => {
             eprintln!("error: {e:#}");
@@ -596,12 +634,15 @@ fn cmd_update(prefix: &Path, crates: &[String], all: bool, yes: bool) -> Result<
     } else {
         select_targets(&snapshot, crates)?
     };
-    let outdated = find_outdated(
+    let outdated: Vec<Checked> = check_versions(
         snapshot
             .crates
             .iter()
             .filter(|(name, _)| targets.contains(name.as_str())),
-    )?;
+    )?
+    .into_iter()
+    .filter(Checked::is_outdated)
+    .collect();
     // Explicitly named crates that need nothing get a line each: the user
     // asked about them by name and should not have to infer "up to date"
     // from silence.

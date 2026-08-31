@@ -75,9 +75,13 @@ cargo lbin list
 Example:
 
 ```text
-hexyl 0.14.0 (hexyl)
+hexyl 0.14.0 (hexyl) -> 0.16.0
+ripgrep 14.1.1 (rg) (up to date)
 some-tool 1.2.3 [locked] (some-tool, some-toolctl)
+update check: 3h ago
 ```
+
+`list` never touches the network. The `-> 0.16.0` and `(up to date)` annotations and the age line come from the most recent `checkupdate` (see below); the age line is printed to stderr so stdout stays parseable. A crate with no annotation was not covered by that check — installed or updated since — and nothing is claimed about it. Without a recorded check, `list` says so and shows versions only.
 
 Check crates.io for updates without changing anything:
 
@@ -156,6 +160,8 @@ or, when `XDG_CACHE_HOME` is unset:
 ```
 
 Each process gets its own staging directory, so independent installs targeting different prefixes cannot wipe each other's builds.
+
+The result of the last `checkupdate` is kept in the same directory, under `checkupdate/`, one file per prefix. It records every crate the check covered — the version it was checked against and the newest version found — so a reader can tell "checked and current" from "not checked". `list` reads it to annotate crates and reports how old the check is. Nothing refreshes it except running `checkupdate` again; it is a plain cache and can be deleted at any time.
 
 ## Update behavior
 
