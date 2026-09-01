@@ -146,11 +146,7 @@ impl Report {
             .parent()
             .context("report path has no parent directory")?;
         fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-        let tmp = dir.join(format!(
-            ".{}.{}.tmp",
-            key(&self.prefix),
-            std::process::id()
-        ));
+        let tmp = dir.join(format!(".{}.{}.tmp", key(&self.prefix), std::process::id()));
         let mut raw = serde_json::to_string_pretty(self)?;
         raw.push('\n');
         fs::write(&tmp, raw).with_context(|| format!("writing {}", tmp.display()))?;
@@ -268,7 +264,9 @@ mod tests {
             .collect();
         assert!(leftovers.is_empty(), "{leftovers:?}");
 
-        let loaded = Report::load(&tmp, Path::new("/usr/local")).unwrap().unwrap();
+        let loaded = Report::load(&tmp, Path::new("/usr/local"))
+            .unwrap()
+            .unwrap();
         assert_eq!(loaded.crates, report.crates);
         assert_eq!(loaded.prefix, Path::new("/usr/local"));
         assert!(loaded.age() < Duration::from_secs(60));
@@ -304,7 +302,10 @@ mod tests {
             Some(Status::Outdated(&v("0.26.1")))
         );
         // Checked and current: a positive answer, not an absence.
-        assert_eq!(report.status_for("ripgrep", &v("14.1.1")), Some(Status::UpToDate));
+        assert_eq!(
+            report.status_for("ripgrep", &v("14.1.1")),
+            Some(Status::UpToDate)
+        );
         // Updated since the check: the report is stale for it — unknown.
         assert_eq!(report.status_for("bat", &v("0.26.1")), None);
         // Installed after the check: never covered — unknown.

@@ -588,11 +588,7 @@ fn release_label(release: &index::Release) -> String {
 /// refuse the crate outright (nothing non-yanked left), the verdict says
 /// so instead of claiming "up to date" — search must never assert
 /// something `checkupdate` would contradict.
-fn describe_search(
-    name: &str,
-    releases: &[index::Release],
-    installed: Option<&Entry>,
-) -> String {
+fn describe_search(name: &str, releases: &[index::Release], installed: Option<&Entry>) -> String {
     // Formatting into a String cannot fail; the `let _ =` discards the
     // Result the macros return for the general `fmt::Write` case.
     use std::fmt::Write as _;
@@ -625,11 +621,9 @@ fn describe_search(
         out.push_str(" (no non-yanked releases)\n");
         return out;
     }
-    let newer = Version::parse(&entry.version)
-        .ok()
-        .and_then(|current| {
-            index::latest_relevant(&live, &current).filter(|latest| *latest > current)
-        });
+    let newer = Version::parse(&entry.version).ok().and_then(|current| {
+        index::latest_relevant(&live, &current).filter(|latest| *latest > current)
+    });
     if let Some(latest) = newer {
         let _ = writeln!(out, " (update available: {latest})");
     } else {
@@ -944,7 +938,10 @@ mod tests {
         let releases = [rel("1.0.0", true)];
         let out = describe_search("foo", &releases, installed);
         assert!(out.contains("latest:      1.0.0 [yanked]"), "{out}");
-        assert!(out.contains("installed:   1.0.0 (no non-yanked releases)"), "{out}");
+        assert!(
+            out.contains("installed:   1.0.0 (no non-yanked releases)"),
+            "{out}"
+        );
     }
 
     #[test]
