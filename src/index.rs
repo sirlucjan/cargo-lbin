@@ -58,26 +58,35 @@ pub struct Release {
 }
 
 /// Fetch all published, non-yanked versions of `name` from the sparse index.
+/// An unknown crate is an error here: for `checkupdate` and `update`, a
+/// manifest entry the index has never heard of is a problem to report,
+/// not a state to describe.
 pub fn published_versions(name: &str) -> Result<Vec<Version>> {
-    non_yanked(name, releases(name)?)
+    let releases = releases(name)?.ok_or_else(|| not_found(name))?;
+    non_yanked(name, releases)
 }
 
-/// Fetch every release of `name`, yanked ones included.
-pub fn releases(name: &str) -> Result<Vec<Release>> {
+/// The error for a name the index does not know, shared so every caller
+/// says it the same way.
+pub fn not_found(name: &str) -> anyhow::Error {
+    anyhow::anyhow!("crate `{name}` not found on crates.io")
+}
+
+/// Fetch every release of `name`, yanked ones included. `Ok(None)` means
+/// the index has no such crate — an answer, distinct from a failed
+/// request — so a caller that asked by name can do something useful
+/// with "no", such as suggest what the user might have meant.
+pub fn releases(name: &str) -> Result<Option<Vec<Release>>> {
     let url = format!("{INDEX_BASE}/{}", index_path(name));
-    let response = ureq::get(&url)
-        .set("User-Agent", USER_AGENT)
-        .call()
-        .map_err(|e| match e {
-            ureq::Error::Status(404, _) => {
-                anyhow::anyhow!("crate `{name}` not found on crates.io")
-            }
-            other => anyhow::anyhow!("index request for `{name}` failed: {other}"),
-        })?;
+    let response = match ureq::get(&url).set("User-Agent", USER_AGENT).call() {
+        Ok(response) => response,
+        Err(ureq::Error::Status(404, _)) => return Ok(None),
+        Err(other) => bail!("index request for `{name}` failed: {other}"),
+    };
     let body = response
         .into_string()
         .with_context(|| format!("reading index response for `{name}`"))?;
-    parse_index_body(name, &body)
+    parse_index_body(name, &body).map(Some)
 }
 
 fn parse_index_body(name: &str, body: &str) -> Result<Vec<Release>> {

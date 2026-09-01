@@ -667,7 +667,7 @@ fn cmd_info(prefix: &Path, crates: &[String]) -> Result<()> {
     let mut shown = 0usize;
     for name in &names {
         match index::releases(name) {
-            Ok(releases) => {
+            Ok(Some(releases)) => {
                 if shown > 0 {
                     println!();
                 }
@@ -677,6 +677,7 @@ fn cmd_info(prefix: &Path, crates: &[String]) -> Result<()> {
                 );
                 shown += 1;
             }
+            Ok(None) => failures.push(index::not_found(name)),
             Err(e) => failures.push(e),
         }
     }

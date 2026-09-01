@@ -136,7 +136,7 @@ enum Job {
     Check(Receiver<Result<Vec<Checked>>>),
     Info {
         name: String,
-        rx: Receiver<Result<Vec<index::Release>>>,
+        rx: Receiver<Result<Option<Vec<index::Release>>>>,
     },
 }
 
@@ -642,9 +642,10 @@ impl App {
     /// answering, and `describe_info` states installation as a fact.
     /// `checkupdate` is immune by construction (`status_for` validates
     /// the version); info has no such check, so it reloads instead.
-    fn finish_info(&mut self, name: String, result: Result<Vec<index::Release>>) {
+    fn finish_info(&mut self, name: String, result: Result<Option<Vec<index::Release>>>) {
         match result {
-            Ok(releases) => {
+            Ok(None) => self.error(&format!("{:#}", index::not_found(&name))),
+            Ok(Some(releases)) => {
                 if let Err(e) = self.reload() {
                     self.error(&format!("reload failed: {e:#}"));
                     return;
