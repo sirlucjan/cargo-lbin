@@ -79,9 +79,9 @@ enum Cmd {
     /// nothing runs unprompted)
     #[cfg(feature = "tui")]
     Tui,
-    /// Look up crates on crates.io: latest versions and whether they are
-    /// installed under the prefix
-    Search {
+    /// Show one or more crates exactly by name: latest versions and
+    /// whether they are installed under the prefix
+    Info {
         #[arg(required = true)]
         crates: Vec<String>,
     },
@@ -138,7 +138,7 @@ fn main() -> ExitCode {
         Cmd::List => cmd_list(&cli.prefix),
         #[cfg(feature = "tui")]
         Cmd::Tui => tui::run(&cli.prefix),
-        Cmd::Search { ref crates } => cmd_search(&cli.prefix, crates),
+        Cmd::Info { ref crates } => cmd_info(&cli.prefix, crates),
         Cmd::Checkupdate => return cmd_checkupdate(&cli.prefix),
         Cmd::Update {
             ref crates,
@@ -579,7 +579,7 @@ fn check_versions<'a>(
     Ok(checked)
 }
 
-/// A release as `search` prints it: the version, flagged if yanked.
+/// A release as `info` prints it: the version, flagged if yanked.
 fn release_label(release: &index::Release) -> String {
     if release.yanked {
         format!("{} [yanked]", release.version)
@@ -588,15 +588,15 @@ fn release_label(release: &index::Release) -> String {
     }
 }
 
-/// Render one crate's search result. Two independent questions, two
+/// Render one crate's `info` block. Two independent questions, two
 /// sources: the `latest`/`pre-release` lines are published history and
 /// may name a yanked release (flagged); the `installed` verdict is update
 /// eligibility, computed from the non-yanked subset with the same
 /// `latest_relevant` rules as `checkupdate`. Where `checkupdate` would
 /// refuse the crate outright (nothing non-yanked left), the verdict says
-/// so instead of claiming "up to date" — search must never assert
+/// so instead of claiming "up to date" — `info` must never assert
 /// something `checkupdate` would contradict.
-fn describe_search(name: &str, releases: &[index::Release], installed: Option<&Entry>) -> String {
+fn describe_info(name: &str, releases: &[index::Release], installed: Option<&Entry>) -> String {
     // Formatting into a String cannot fail; the `let _ =` discards the
     // Result the macros return for the general `fmt::Write` case.
     use std::fmt::Write as _;
@@ -645,7 +645,7 @@ fn describe_search(name: &str, releases: &[index::Release], installed: Option<&E
 /// query runs unlocked. Each name is independent — an unknown crate is
 /// reported and the rest are still looked up; the exit code says whether
 /// everything was found.
-fn cmd_search(prefix: &Path, crates: &[String]) -> Result<()> {
+fn cmd_info(prefix: &Path, crates: &[String]) -> Result<()> {
     for name in crates {
         validate_name(name)?;
     }
@@ -673,7 +673,7 @@ fn cmd_search(prefix: &Path, crates: &[String]) -> Result<()> {
                 }
                 print!(
                     "{}",
-                    describe_search(name, &releases, manifest.crates.get(*name))
+                    describe_info(name, &releases, manifest.crates.get(*name))
                 );
                 shown += 1;
             }
@@ -901,7 +901,7 @@ mod tests {
     }
 
     #[test]
-    fn search_describes_installed_state_with_checkupdate_rules() {
+    fn info_describes_installed_state_with_checkupdate_rules() {
         let rel = |v: &str, yanked: bool| index::Release {
             version: Version::parse(v).unwrap(),
             yanked,
@@ -915,7 +915,7 @@ mod tests {
         let m = manifest_with(&["foo"]);
         let installed = m.crates.get("foo");
 
-        let out = describe_search("foo", &releases, installed);
+        let out = describe_info("foo", &releases, installed);
         assert!(out.contains("latest:      1.2.0"), "{out}");
         assert!(out.contains("pre-release: 2.0.0-rc.1"), "{out}");
         assert!(out.contains("releases:    4 (1 yanked)"), "{out}");
@@ -925,26 +925,26 @@ mod tests {
             "{out}"
         );
 
-        let out = describe_search("foo", &releases, None);
+        let out = describe_info("foo", &releases, None);
         assert!(out.contains("installed:   no"), "{out}");
 
         // Installed at the newest stable: up to date, rc still not offered.
         let mut m = manifest_with(&["foo"]);
         m.crates.get_mut("foo").unwrap().version = "1.2.0".to_owned();
-        let out = describe_search("foo", &releases, m.crates.get("foo"));
+        let out = describe_info("foo", &releases, m.crates.get("foo"));
         assert!(out.contains("installed:   1.2.0 (up to date)"), "{out}");
 
         // History and eligibility diverge: the newest stable is yanked, so
         // it is shown flagged, while the installed 1.0.0 has nowhere to go.
         let releases = [rel("1.0.0", false), rel("1.1.0", true)];
-        let out = describe_search("foo", &releases, installed);
+        let out = describe_info("foo", &releases, installed);
         assert!(out.contains("latest:      1.1.0 [yanked]"), "{out}");
         assert!(out.contains("installed:   1.0.0 (up to date)"), "{out}");
 
         // Everything yanked: `checkupdate` would refuse this crate, and
-        // search must not call it "up to date".
+        // `info` must not call it "up to date".
         let releases = [rel("1.0.0", true)];
-        let out = describe_search("foo", &releases, installed);
+        let out = describe_info("foo", &releases, installed);
         assert!(out.contains("latest:      1.0.0 [yanked]"), "{out}");
         assert!(
             out.contains("installed:   1.0.0 (no non-yanked releases)"),

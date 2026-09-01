@@ -5,7 +5,7 @@
 It uses `cargo install` for the build, installs the resulting binaries into `/usr/local/bin` by default, keeps track of what it owns, and adds the small lifecycle layer that plain `cargo install` does not try to provide:
 
 ```text
-search -> install -> list -> check updates -> update -> remove
+info -> install -> list -> check updates -> update -> remove
 ```
 
 The executable is a Cargo subcommand, so the normal interface is:
@@ -83,10 +83,10 @@ update check: 3h ago
 
 `list` never touches the network. The `-> 0.16.0` and `(up to date)` annotations and the age line come from the most recent `checkupdate` (see below); the age line is printed to stderr so stdout stays parseable. A crate with no annotation was not covered by that check — installed or updated since — and nothing is claimed about it. Without a recorded check, `list` says so and shows versions only.
 
-Look up crates on crates.io before installing, or to see where an installed one stands:
+Show crates by exact name — before installing, or to see where an installed one stands:
 
 ```bash
-cargo lbin search ripgrep bat
+cargo lbin info ripgrep bat
 ```
 
 Example:
@@ -178,7 +178,7 @@ cargo lbin tui
 └───────────────────────────────────────────────────────────┘
 ```
 
-The TUI starts from disk — the manifest and the last `checkupdate` report — and does nothing on its own. The report is presentation only: `U` runs a real `update --all`, which asks crates.io itself and shows its own plan, whatever the list currently says. `r` runs the same check `checkupdate` does and writes the same report; until then, crates the last check did not cover show `? not checked` rather than a guess. `s` looks one crate up. Everything that builds or places binaries (`Enter`/`u` for one crate, `U` for `update --all`, `i` to install, `x` to remove) hands the terminal to the CLI command: cargo's output, the update confirmation prompt and any `sudo` password prompt appear exactly as they would on the command line, and the TUI returns when you press Enter. `x` asks first, in the TUI, because `remove` itself does not.
+The TUI starts from disk — the manifest and the last `checkupdate` report — and does nothing on its own. The report is presentation only: `U` runs a real `update --all`, which asks crates.io itself and shows its own plan, whatever the list currently says. `r` runs the same check `checkupdate` does and writes the same report; until then, crates the last check did not cover show `? not checked` rather than a guess. `s` looks one crate up by exact name (`info`). Everything that builds or places binaries (`Enter`/`u` for one crate, `U` for `update --all`, `i` to install, `x` to remove) hands the terminal to the CLI command: cargo's output, the update confirmation prompt and any `sudo` password prompt appear exactly as they would on the command line, and the TUI returns when you press Enter. `x` asks first, in the TUI, because `remove` itself does not.
 
 The TUI is a default Cargo feature; `cargo install cargo-lbin --no-default-features` builds the CLI alone, without the terminal UI dependencies.
 

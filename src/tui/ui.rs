@@ -127,10 +127,10 @@ fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_details(frame: &mut Frame, app: &App, area: Rect) {
-    // A finished search takes over the panel until dismissed; it is the
+    // A finished lookup takes over the panel until dismissed; it is the
     // one piece of information here that did not come from the manifest.
-    if let Some(search) = &app.search {
-        let text: Vec<Line> = search
+    if let Some(info) = &app.info_result {
+        let text: Vec<Line> = info
             .text
             .lines()
             .map(|l| Line::from(l.to_owned()))
@@ -138,7 +138,7 @@ fn draw_details(frame: &mut Frame, app: &App, area: Rect) {
         let panel = Paragraph::new(text).wrap(Wrap { trim: false }).block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(format!(" Search: {} (Esc to dismiss) ", search.name)),
+                .title(format!(" Info: {} (Esc to dismiss) ", info.name)),
         );
         frame.render_widget(panel, area);
         return;
@@ -202,7 +202,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     } else if app.input.is_some() {
         " Enter run · Esc cancel"
     } else {
-        " ↑/↓ select · Tab filter · Enter/u update · U update all · i install · x remove · r check · s search · ? help · q quit"
+        " ↑/↓ select · Tab filter · Enter/u update · U update all · i install · x remove · r check · s info · ? help · q quit"
     };
     frame.render_widget(
         Paragraph::new(Span::styled(keys, Style::default().fg(Color::DarkGray))),
@@ -242,7 +242,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     } else if let Some(input) = &app.input {
         let label = match input.purpose {
             InputPurpose::Install => "install: ",
-            InputPurpose::Search => "search: ",
+            InputPurpose::Info => "info: ",
         };
         let text = format!(" {label}{}", input.buffer);
         // Cursor after the typed text; widths are clamped to u16 because
@@ -280,7 +280,7 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         "i           install: NAME... [--locked]",
         "x           remove selected crate (asks first)",
         "r           check crates.io for updates (writes the report)",
-        "s           search crates.io for one crate",
+        "s           info: look one crate up on crates.io by exact name",
         "",
         "Nothing runs on its own: no refresh or network access on start.",
         "Commands that build hand the terminal to cargo and sudo and",
