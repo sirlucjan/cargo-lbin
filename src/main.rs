@@ -730,7 +730,11 @@ fn format_search_hits(hits: &[api::Hit], installed: &BTreeMap<String, String>) -
         } else {
             ' '
         };
-        let mut description: String = hit.description.chars().take(SEARCH_DESCRIPTION_WIDTH).collect();
+        let mut description: String = hit
+            .description
+            .chars()
+            .take(SEARCH_DESCRIPTION_WIDTH)
+            .collect();
         if hit.description.chars().count() > SEARCH_DESCRIPTION_WIDTH {
             description.push('…');
         }
@@ -997,8 +1001,16 @@ mod tests {
         let out = format_search_hits(&hits, &installed);
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines.len(), 2);
-        assert!(lines[0].starts_with("  scx_beerland  1.1.3   A sched_ext scheduler"), "{}", lines[0]);
-        assert!(lines[1].starts_with("* bat           0.26.0  "), "{}", lines[1]);
+        assert!(
+            lines[0].starts_with("  scx_beerland  1.1.3   A sched_ext scheduler"),
+            "{}",
+            lines[0]
+        );
+        assert!(
+            lines[1].starts_with("* bat           0.26.0  "),
+            "{}",
+            lines[1]
+        );
         assert!(lines[1].ends_with("  [installed 0.25.0]"), "{}", lines[1]);
         // Description cut at the width, with an ellipsis, before the marker.
         let desc = lines[1].rsplit("  ").nth(1).unwrap();

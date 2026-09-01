@@ -881,7 +881,10 @@ mod tests {
     #[test]
     fn search_input_is_free_text() {
         assert_eq!(parse_search_input(" bat ").unwrap(), "bat");
-        assert_eq!(parse_search_input("sched  ext\tscheduler").unwrap(), "sched ext scheduler");
+        assert_eq!(
+            parse_search_input("sched  ext\tscheduler").unwrap(),
+            "sched ext scheduler"
+        );
         assert!(parse_search_input("").is_err());
         assert!(parse_search_input("   ").is_err());
     }

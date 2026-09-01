@@ -158,11 +158,9 @@ fn draw_details(frame: &mut Frame, app: &App, area: Rect) {
                 Line::from(spans)
             })
             .collect();
-        let panel = Paragraph::new(lines).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(format!(" Search: {} (digit installs, Esc dismisses) ", search.query)),
-        );
+        let panel = Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(
+            format!(" Search: {} (digit installs, Esc dismisses) ", search.query),
+        ));
         frame.render_widget(panel, area);
         return;
     }

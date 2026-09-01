@@ -262,7 +262,10 @@ mod tests {
         assert_eq!(wait_for_slot(Some(t0), t1), Duration::from_millis(700));
         // Exactly one interval later, or any time after: no wait.
         assert_eq!(wait_for_slot(Some(t0), t0 + API_INTERVAL), Duration::ZERO);
-        assert_eq!(wait_for_slot(Some(t0), t0 + Duration::from_secs(5)), Duration::ZERO);
+        assert_eq!(
+            wait_for_slot(Some(t0), t0 + Duration::from_secs(5)),
+            Duration::ZERO
+        );
         // A previous timestamp in the future (clock oddities) is treated
         // as "just now", never as an underflow.
         assert_eq!(wait_for_slot(Some(t1), t0), API_INTERVAL);
