@@ -1,7 +1,7 @@
 %define _disable_source_fetch 0
 
 Name:           cargo-lbin
-Version:        0.3.0
+Version:        0.4.0
 Release:        1%{?dist}
 Summary:        Thin cargo-install wrapper targeting /usr/local/bin, crates.io only
 
