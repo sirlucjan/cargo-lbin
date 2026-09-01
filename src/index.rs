@@ -9,7 +9,7 @@ use semver::Version;
 use serde::Deserialize;
 
 const INDEX_BASE: &str = "https://index.crates.io";
-const USER_AGENT: &str = concat!(
+pub(crate) const USER_AGENT: &str = concat!(
     env!("CARGO_PKG_NAME"),
     "/",
     env!("CARGO_PKG_VERSION"),

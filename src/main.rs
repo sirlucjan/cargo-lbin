@@ -1,3 +1,4 @@
+mod api;
 mod index;
 mod lock;
 mod manifest;
@@ -14,7 +15,7 @@ use lock::{Mode, StateLock};
 use manifest::{Entry, Manifest};
 use report::{Checked, Report, Status};
 use semver::Version;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -85,6 +86,16 @@ enum Cmd {
         #[arg(required = true)]
         crates: Vec<String>,
     },
+    /// Find crates on crates.io by keyword; marks the ones installed
+    /// under the prefix
+    Search {
+        /// Search terms (joined with spaces)
+        #[arg(required = true)]
+        query: Vec<String>,
+        /// Maximum number of results (1-100)
+        #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u8).range(1..=100))]
+        limit: u8,
+    },
     /// Check crates.io for newer versions (read-only, no sudo).
     /// Exit codes: 0 updates available, 2 none, 1 error
     Checkupdate,
@@ -139,6 +150,7 @@ fn main() -> ExitCode {
         #[cfg(feature = "tui")]
         Cmd::Tui => tui::run(&cli.prefix),
         Cmd::Info { ref crates } => cmd_info(&cli.prefix, crates),
+        Cmd::Search { ref query, limit } => cmd_search(&cli.prefix, query, limit),
         Cmd::Checkupdate => return cmd_checkupdate(&cli.prefix),
         Cmd::Update {
             ref crates,
@@ -696,6 +708,67 @@ fn cmd_info(prefix: &Path, crates: &[String]) -> Result<()> {
     bail!("{} of {} lookups failed", failures.len(), names.len())
 }
 
+/// Longest description `search` prints before cutting; a preview line,
+/// not a README.
+const SEARCH_DESCRIPTION_WIDTH: usize = 72;
+
+/// Lay out search hits as aligned rows. `installed` maps a crate name to
+/// its installed version; matching hits get a `*` and the version.
+fn format_search_hits(hits: &[api::Hit], installed: &BTreeMap<String, String>) -> String {
+    use std::fmt::Write as _;
+    let name_w = hits.iter().map(|h| h.name.len()).max().unwrap_or(0);
+    let version_w = hits.iter().map(|h| h.version.len()).max().unwrap_or(0);
+    let mut out = String::new();
+    for hit in hits {
+        let mark = if installed.contains_key(&hit.name) {
+            '*'
+        } else {
+            ' '
+        };
+        let mut description: String = hit.description.chars().take(SEARCH_DESCRIPTION_WIDTH).collect();
+        if hit.description.chars().count() > SEARCH_DESCRIPTION_WIDTH {
+            description.push('…');
+        }
+        let _ = write!(
+            out,
+            "{mark} {:<name_w$}  {:<version_w$}  {description}",
+            hit.name, hit.version
+        );
+        if let Some(have) = installed.get(&hit.name) {
+            let _ = write!(out, "  [installed {have}]");
+        }
+        out.push('\n');
+    }
+    out
+}
+
+/// Keyword search over crates.io, for choosing a name; `info` is where a
+/// chosen name gets looked at properly. One API request, then the
+/// manifest is read (shared lock, briefly) so hits already installed
+/// under the prefix are marked — the one thing `cargo search` cannot
+/// tell you. No results is an answer, not an error.
+fn cmd_search(prefix: &Path, query: &[String], limit: u8) -> Result<()> {
+    let query = query.join(" ");
+    let hits = api::search(&query, usize::from(limit))?;
+    if hits.is_empty() {
+        println!("no crates match `{query}`");
+        return Ok(());
+    }
+    let installed: BTreeMap<String, String> = {
+        let _lock = StateLock::acquire(prefix, &Mode::Shared)?;
+        Manifest::load(prefix)?
+            .crates
+            .into_iter()
+            .map(|(name, entry)| (name, entry.version))
+            .collect()
+    };
+    print!("{}", format_search_hits(&hits, &installed));
+    if hits.iter().any(|h| installed.contains_key(&h.name)) {
+        println!("* installed under {}", prefix.display());
+    }
+    Ok(())
+}
+
 fn cmd_checkupdate(prefix: &Path) -> ExitCode {
     // Shared lock covers only the manifest snapshot; the index queries run
     // unlocked, so a slow crates.io cannot starve writers on the prefix.
@@ -899,6 +972,33 @@ mod tests {
         // The cargo-subcommand form strips "lbin" in main(); the parser
         // itself must not accept it.
         assert!(Cli::try_parse_from(["cargo-lbin", "lbin", "update", "--all"]).is_err());
+    }
+
+    #[test]
+    fn search_rows_align_and_mark_installed() {
+        let hits = [
+            api::Hit {
+                name: "scx_beerland".to_owned(),
+                version: "1.1.3".to_owned(),
+                description: "A sched_ext scheduler".to_owned(),
+            },
+            api::Hit {
+                name: "bat".to_owned(),
+                version: "0.26.0".to_owned(),
+                description: "x".repeat(SEARCH_DESCRIPTION_WIDTH + 5),
+            },
+        ];
+        let installed = BTreeMap::from([("bat".to_owned(), "0.25.0".to_owned())]);
+        let out = format_search_hits(&hits, &installed);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].starts_with("  scx_beerland  1.1.3   A sched_ext scheduler"), "{}", lines[0]);
+        assert!(lines[1].starts_with("* bat           0.26.0  "), "{}", lines[1]);
+        assert!(lines[1].ends_with("  [installed 0.25.0]"), "{}", lines[1]);
+        // Description cut at the width, with an ellipsis, before the marker.
+        let desc = lines[1].rsplit("  ").nth(1).unwrap();
+        assert_eq!(desc.chars().count(), SEARCH_DESCRIPTION_WIDTH + 1);
+        assert!(desc.ends_with('…'));
     }
 
     #[test]

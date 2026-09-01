@@ -5,7 +5,7 @@
 It uses `cargo install` for the build, installs the resulting binaries into `/usr/local/bin` by default, keeps track of what it owns, and adds the small lifecycle layer that plain `cargo install` does not try to provide:
 
 ```text
-info -> install -> list -> check updates -> update -> remove
+search -> info -> install -> list -> check updates -> update -> remove
 ```
 
 The executable is a Cargo subcommand, so the normal interface is:
@@ -82,6 +82,21 @@ update check: 3h ago
 ```
 
 `list` never touches the network. The `-> 0.16.0` and `(up to date)` annotations and the age line come from the most recent `checkupdate` (see below); the age line is printed to stderr so stdout stays parseable. A crate with no annotation was not covered by that check — installed or updated since — and nothing is claimed about it. Without a recorded check, `list` says so and shows versions only.
+
+Find crates by keyword:
+
+```bash
+cargo lbin search sched_ext scheduler
+```
+
+```text
+* scx_beerland  1.1.3   A sched_ext scheduler …            [installed 1.1.2]
+  scx_lavd      1.1.3   A Latency-criticality Aware Virtual Deadline …
+  scx_rusty     1.1.3   A multi-domain, BPF / user space hybrid scheduler …
+* installed under /usr/local
+```
+
+This is the same search crates.io itself runs — `search beerland` finds `scx_beerland` — with one addition `cargo search` cannot make: hits already installed under the prefix are marked with their installed version. Results are a preview for choosing a name (`--limit`, default 10); the version shown is the newest stable release, or the newest of any kind if there is none. No matches is an answer, not an error.
 
 Show crates by exact name — before installing, or to see where an installed one stands:
 
