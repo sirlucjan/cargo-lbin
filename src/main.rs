@@ -4,6 +4,8 @@ mod manifest;
 mod privileged;
 mod report;
 mod stage;
+#[cfg(feature = "tui")]
+mod tui;
 mod validate;
 
 use anyhow::{Context, Result, bail};
@@ -73,6 +75,10 @@ enum Cmd {
     },
     /// List installed crates and their binaries
     List,
+    /// Interactive front end over the same commands (starts from disk;
+    /// nothing runs unprompted)
+    #[cfg(feature = "tui")]
+    Tui,
     /// Look up crates on crates.io: latest versions and whether they are
     /// installed under the prefix
     Search {
@@ -130,6 +136,8 @@ fn main() -> ExitCode {
         Cmd::Install { ref crates, locked } => cmd_install(&cli.prefix, crates, locked),
         Cmd::Remove { ref crates } => cmd_remove(&cli.prefix, crates),
         Cmd::List => cmd_list(&cli.prefix),
+        #[cfg(feature = "tui")]
+        Cmd::Tui => tui::run(&cli.prefix),
         Cmd::Search { ref crates } => cmd_search(&cli.prefix, crates),
         Cmd::Checkupdate => return cmd_checkupdate(&cli.prefix),
         Cmd::Update {

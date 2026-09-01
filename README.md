@@ -151,6 +151,37 @@ cargo lbin remove hexyl
 cargo lbin remove foo bar
 ```
 
+## TUI
+
+The same commands, behind a list:
+
+```bash
+cargo lbin tui
+```
+
+```text
+┌ cargo-lbin — /usr/local ──────────────────────────────────┐
+│ Packages (3)  Updates (2)                                 │
+├───────────────────────────────────────────────────────────┤
+│ NAME             VERSION       STATUS                     │
+│ > ripgrep        14.1.1        ✓ up to date               │
+│   bat            0.26.0        ↑ 0.26.1                   │
+│   fd             10.2.0        ↑ 10.3.0                   │
+├ Selected ─────────────────────────────────────────────────┤
+│ Crate      bat                                            │
+│ Installed  0.26.0                                         │
+│ Latest     0.26.1                                         │
+│ Binaries   bat                                            │
+├───────────────────────────────────────────────────────────┤
+│ ↑/↓ select · Tab filter · Enter/u update · U update all … │
+│ 3 packages · 2 updates · checked 3h ago                   │
+└───────────────────────────────────────────────────────────┘
+```
+
+The TUI starts from disk — the manifest and the last `checkupdate` report — and does nothing on its own. The report is presentation only: `U` runs a real `update --all`, which asks crates.io itself and shows its own plan, whatever the list currently says. `r` runs the same check `checkupdate` does and writes the same report; until then, crates the last check did not cover show `? not checked` rather than a guess. `s` looks one crate up. Everything that builds or places binaries (`Enter`/`u` for one crate, `U` for `update --all`, `i` to install, `x` to remove) hands the terminal to the CLI command: cargo's output, the update confirmation prompt and any `sudo` password prompt appear exactly as they would on the command line, and the TUI returns when you press Enter. `x` asks first, in the TUI, because `remove` itself does not.
+
+The TUI is a default Cargo feature; `cargo install cargo-lbin --no-default-features` builds the CLI alone, without the terminal UI dependencies.
+
 ## Prefixes
 
 The default prefix is `/usr/local`:
@@ -299,7 +330,7 @@ It currently does **not** provide:
 - Privileged installation into arbitrary custom prefixes.
 - Management of libraries, headers, systemd units, configuration files or other distro integration.
 - A dependency resolver of its own — Cargo remains responsible for builds and dependencies.
-- Automatic background updates or a daemon.
+- Automatic background updates or a daemon. This includes the TUI: it never refreshes, checks or updates anything on its own.
 
 For a normal per-user `~/.cargo/bin` workflow, plain `cargo install` remains the simpler tool.
 
