@@ -5,7 +5,7 @@
 It uses `cargo install` for the build, installs the resulting binaries into `/usr/local/bin` by default, keeps track of what it owns, and adds the small lifecycle layer that plain `cargo install` does not try to provide:
 
 ```text
-install -> list -> check updates -> update -> remove
+search -> install -> list -> check updates -> update -> remove
 ```
 
 The executable is a Cargo subcommand, so the normal interface is:
@@ -82,6 +82,29 @@ update check: 3h ago
 ```
 
 `list` never touches the network. The `-> 0.16.0` and `(up to date)` annotations and the age line come from the most recent `checkupdate` (see below); the age line is printed to stderr so stdout stays parseable. A crate with no annotation was not covered by that check — installed or updated since — and nothing is claimed about it. Without a recorded check, `list` says so and shows versions only.
+
+Look up crates on crates.io before installing, or to see where an installed one stands:
+
+```bash
+cargo lbin search ripgrep bat
+```
+
+Example:
+
+```text
+ripgrep
+  latest:      14.1.1
+  releases:    42 (2 yanked)
+  installed:   14.1.0 (update available: 14.1.1)
+
+bat
+  latest:      0.26.0
+  pre-release: 0.27.0-beta.1
+  releases:    38
+  installed:   no
+```
+
+The `latest` and `pre-release` lines describe published history and may name a yanked release, flagged as `1.1.0 [yanked]` — the yank is the point, not something to hide behind the previous version. A pre-release line appears only when it is newer than the latest stable release. The `installed` verdict is a separate question, answered from the non-yanked releases with the same rules as `checkupdate`, so the two never disagree; a crate with nothing non-yanked left says so rather than "up to date". Unknown crates are reported after the results, and the remaining names are still looked up; the exit code is non-zero if any lookup failed.
 
 Check crates.io for updates without changing anything:
 

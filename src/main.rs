@@ -73,6 +73,12 @@ enum Cmd {
     },
     /// List installed crates and their binaries
     List,
+    /// Look up crates on crates.io: latest versions and whether they are
+    /// installed under the prefix
+    Search {
+        #[arg(required = true)]
+        crates: Vec<String>,
+    },
     /// Check crates.io for newer versions (read-only, no sudo).
     /// Exit codes: 0 updates available, 2 none, 1 error
     Checkupdate,
@@ -124,6 +130,7 @@ fn main() -> ExitCode {
         Cmd::Install { ref crates, locked } => cmd_install(&cli.prefix, crates, locked),
         Cmd::Remove { ref crates } => cmd_remove(&cli.prefix, crates),
         Cmd::List => cmd_list(&cli.prefix),
+        Cmd::Search { ref crates } => cmd_search(&cli.prefix, crates),
         Cmd::Checkupdate => return cmd_checkupdate(&cli.prefix),
         Cmd::Update {
             ref crates,
@@ -516,9 +523,10 @@ fn cmd_list(prefix: &Path) -> Result<()> {
     }
     // Status goes to stderr: it is for the person reading the terminal,
     // not for whatever may be parsing stdout.
-    match report {
-        Some(r) => eprintln!("update check: {}", report::describe_age(r.age())),
-        None => eprintln!("no update check recorded; run `cargo lbin checkupdate`"),
+    if let Some(r) = report {
+        eprintln!("update check: {}", report::describe_age(r.age()));
+    } else {
+        eprintln!("no update check recorded; run `cargo lbin checkupdate`");
     }
     Ok(())
 }
@@ -561,6 +569,128 @@ fn check_versions<'a>(
         });
     }
     Ok(checked)
+}
+
+/// A release as `search` prints it: the version, flagged if yanked.
+fn release_label(release: &index::Release) -> String {
+    if release.yanked {
+        format!("{} [yanked]", release.version)
+    } else {
+        release.version.to_string()
+    }
+}
+
+/// Render one crate's search result. Two independent questions, two
+/// sources: the `latest`/`pre-release` lines are published history and
+/// may name a yanked release (flagged); the `installed` verdict is update
+/// eligibility, computed from the non-yanked subset with the same
+/// `latest_relevant` rules as `checkupdate`. Where `checkupdate` would
+/// refuse the crate outright (nothing non-yanked left), the verdict says
+/// so instead of claiming "up to date" — search must never assert
+/// something `checkupdate` would contradict.
+fn describe_search(
+    name: &str,
+    releases: &[index::Release],
+    installed: Option<&Entry>,
+) -> String {
+    // Formatting into a String cannot fail; the `let _ =` discards the
+    // Result the macros return for the general `fmt::Write` case.
+    use std::fmt::Write as _;
+    let summary = index::summarize(releases);
+    let mut out = format!("{name}\n");
+    if let Some(stable) = &summary.latest_stable {
+        let _ = writeln!(out, "  latest:      {}", release_label(stable));
+    } else {
+        out.push_str("  latest:      (no stable release)\n");
+    }
+    if let Some(pre) = &summary.latest_pre {
+        let _ = writeln!(out, "  pre-release: {}", release_label(pre));
+    }
+    let _ = write!(out, "  releases:    {}", summary.total);
+    if summary.yanked > 0 {
+        let _ = write!(out, " ({} yanked)", summary.yanked);
+    }
+    out.push('\n');
+    let Some(entry) = installed else {
+        out.push_str("  installed:   no\n");
+        return out;
+    };
+    let _ = write!(out, "  installed:   {}", entry.version);
+    let live: Vec<Version> = releases
+        .iter()
+        .filter(|r| !r.yanked)
+        .map(|r| r.version.clone())
+        .collect();
+    if live.is_empty() {
+        out.push_str(" (no non-yanked releases)\n");
+        return out;
+    }
+    let newer = Version::parse(&entry.version)
+        .ok()
+        .and_then(|current| {
+            index::latest_relevant(&live, &current).filter(|latest| *latest > current)
+        });
+    if let Some(latest) = newer {
+        let _ = writeln!(out, " (update available: {latest})");
+    } else {
+        out.push_str(" (up to date)\n");
+    }
+    out
+}
+
+/// Read-only and explicitly network-bound, like `checkupdate`: the manifest
+/// is snapshotted under a shared lock for the "installed" line, then every
+/// query runs unlocked. Each name is independent — an unknown crate is
+/// reported and the rest are still looked up; the exit code says whether
+/// everything was found.
+fn cmd_search(prefix: &Path, crates: &[String]) -> Result<()> {
+    for name in crates {
+        validate_name(name)?;
+    }
+    let manifest = {
+        let _lock = StateLock::acquire(prefix, &Mode::Shared)?;
+        Manifest::load(prefix)?
+    };
+    // Input order, first occurrence wins: the user asked in the order they
+    // think about these crates and reads the answers in the same order.
+    // (`update` sorts deliberately — there the order is a build sequence,
+    // which should not depend on how the arguments were typed.)
+    let mut names: Vec<&str> = Vec::new();
+    for name in crates {
+        if !names.contains(&name.as_str()) {
+            names.push(name);
+        }
+    }
+    let mut failures: Vec<anyhow::Error> = Vec::new();
+    let mut shown = 0usize;
+    for name in &names {
+        match index::releases(name) {
+            Ok(releases) => {
+                if shown > 0 {
+                    println!();
+                }
+                print!(
+                    "{}",
+                    describe_search(name, &releases, manifest.crates.get(*name))
+                );
+                shown += 1;
+            }
+            Err(e) => failures.push(e),
+        }
+    }
+    // Errors are reported after all results, so stdout stays contiguous
+    // and stderr is not interleaved with it. A single lookup that failed
+    // is simply the command's error — one line, no summary restating it.
+    if failures.is_empty() {
+        return Ok(());
+    }
+    if names.len() == 1 {
+        return Err(failures.remove(0));
+    }
+    for e in &failures {
+        eprintln!("error: {e:#}");
+    }
+    bail!("{} of {} lookups failed", failures.len(), names.len())
 }
 
 fn cmd_checkupdate(prefix: &Path) -> ExitCode {
@@ -766,6 +896,55 @@ mod tests {
         // The cargo-subcommand form strips "lbin" in main(); the parser
         // itself must not accept it.
         assert!(Cli::try_parse_from(["cargo-lbin", "lbin", "update", "--all"]).is_err());
+    }
+
+    #[test]
+    fn search_describes_installed_state_with_checkupdate_rules() {
+        let rel = |v: &str, yanked: bool| index::Release {
+            version: Version::parse(v).unwrap(),
+            yanked,
+        };
+        let releases = [
+            rel("1.0.0", false),
+            rel("1.1.0", true),
+            rel("1.2.0", false),
+            rel("2.0.0-rc.1", false),
+        ];
+        let m = manifest_with(&["foo"]);
+        let installed = m.crates.get("foo");
+
+        let out = describe_search("foo", &releases, installed);
+        assert!(out.contains("latest:      1.2.0"), "{out}");
+        assert!(out.contains("pre-release: 2.0.0-rc.1"), "{out}");
+        assert!(out.contains("releases:    4 (1 yanked)"), "{out}");
+        // Installed 1.0.0 is stable: the rc is not offered, 1.2.0 is.
+        assert!(
+            out.contains("installed:   1.0.0 (update available: 1.2.0)"),
+            "{out}"
+        );
+
+        let out = describe_search("foo", &releases, None);
+        assert!(out.contains("installed:   no"), "{out}");
+
+        // Installed at the newest stable: up to date, rc still not offered.
+        let mut m = manifest_with(&["foo"]);
+        m.crates.get_mut("foo").unwrap().version = "1.2.0".to_owned();
+        let out = describe_search("foo", &releases, m.crates.get("foo"));
+        assert!(out.contains("installed:   1.2.0 (up to date)"), "{out}");
+
+        // History and eligibility diverge: the newest stable is yanked, so
+        // it is shown flagged, while the installed 1.0.0 has nowhere to go.
+        let releases = [rel("1.0.0", false), rel("1.1.0", true)];
+        let out = describe_search("foo", &releases, installed);
+        assert!(out.contains("latest:      1.1.0 [yanked]"), "{out}");
+        assert!(out.contains("installed:   1.0.0 (up to date)"), "{out}");
+
+        // Everything yanked: `checkupdate` would refuse this crate, and
+        // search must not call it "up to date".
+        let releases = [rel("1.0.0", true)];
+        let out = describe_search("foo", &releases, installed);
+        assert!(out.contains("latest:      1.0.0 [yanked]"), "{out}");
+        assert!(out.contains("installed:   1.0.0 (no non-yanked releases)"), "{out}");
     }
 
     #[test]
