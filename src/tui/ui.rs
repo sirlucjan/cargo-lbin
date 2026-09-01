@@ -5,7 +5,7 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, Borders, Cell, Clear, Paragraph, Row as TableRow, Table, TableState, Tabs, Wrap,
+    Block, Borders, Cell, Clear, Paragraph, Row as TableRow, Table, TableState, Tabs,
 };
 
 use super::{App, Filter, InputPurpose, MessageKind, RowStatus};
@@ -127,18 +127,41 @@ fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_details(frame: &mut Frame, app: &App, area: Rect) {
-    // A finished lookup takes over the panel until dismissed; it is the
+    // A finished search takes over the panel until dismissed; it is the
     // one piece of information here that did not come from the manifest.
-    if let Some(info) = &app.info_result {
-        let text: Vec<Line> = info
-            .text
-            .lines()
-            .map(|l| Line::from(l.to_owned()))
+    if let Some(search) = &app.search_result {
+        let name_w = search.hits.iter().map(|h| h.name.len()).max().unwrap_or(0);
+        // `api::search` bounds the hit count locally, so the panel's
+        // numbering and the footer's "1-n" describe the same list.
+        let lines: Vec<Line> = search
+            .hits
+            .iter()
+            .enumerate()
+            .map(|(i, hit)| {
+                let mut spans = vec![
+                    Span::styled(
+                        format!("[{}] ", i + 1),
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(format!("{:<name_w$}  {}  ", hit.name, hit.version)),
+                ];
+                if let Some(have) = search.installed.get(&hit.name) {
+                    spans.push(Span::styled(
+                        format!("[installed {have}]  "),
+                        Style::default().fg(Color::Green),
+                    ));
+                }
+                spans.push(Span::styled(
+                    hit.description.clone(),
+                    Style::default().fg(Color::Gray),
+                ));
+                Line::from(spans)
+            })
             .collect();
-        let panel = Paragraph::new(text).wrap(Wrap { trim: false }).block(
+        let panel = Paragraph::new(lines).block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(format!(" Info: {} (Esc to dismiss) ", info.name)),
+                .title(format!(" Search: {} (digit installs, Esc dismisses) ", search.query)),
         );
         frame.render_widget(panel, area);
         return;
@@ -202,7 +225,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     } else if app.input.is_some() {
         " Enter run · Esc cancel"
     } else {
-        " ↑/↓ select · Tab filter · Enter/u update · U update all · i install · x remove · r check · s info · ? help · q quit"
+        " ↑/↓ select · Tab filter · Enter/u update · U update all · i install · x remove · r check · s search · ? help · q quit"
     };
     frame.render_widget(
         Paragraph::new(Span::styled(keys, Style::default().fg(Color::DarkGray))),
@@ -242,7 +265,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     } else if let Some(input) = &app.input {
         let label = match input.purpose {
             InputPurpose::Install => "install: ",
-            InputPurpose::Info => "info: ",
+            InputPurpose::Search => "search: ",
         };
         let text = format!(" {label}{}", input.buffer);
         // Cursor after the typed text; widths are clamped to u16 because
@@ -280,7 +303,8 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         "i           install: NAME... [--locked]",
         "x           remove selected crate (asks first)",
         "r           check crates.io for updates (writes the report)",
-        "s           info: look one crate up on crates.io by exact name",
+        "s           search crates.io by keyword; a digit then picks a hit",
+        "            and opens the install line with its name",
         "",
         "Nothing runs on its own: no refresh or network access on start.",
         "Commands that build hand the terminal to cargo and sudo and",

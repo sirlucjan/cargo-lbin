@@ -3,7 +3,7 @@
 //! The TUI adds no logic of its own. It reads the manifest and the last
 //! `checkupdate` report from disk, and every action is one of the existing
 //! commands: `r` is `checkupdate`, `u`/`U` are `update NAME`/`update --all`,
-//! `i` is `install`, `x` is `remove`, `s` is `info`. Nothing happens
+//! `i` is `install`, `x` is `remove`, `s` is `search`. Nothing happens
 //! unless a key asks for it — no polling, no refresh or network access on
 //! start. (Once asked, `i`, `u` and `U` reach the network too, through
 //! cargo; the guarantee is about what the TUI does unprompted.)
@@ -16,8 +16,8 @@
 //! back (the lazygit-spawns-an-editor pattern). The `Terminal` is created
 //! once and kept across handoffs: `ratatui::try_init()` installs a panic hook
 //! on every call, wrapping the previous one, so re-initializing per
-//! command would stack a hook per operation. `checkupdate` and `info`
-//! only talk to the index; they run on a one-shot thread while the list
+//! command would stack a hook per operation. `checkupdate` and `search`
+//! only talk to crates.io; they run on a one-shot thread while the list
 //! stays navigable, and their answers are applied on the main thread.
 
 mod ui;
@@ -35,7 +35,7 @@ use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, Ke
 use ratatui::crossterm::terminal::{EnterAlternateScreen, enable_raw_mode};
 use semver::Version;
 
-use crate::index;
+use crate::api;
 use crate::lock::{Mode, StateLock};
 use crate::manifest::{Entry, Manifest};
 use crate::report::{Checked, Report, Status};
@@ -106,7 +106,7 @@ pub struct Message {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum InputPurpose {
     Install,
-    Info,
+    Search,
 }
 
 pub struct Input {
@@ -134,9 +134,9 @@ enum PendingAction {
 /// busy label and the user should know what it stands for.
 enum Job {
     Check(Receiver<Result<Vec<Checked>>>),
-    Info {
-        name: String,
-        rx: Receiver<Result<Option<Vec<index::Release>>>>,
+    Search {
+        query: String,
+        rx: Receiver<Result<Vec<api::Hit>>>,
     },
 }
 
@@ -144,15 +144,23 @@ impl Job {
     fn label(&self) -> String {
         match self {
             Job::Check(_) => "checking crates.io for updates…".to_owned(),
-            Job::Info { name, .. } => format!("looking up `{name}` on crates.io…"),
+            Job::Search { query, .. } => format!("searching crates.io for `{query}`…"),
         }
     }
 }
 
-/// A finished lookup, shown in the details panel until dismissed.
-pub struct InfoResult {
-    pub name: String,
-    pub text: String,
+/// How many hits the details panel can show; passed to `api::search`,
+/// which guarantees no more come back.
+const SEARCH_HITS: usize = 6;
+
+/// A finished search, shown in the details panel until dismissed. Digit
+/// keys pick a hit by its 1-based position and fill the install input.
+pub struct SearchResult {
+    pub query: String,
+    pub hits: Vec<api::Hit>,
+    /// Installed version per hit name, read from the manifest when the
+    /// result was presented (see `finish_search`).
+    pub installed: BTreeMap<String, String>,
 }
 
 pub struct App {
@@ -168,7 +176,7 @@ pub struct App {
     pub message: Option<Message>,
     pub input: Option<Input>,
     pub confirm: Option<Confirm>,
-    pub info_result: Option<InfoResult>,
+    pub search_result: Option<SearchResult>,
     pub show_help: bool,
     pending: Option<PendingAction>,
     job: Option<Job>,
@@ -222,7 +230,7 @@ impl App {
             message: None,
             input: None,
             confirm: None,
-            info_result: None,
+            search_result: None,
             show_help: false,
             pending: None,
             job: None,
@@ -234,18 +242,18 @@ impl App {
 
     /// Re-read manifest and report from disk and rebuild the rows. Called
     /// at start, after every terminal-taking command, before an update
-    /// check, and when an info result is about to be presented — the
+    /// check, and when a search result is about to be presented — the
     /// TUI may have been open for an hour while another cargo-lbin
     /// changed the prefix, and each of those is a moment the user is
     /// about to be shown or act on the prefix's state. The state lock is
     /// held only for the manifest read, never while the TUI idles.
     fn reload(&mut self) -> Result<()> {
-        // An info result states "installed: yes/no" as a fact about the
+        // A search result marks hits as installed — a fact about the
         // prefix. Anything that re-reads the prefix — a command's return,
-        // `r`, a newer lookup — is exactly the moment that fact may have
-        // stopped being true, so it goes. `finish_info` reloads first
+        // `r`, a newer search — is exactly the moment that fact may have
+        // stopped being true, so it goes. `finish_search` reloads first
         // and sets the new result after, so this never eats a fresh one.
-        self.info_result = None;
+        self.search_result = None;
         let report = match Report::load(&self.cache, &self.prefix) {
             Ok(report) => report,
             Err(e) => {
@@ -418,7 +426,7 @@ impl App {
         match key.code {
             KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Esc => {
-                if self.info_result.take().is_none() {
+                if self.search_result.take().is_none() {
                     self.should_quit = true;
                 }
             }
@@ -434,7 +442,24 @@ impl App {
                 self.clamp_selection();
             }
             KeyCode::Char('r') => self.start_check(),
-            KeyCode::Char('s') => self.open_input(InputPurpose::Info),
+            KeyCode::Char('s') => self.open_input(InputPurpose::Search),
+            // With a search result up, a digit picks a hit and opens the
+            // install line with that name — editable, so `--locked` can
+            // still be added before Enter.
+            KeyCode::Char(c @ '1'..='9') if self.search_result.is_some() => {
+                let pick = c
+                    .to_digit(10)
+                    .and_then(|d| usize::try_from(d).ok())
+                    .and_then(|d| d.checked_sub(1))
+                    .and_then(|i| self.search_result.as_ref()?.hits.get(i))
+                    .map(|h| h.name.clone());
+                if let Some(name) = pick {
+                    self.input = Some(Input {
+                        purpose: InputPurpose::Install,
+                        buffer: name,
+                    });
+                }
+            }
             KeyCode::Char('i') => self.open_input(InputPurpose::Install),
             KeyCode::Enter | KeyCode::Char('u') => {
                 if let Some(name) = self.selected_name() {
@@ -501,15 +526,15 @@ impl App {
                 Ok((crates, locked)) => self.queue(PendingAction::Install { crates, locked }),
                 Err(e) => self.error(&format!("{e:#}")),
             },
-            InputPurpose::Info => match parse_info_input(buffer) {
-                Ok(name) => self.start_info(name),
+            InputPurpose::Search => match parse_search_input(buffer) {
+                Ok(query) => self.start_search(query),
                 Err(e) => self.error(&format!("{e:#}")),
             },
         }
     }
 
     fn open_input(&mut self, purpose: InputPurpose) {
-        if self.job.is_some() && purpose == InputPurpose::Info {
+        if self.job.is_some() && purpose == InputPurpose::Search {
             self.error("busy; wait for the current lookup to finish");
             return;
         }
@@ -563,17 +588,17 @@ impl App {
         self.message = None;
     }
 
-    fn start_info(&mut self, name: String) {
+    fn start_search(&mut self, query: String) {
         // The old result is not a placeholder for the new one: a failed
-        // lookup must not leave the previous crate's answer on screen
-        // under a footer that talks about a different name.
-        self.info_result = None;
+        // search must not leave the previous query's hits on screen under
+        // a footer that talks about a different one.
+        self.search_result = None;
         let (tx, rx) = mpsc::channel();
-        let query = name.clone();
+        let q = query.clone();
         thread::spawn(move || {
-            let _ = tx.send(index::releases(&query));
+            let _ = tx.send(api::search(&q, SEARCH_HITS));
         });
-        self.job = Some(Job::Info { name, rx });
+        self.job = Some(Job::Search { query, rx });
         self.message = None;
     }
 
@@ -599,11 +624,11 @@ impl App {
                     bail!("update check worker aborted; the terminal was reset by the panic")
                 }
             },
-            Job::Info { name, rx } => match rx.try_recv() {
-                Ok(result) => self.finish_info(name, result),
-                Err(TryRecvError::Empty) => self.job = Some(Job::Info { name, rx }),
+            Job::Search { query, rx } => match rx.try_recv() {
+                Ok(result) => self.finish_search(query, result),
+                Err(TryRecvError::Empty) => self.job = Some(Job::Search { query, rx }),
                 Err(TryRecvError::Disconnected) => {
-                    bail!("info worker aborted; the terminal was reset by the panic")
+                    bail!("search worker aborted; the terminal was reset by the panic")
                 }
             },
         }
@@ -636,28 +661,33 @@ impl App {
         }
     }
 
-    /// The "installed" line is read from the manifest *now*, not from the
-    /// rows as they were when the request went out: another cargo-lbin
-    /// may have installed or removed the crate while the index was
-    /// answering, and `describe_info` states installation as a fact.
+    /// The installed marks are read from the manifest *now*, not from
+    /// the rows as they were when the request went out: another
+    /// cargo-lbin may have installed or removed a crate while crates.io
+    /// was answering, and the mark states installation as a fact.
     /// `checkupdate` is immune by construction (`status_for` validates
-    /// the version); info has no such check, so it reloads instead.
-    fn finish_info(&mut self, name: String, result: Result<Option<Vec<index::Release>>>) {
+    /// the version); search has no such check, so it reloads instead.
+    fn finish_search(&mut self, query: String, result: Result<Vec<api::Hit>>) {
         match result {
-            Ok(None) => self.error(&format!("{:#}", index::not_found(&name))),
-            Ok(Some(releases)) => {
+            Ok(hits) if hits.is_empty() => self.info(&format!("no crates match `{query}`")),
+            Ok(hits) => {
                 if let Err(e) = self.reload() {
                     self.error(&format!("reload failed: {e:#}"));
                     return;
                 }
-                let installed = self.rows.iter().find(|r| r.name == name).map(|r| Entry {
-                    version: r.version.clone(),
-                    bins: r.bins.clone(),
-                    locked: r.locked,
+                let installed: BTreeMap<String, String> = self
+                    .rows
+                    .iter()
+                    .filter(|r| hits.iter().any(|h| h.name == r.name))
+                    .map(|r| (r.name.clone(), r.version.clone()))
+                    .collect();
+                let n = hits.len();
+                self.search_result = Some(SearchResult {
+                    query,
+                    hits,
+                    installed,
                 });
-                let text = crate::describe_info(&name, &releases, installed.as_ref());
-                self.info_result = Some(InfoResult { name, text });
-                self.info("info shown; Esc to dismiss");
+                self.info(&format!("{n} hit(s); 1-{n} to install, Esc to dismiss"));
             }
             Err(e) => self.error(&format!("{e:#}")),
         }
@@ -762,15 +792,14 @@ fn parse_install_input(buffer: &str) -> Result<(Vec<String>, bool)> {
     Ok((crates, locked))
 }
 
-/// `s` input: exactly one crate name.
-fn parse_info_input(buffer: &str) -> Result<String> {
-    let mut tokens = buffer.split_whitespace();
-    let name = tokens.next().context("no crate name given")?;
-    if tokens.next().is_some() {
-        bail!("info takes one crate name here; use the CLI for several");
+/// `s` input: free-text search terms, whitespace-normalized. Not a crate
+/// name, so not validated as one — "sched ext scheduler" is a fine query.
+fn parse_search_input(buffer: &str) -> Result<String> {
+    let query = buffer.split_whitespace().collect::<Vec<_>>().join(" ");
+    if query.is_empty() {
+        bail!("no search terms given");
     }
-    validate_name(name)?;
-    Ok(name.to_owned())
+    Ok(query)
 }
 
 #[cfg(test)]
@@ -850,11 +879,11 @@ mod tests {
     }
 
     #[test]
-    fn info_input_takes_one_name() {
-        assert_eq!(parse_info_input(" bat ").unwrap(), "bat");
-        assert!(parse_info_input("").is_err());
-        assert!(parse_info_input("bat fd").is_err());
-        assert!(parse_info_input("bad name!").is_err());
+    fn search_input_is_free_text() {
+        assert_eq!(parse_search_input(" bat ").unwrap(), "bat");
+        assert_eq!(parse_search_input("sched  ext\tscheduler").unwrap(), "sched ext scheduler");
+        assert!(parse_search_input("").is_err());
+        assert!(parse_search_input("   ").is_err());
     }
 
     #[test]
