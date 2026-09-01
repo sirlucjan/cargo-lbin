@@ -293,7 +293,7 @@ mod tests {
     #[test]
     fn empty_result_set_is_not_an_error() {
         let hits = parse_search_body(r#"{"crates": [], "meta": {"total": 0}}"#).unwrap();
-        assert!(hits.is_empty());
+        assert_eq!(hits, Vec::<Hit>::new());
     }
 
     #[test]

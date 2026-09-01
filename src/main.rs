@@ -1109,7 +1109,7 @@ mod tests {
         // Fresh install: the name must disappear again.
         let mut m = Manifest::default();
         assert!(commit_entry(&mut m, &prefix, "foo", entry("2.0.0")).is_err());
-        assert!(m.crates.is_empty());
+        assert_eq!(m.crates.keys().collect::<Vec<_>>(), Vec::<&String>::new());
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

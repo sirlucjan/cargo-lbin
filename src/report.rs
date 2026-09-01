@@ -262,7 +262,7 @@ mod tests {
             .map(|e| e.unwrap().file_name())
             .filter(|n| n.to_string_lossy().ends_with(".tmp"))
             .collect();
-        assert!(leftovers.is_empty(), "{leftovers:?}");
+        assert_eq!(leftovers, Vec::<std::ffi::OsString>::new());
 
         let loaded = Report::load(&tmp, Path::new("/usr/local"))
             .unwrap()
