@@ -119,7 +119,7 @@ bat
   installed:   no
 ```
 
-The `latest` and `pre-release` lines describe published history and may name a yanked release, flagged as `1.1.0 [yanked]` — the yank is the point, not something to hide behind the previous version. A pre-release line appears only when it is newer than the latest stable release. The `installed` verdict is a separate question, answered from the non-yanked releases with the same rules as `checkupdate`, so the two never disagree; a crate with nothing non-yanked left says so rather than "up to date". Unknown crates are reported after the results, and the remaining names are still looked up; the exit code is non-zero if any lookup failed.
+The `latest` and `pre-release` lines describe published history and may name a yanked release, flagged as `1.1.0 [yanked]` — the yank is the point, not something to hide behind the previous version. A pre-release line appears only when it is newer than the latest stable release. The `installed` verdict is a separate question, answered from the non-yanked releases with the same rules as `checkupdate`, so the two never disagree; a crate with nothing non-yanked left says so rather than "up to date". Unknown crates are reported after the results — with a pointer to `search`, since `info` is exact by design — and the remaining names are still looked up; the exit code is non-zero if any lookup failed.
 
 Check crates.io for updates without changing anything:
 

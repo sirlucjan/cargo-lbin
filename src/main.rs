@@ -689,7 +689,12 @@ fn cmd_info(prefix: &Path, crates: &[String]) -> Result<()> {
                 );
                 shown += 1;
             }
-            Ok(None) => failures.push(index::not_found(name)),
+            // `info` is exact by design; the fuzzy question lives one
+            // command over, and a miss is the moment to say so.
+            Ok(None) => failures.push(anyhow::anyhow!(
+                "{}; try `cargo lbin search {name}`",
+                index::not_found(name)
+            )),
             Err(e) => failures.push(e),
         }
     }
