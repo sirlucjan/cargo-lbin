@@ -150,8 +150,16 @@ mod tests {
     #[test]
     fn install_spec_refuses_requirements_and_junk() {
         for bad in [
-            "foo@", "foo@^1", "foo@~1.2", "foo@1", "foo@1.2", "foo@=1.2.3", "foo@ 1.2.3",
-            "@1.2.3", "../x@1.2.3", "foo@1.2.3@4",
+            "foo@",
+            "foo@^1",
+            "foo@~1.2",
+            "foo@1",
+            "foo@1.2",
+            "foo@=1.2.3",
+            "foo@ 1.2.3",
+            "@1.2.3",
+            "../x@1.2.3",
+            "foo@1.2.3@4",
         ] {
             assert!(InstallSpec::parse(bad).is_err(), "{bad}");
         }

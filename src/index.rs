@@ -311,7 +311,10 @@ mod tests {
             [v("1.1.0"), v("1.0.0"), v("1.0.0-rc.1"), v("0.9.0")]
         );
         // Nothing older: empty, not an error.
-        assert_eq!(downgrade_candidates(&releases, &v("0.9.0")), Vec::<Version>::new());
+        assert_eq!(
+            downgrade_candidates(&releases, &v("0.9.0")),
+            Vec::<Version>::new()
+        );
     }
 
     #[test]

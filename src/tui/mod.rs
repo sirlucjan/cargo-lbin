@@ -127,10 +127,16 @@ pub struct Confirm {
 enum PendingAction {
     Update(String),
     UpdateAll,
-    Install { crates: Vec<String>, locked: bool },
+    Install {
+        crates: Vec<String>,
+        locked: bool,
+    },
     Remove(String),
     /// `pin` / `unpin`: a manifest write, so privileged like the rest.
-    SetPinned { name: String, pinned: bool },
+    SetPinned {
+        name: String,
+        pinned: bool,
+    },
     /// `downgrade`: the version prompt appears in the terminal, like
     /// `update`'s confirmation.
     Downgrade(String),
@@ -771,7 +777,10 @@ fn action_label(action: &PendingAction) -> String {
         }
         PendingAction::Remove(name) => format!("remove {name}"),
         PendingAction::SetPinned { name, pinned: true } => format!("pin {name}"),
-        PendingAction::SetPinned { name, pinned: false } => format!("unpin {name}"),
+        PendingAction::SetPinned {
+            name,
+            pinned: false,
+        } => format!("unpin {name}"),
         PendingAction::Downgrade(name) => format!("downgrade {name}"),
     }
 }

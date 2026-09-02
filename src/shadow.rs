@@ -255,10 +255,22 @@ mod tests {
         let exists = |p: &Path| p == Path::new("/usr/bin/rg");
         let cwd = Path::new("/home/u");
         let path = OsStr::new("/usr/bin:/usr/local/bin");
-        let found = find_shadows(path, Path::new("/usr/local/bin"), &bins(&["rg"]), cwd, exists);
+        let found = find_shadows(
+            path,
+            Path::new("/usr/local/bin"),
+            &bins(&["rg"]),
+            cwd,
+            exists,
+        );
         assert_eq!(found[0].outcome, Outcome::ExistingFirst);
         let path = OsStr::new("/usr/bin:/bin");
-        let found = find_shadows(path, Path::new("/opt/tools/bin"), &bins(&["rg"]), cwd, exists);
+        let found = find_shadows(
+            path,
+            Path::new("/opt/tools/bin"),
+            &bins(&["rg"]),
+            cwd,
+            exists,
+        );
         assert_eq!(found[0].outcome, Outcome::PrefixAbsent);
     }
 
@@ -269,7 +281,13 @@ mod tests {
         let exists = |p: &Path| p == Path::new("/usr/local/bin/rg");
         let cwd = Path::new("/home/u");
         let path = OsStr::new("/usr/local/bin/:/usr/./local/bin");
-        let found = find_shadows(path, Path::new("/usr/local/bin"), &bins(&["rg"]), cwd, exists);
+        let found = find_shadows(
+            path,
+            Path::new("/usr/local/bin"),
+            &bins(&["rg"]),
+            cwd,
+            exists,
+        );
         assert_eq!(found, Vec::<Shadow>::new());
     }
 
@@ -281,11 +299,23 @@ mod tests {
         // is absent from PATH.
         let exists = |p: &Path| p == Path::new("/usr/local/bin/rg");
         let path = OsStr::new("/usr/local/../local/bin:/usr/bin");
-        let found = find_shadows(path, Path::new("/usr/local/bin"), &bins(&["rg"]), cwd, exists);
+        let found = find_shadows(
+            path,
+            Path::new("/usr/local/bin"),
+            &bins(&["rg"]),
+            cwd,
+            exists,
+        );
         assert_eq!(found, Vec::<Shadow>::new());
         // And the fold does not climb above the root.
-        assert_eq!(anchor(PathBuf::from("/../usr/bin"), cwd), PathBuf::from("/usr/bin"));
-        assert_eq!(anchor(PathBuf::from("../x"), Path::new("/a/b")), PathBuf::from("/a/x"));
+        assert_eq!(
+            anchor(PathBuf::from("/../usr/bin"), cwd),
+            PathBuf::from("/usr/bin")
+        );
+        assert_eq!(
+            anchor(PathBuf::from("../x"), Path::new("/a/b")),
+            PathBuf::from("/a/x")
+        );
     }
 
     #[test]
@@ -300,7 +330,13 @@ mod tests {
         // ...and an empty entry means the current directory, as in a shell.
         let exists = |p: &Path| p == Path::new("/home/u/rg");
         let path = OsStr::new("/usr/bin::/usr/local/bin");
-        let found = find_shadows(path, Path::new("/usr/local/bin"), &bins(&["rg"]), cwd, exists);
+        let found = find_shadows(
+            path,
+            Path::new("/usr/local/bin"),
+            &bins(&["rg"]),
+            cwd,
+            exists,
+        );
         assert_eq!(found[0].existing, PathBuf::from("/home/u/rg"));
         assert_eq!(found[0].outcome, Outcome::ExistingFirst);
     }
@@ -323,7 +359,10 @@ mod tests {
             ),
             "{text}"
         );
-        assert!(text.ends_with("/usr/local/bin precedes /usr/bin in PATH"), "{text}");
+        assert!(
+            text.ends_with("/usr/local/bin precedes /usr/bin in PATH"),
+            "{text}"
+        );
         let prefix = Path::new("/usr/local/bin");
         let later = Shadow {
             outcome: Outcome::ExistingFirst,
@@ -331,7 +370,10 @@ mod tests {
         };
         let text = describe(&later, prefix, None);
         assert!(!text.contains('('), "{text}");
-        assert!(text.ends_with("/usr/bin precedes /usr/local/bin in PATH"), "{text}");
+        assert!(
+            text.ends_with("/usr/bin precedes /usr/local/bin in PATH"),
+            "{text}"
+        );
         let absent = Shadow {
             outcome: Outcome::PrefixAbsent,
             ..later

@@ -397,7 +397,12 @@ fn install_and_commit(
     let new_bins: Vec<String> = built
         .bins
         .iter()
-        .filter(|b| !manifest.crates.get(name).is_some_and(|e| e.bins.contains(b)))
+        .filter(|b| {
+            !manifest
+                .crates
+                .get(name)
+                .is_some_and(|e| e.bins.contains(b))
+        })
         .cloned()
         .collect();
     warn_shadows(prefix, &new_bins);
@@ -409,9 +414,16 @@ fn install_and_commit(
     // next `update --all` would undo the choice. Without one, a pin
     // already present is carried over (see below).
     let pin = version.is_some();
-    if let Err(err) =
-        place_and_commit(prefix, policy, manifest, name, built, locked, pin, &mut rollback)
-    {
+    if let Err(err) = place_and_commit(
+        prefix,
+        policy,
+        manifest,
+        name,
+        built,
+        locked,
+        pin,
+        &mut rollback,
+    ) {
         rollback_new_bins(policy, &rollback.placed);
         return Err(err);
     }
@@ -1005,7 +1017,9 @@ fn cmd_downgrade(prefix: &Path, name: &str) -> Result<()> {
         return Ok(());
     }
     if !std::io::stdin().is_terminal() {
-        bail!("downgrade asks which version to install; without a terminal, use `cargo lbin install {name}@VERSION`");
+        bail!(
+            "downgrade asks which version to install; without a terminal, use `cargo lbin install {name}@VERSION`"
+        );
     }
     println!("{name} {current} is installed; older versions on crates.io:");
     let shown = &candidates[..candidates.len().min(DOWNGRADE_CHOICES)];
@@ -1161,7 +1175,10 @@ fn cmd_update(prefix: &Path, crates: &[String], all: bool, yes: bool) -> Result<
         targets
     };
     for name in &skipped_pinned {
-        println!("{name} {} [pinned, skipped]", snapshot.crates[*name].version);
+        println!(
+            "{name} {} [pinned, skipped]",
+            snapshot.crates[*name].version
+        );
     }
     let outdated: Vec<Checked> = check_versions(
         snapshot
