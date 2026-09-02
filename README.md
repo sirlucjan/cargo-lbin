@@ -537,6 +537,7 @@ It currently does **not** provide:
 - Management of libraries, headers, systemd units, configuration files or other distro integration.
 - A dependency resolver of its own — Cargo remains responsible for builds and dependencies.
 - Automatic background checks, updates or a daemon. The TUI also never refreshes, searches or updates anything on its own.
+- Security advisories. Vulnerabilities live in the dependencies compiled into a binary, and `cargo-lbin` records only the crates it installed, not their dependency graphs; an "audit" of the installed names alone would report clean binaries it had not looked inside. Doing it properly would mean capturing each build's resolved dependency set, keeping an advisory database and matching version ranges — a second tool grafted onto this one. Use `cargo audit` in a source tree with an appropriate `Cargo.lock`; `cargo-lbin` does not claim to audit the dependencies compiled into its installed binaries, and a crate's published lockfile need not match what a build without `--locked` resolved.
 
 For a normal per-user `~/.cargo/bin` workflow, plain `cargo install` remains the simpler tool.
 
