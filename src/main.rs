@@ -1465,7 +1465,7 @@ mod tests {
             .collect();
         // Whatever the commands are at the time; the test does not keep
         // its own list, which is the point.
-        assert!(!names.is_empty());
+        assert_ne!(names, Vec::<String>::new());
         for shell in clap_complete::Shell::value_variants() {
             let mut out = Vec::new();
             clap_complete::generate(*shell, &mut Cli::command(), "cargo-lbin", &mut out);
