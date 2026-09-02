@@ -147,10 +147,9 @@ pub fn owner_of(path: &Path) -> Option<String> {
         ("/usr/bin/dpkg", &["-S"]),
     ];
     for (tool, args) in queries {
-        let output = match Command::new(tool).args(args).arg(path).output() {
-            Ok(output) => output,
-            // Not present (or not runnable): try the next one.
-            Err(_) => continue,
+        // Not present (or not runnable): try the next one.
+        let Ok(output) = Command::new(tool).args(args).arg(path).output() else {
+            continue;
         };
         if !output.status.success() {
             // This tool does not claim the file (or errored). Ask the

@@ -1201,10 +1201,17 @@ fn cmd_update(prefix: &Path, crates: &[String], all: bool, yes: bool) -> Result<
         println!("aborted");
         return Ok(());
     }
-    // Phase 2: exclusive. The world may have changed while we were talking,
-    // so reload and verify each planned update against the fresh manifest;
-    // anything that no longer matches the snapshot is skipped with a note
-    // rather than acted on blindly.
+    // Phase 2, in its own function: exclusive lock, fresh manifest, one
+    // crate at a time.
+    apply_updates(prefix, &cache, &outdated)
+}
+
+/// The mutating half of `update`: exclusive lock, fresh manifest, and
+/// each planned update verified against it before it is applied. The
+/// world may have changed while the plan was being confirmed, so
+/// anything that no longer matches the snapshot is skipped with a note
+/// rather than acted on blindly.
+fn apply_updates(prefix: &Path, cache: &Path, outdated: &[Checked]) -> Result<()> {
     let _lock = StateLock::acquire(prefix, &Mode::Exclusive)?;
     let mut manifest = Manifest::load(prefix)?;
     // Each crate is its own unit of work: a failed build or placement is
@@ -1227,7 +1234,7 @@ fn cmd_update(prefix: &Path, crates: &[String], all: bool, yes: bool) -> Result<
                 // The stage may end up building something newer than
                 // `latest` if a release lands mid-update; the manifest
                 // records what was built.
-                match install_and_commit(prefix, &cache, &mut manifest, &o.name, None, locked) {
+                match install_and_commit(prefix, cache, &mut manifest, &o.name, None, locked) {
                     Ok(()) => updated += 1,
                     Err(err) => {
                         eprintln!("error: updating `{}` failed: {err:#}", o.name);
