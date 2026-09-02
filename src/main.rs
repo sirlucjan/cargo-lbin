@@ -1,5 +1,6 @@
 mod api;
 mod index;
+mod json;
 mod lock;
 mod manifest;
 mod privileged;
@@ -75,7 +76,11 @@ enum Cmd {
         crates: Vec<String>,
     },
     /// List installed crates and their binaries
-    List,
+    List {
+        /// Machine-readable output (schema documented in README)
+        #[arg(long)]
+        json: bool,
+    },
     /// Interactive front end over the same commands (starts from disk;
     /// nothing runs unprompted)
     #[cfg(feature = "tui")]
@@ -98,7 +103,11 @@ enum Cmd {
     },
     /// Check crates.io for newer versions (read-only, no sudo).
     /// Exit codes: 0 updates available, 2 none, 1 error
-    Checkupdate,
+    Checkupdate {
+        /// Machine-readable output (schema documented in README)
+        #[arg(long)]
+        json: bool,
+    },
     /// Update installed crates to their newest crates.io versions
     // Either an explicit list of crates or `--all`, never neither: a bare
     // `update` has no obvious meaning once single-crate updates exist, and
@@ -146,12 +155,12 @@ fn main() -> ExitCode {
     let result = match cli.cmd {
         Cmd::Install { ref crates, locked } => cmd_install(&cli.prefix, crates, locked),
         Cmd::Remove { ref crates } => cmd_remove(&cli.prefix, crates),
-        Cmd::List => cmd_list(&cli.prefix),
+        Cmd::List { json } => cmd_list(&cli.prefix, json),
         #[cfg(feature = "tui")]
         Cmd::Tui => tui::run(&cli.prefix),
         Cmd::Info { ref crates } => cmd_info(&cli.prefix, crates),
         Cmd::Search { ref query, limit } => cmd_search(&cli.prefix, query, limit),
-        Cmd::Checkupdate => return cmd_checkupdate(&cli.prefix),
+        Cmd::Checkupdate { json } => return cmd_checkupdate(&cli.prefix, json),
         Cmd::Update {
             ref crates,
             all,
@@ -505,13 +514,9 @@ fn cmd_remove(prefix: &Path, crates: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn cmd_list(prefix: &Path) -> Result<()> {
+fn cmd_list(prefix: &Path, json: bool) -> Result<()> {
     let _lock = StateLock::acquire(prefix, &Mode::Shared)?;
     let manifest = Manifest::load(prefix)?;
-    if manifest.crates.is_empty() {
-        println!("no crates installed under {}", prefix.display());
-        return Ok(());
-    }
     // Purely local: the last `checkupdate` result, if any. An unreadable
     // report is a warning — the listing itself does not depend on it.
     let report = match cache_dir().and_then(|cache| Report::load(&cache, prefix)) {
@@ -521,6 +526,16 @@ fn cmd_list(prefix: &Path) -> Result<()> {
             None
         }
     };
+    if json {
+        // A document either way: an empty prefix is `"crates": []`, not a
+        // sentence a script would have to recognize.
+        let output = json::ListOutput::build(report::identity(prefix)?, &manifest, report.as_ref());
+        return json::print(&output);
+    }
+    if manifest.crates.is_empty() {
+        println!("no crates installed under {}", prefix.display());
+        return Ok(());
+    }
     for (name, entry) in &manifest.crates {
         let locked = if entry.locked { " [locked]" } else { "" };
         // Three states, and the last must stay silent rather than
@@ -778,31 +793,37 @@ fn cmd_search(prefix: &Path, query: &[String], limit: u8) -> Result<()> {
     Ok(())
 }
 
-fn cmd_checkupdate(prefix: &Path) -> ExitCode {
+fn cmd_checkupdate(prefix: &Path, json: bool) -> ExitCode {
     // Shared lock covers only the manifest snapshot; the index queries run
     // unlocked, so a slow crates.io cannot starve writers on the prefix.
+    // Building the report is inside the fallible part: its only failure
+    // is not being able to anchor a relative prefix, and a check whose
+    // prefix cannot be named has nothing to persist or report.
     let outcome = (|| {
         let manifest = {
             let _lock = StateLock::acquire(prefix, &Mode::Shared)?;
             Manifest::load(prefix)?
         };
-        check_versions(&manifest.crates)
+        Report::new(prefix, check_versions(&manifest.crates)?)
     })();
     match outcome {
-        Ok(checked) => {
+        Ok(report) => {
             // Persist the full snapshot for `list` (and any later reader)
             // before reporting. A failed write is a warning: the check
             // itself succeeded and its exit code must say so.
-            let stored = Report::new(prefix, checked.clone())
-                .and_then(|report| cache_dir().map(|cache| (report, cache)))
-                .and_then(|(report, cache)| report.store(&cache));
-            if let Err(e) = stored {
+            if let Err(e) = cache_dir().and_then(|cache| report.store(&cache)) {
                 eprintln!("warning: could not save update report: {e:#}");
             }
-            let mut any = false;
-            for o in checked.iter().filter(|c| c.is_outdated()) {
-                println!("{} {} -> {}", o.name, o.current, o.latest);
-                any = true;
+            let any = report.crates.iter().any(Checked::is_outdated);
+            if json {
+                if let Err(e) = json::print(&json::CheckOutput::from_report(&report)) {
+                    eprintln!("error: {e:#}");
+                    return ExitCode::from(EXIT_ERROR);
+                }
+            } else {
+                for o in report.crates.iter().filter(|c| c.is_outdated()) {
+                    println!("{} {} -> {}", o.name, o.current, o.latest);
+                }
             }
             if any {
                 ExitCode::from(EXIT_UPDATES)
@@ -977,6 +998,12 @@ mod tests {
         // Names and --all are mutually exclusive.
         assert!(Cli::try_parse_from(["cargo-lbin", "update", "--all", "foo"]).is_err());
         assert!(Cli::try_parse_from(["cargo-lbin", "update", "--all"]).is_ok());
+        assert!(Cli::try_parse_from(["cargo-lbin", "list", "--json"]).is_ok());
+        assert!(Cli::try_parse_from(["cargo-lbin", "checkupdate", "--json"]).is_ok());
+        // `--json` is per command, not global: it must not be accepted
+        // where it would silently do nothing.
+        assert!(Cli::try_parse_from(["cargo-lbin", "--json", "list"]).is_err());
+        assert!(Cli::try_parse_from(["cargo-lbin", "install", "--json", "bat"]).is_err());
         assert!(Cli::try_parse_from(["cargo-lbin", "update", "foo", "bar", "-y"]).is_ok());
         // The cargo-subcommand form strips "lbin" in main(); the parser
         // itself must not accept it.

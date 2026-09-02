@@ -88,8 +88,8 @@ cargo lbin tui
 | --- | --- |
 | `install <crate>... [--locked]` | Build crates with Cargo and install their binaries |
 | `remove <crate>...` | Remove managed crates and their binaries |
-| `list` | List managed crates, using the last update report for annotations |
-| `checkupdate` | Query crates.io for updates and save a full local report |
+| `list [--json]` | List managed crates, using the last update report for annotations |
+| `checkupdate [--json]` | Query crates.io for updates and save a full local report |
 | `update <crate>... [--yes]` | Update explicitly selected managed crates; `--yes` skips confirmation |
 | `update --all [--yes]` | Update every managed crate with an available update; `--yes` skips confirmation |
 | `search <terms>... [--limit N]` | Find crates by keyword |
@@ -216,6 +216,44 @@ some-tool 1.2.3 -> 1.3.0
 | `2` | everything is up to date |
 
 A successful check writes a full per-prefix snapshot, not merely the outdated entries. Failure to write that presentation cache is a warning; it does not change the result of an otherwise successful update check.
+
+### JSON output
+
+`list --json` and `checkupdate --json` print one JSON document on stdout and nothing else; warnings stay on stderr and exit codes are unchanged. The shape is a contract: every document carries a `schema` number, fields are only ever added within a schema version, and any rename, retype or removal is a schema bump.
+
+```json
+{
+  "schema": 1,
+  "prefix": "/usr/local",
+  "checked_at": 1756761600,
+  "crates": [
+    {
+      "name": "hexyl",
+      "version": "0.14.0",
+      "bins": ["hexyl"],
+      "locked": false,
+      "status": "outdated",
+      "latest": "0.16.0"
+    },
+    {
+      "name": "some-tool",
+      "version": "1.3.0",
+      "bins": ["some-tool", "some-toolctl"],
+      "locked": true,
+      "status": "unknown",
+      "latest": null
+    }
+  ]
+}
+```
+
+`list --json` fields: `prefix` is the absolute, normalized prefix; `checked_at` is the Unix time of the last recorded check, or `null` if there is none; `status` is one of `up_to_date`, `outdated` or `unknown` (not covered by the last check — installed or updated since); `latest` is the newest version that check found, or `null` when the status is `unknown`. An empty prefix is `"crates": []`, not a message.
+
+`checkupdate --json` prints the snapshot the check just took, with the same `schema`, `prefix` and `checked_at`, and per crate `name`, `current`, `latest` and a derived `outdated` boolean:
+
+```bash
+cargo lbin checkupdate --json | jq -r '.crates[] | select(.outdated) | .name'
+```
 
 ## Update
 

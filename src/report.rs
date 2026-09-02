@@ -70,7 +70,7 @@ pub struct Report {
 /// get two keys, which costs a cache miss and never a wrong hit.
 /// Trailing slashes and `.` components are dropped so they do not split
 /// one prefix into several keys.
-fn identity(prefix: &Path) -> Result<PathBuf> {
+pub fn identity(prefix: &Path) -> Result<PathBuf> {
     let anchored = if prefix.is_absolute() {
         prefix.to_path_buf()
     } else {
@@ -172,15 +172,24 @@ impl Report {
     /// nothing about the version that replaced it — and nothing is what
     /// the caller must show, not a stale checkmark.
     pub fn status_for(&self, name: &str, current: &Version) -> Option<Status<'_>> {
-        let checked = self
-            .crates
-            .iter()
-            .find(|c| c.name == name && c.current == *current)?;
+        let checked = self.checked_for(name, current)?;
         Some(if checked.is_outdated() {
             Status::Outdated(&checked.latest)
         } else {
             Status::UpToDate
         })
+    }
+
+    /// The record for `name` as installed *now*, with the same "checked
+    /// against this exact version" rule as `status_for`. For callers that
+    /// need what the check found even when nothing is newer: `latest` is
+    /// not always `current` for an up-to-date crate — an installed version
+    /// yanked since has a lower `latest`, and reporting `current` in its
+    /// place would misstate what the check saw.
+    pub fn checked_for(&self, name: &str, current: &Version) -> Option<&Checked> {
+        self.crates
+            .iter()
+            .find(|c| c.name == name && c.current == *current)
     }
 }
 
