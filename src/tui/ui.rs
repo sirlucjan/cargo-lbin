@@ -72,11 +72,13 @@ fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
         .visible()
         .into_iter()
         .map(|row| {
-            let name = if row.locked {
-                format!("{} [locked]", row.name)
-            } else {
-                row.name.clone()
-            };
+            let mut name = row.name.clone();
+            if row.locked {
+                name.push_str(" [locked]");
+            }
+            if row.pinned {
+                name.push_str(" [pinned]");
+            }
             TableRow::new(vec![
                 Cell::from(name),
                 Cell::from(row.version.clone()),
@@ -195,6 +197,13 @@ fn draw_details(frame: &mut Frame, app: &App, area: Rect) {
         if row.locked {
             lines.push(kv("Build", "--locked (reused on update)", Style::default()));
         }
+        if row.pinned {
+            lines.push(kv(
+                "Pinned",
+                "held at this version; p to unpin",
+                Style::default().fg(Color::Yellow),
+            ));
+        }
     } else {
         lines.push(Line::from(Span::styled(
             "nothing selected",
@@ -223,7 +232,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     } else if app.input.is_some() {
         " Enter run · Esc cancel"
     } else {
-        " ↑/↓ select · Tab filter · Enter/u update · U update all · i install · x remove · r check · s search · ? help · q quit"
+        " ↑/↓ select · Tab filter · Enter/u update · U update all · i install · x remove · p pin · r check · s search · ? help · q quit"
     };
     frame.render_widget(
         Paragraph::new(Span::styled(keys, Style::default().fg(Color::DarkGray))),
@@ -300,6 +309,7 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         "U           run update --all: fresh plan from crates.io, not the cache",
         "i           install: NAME... [--locked]",
         "x           remove selected crate (asks first)",
+        "p           pin / unpin selected crate (held back by update --all)",
         "r           check crates.io for updates (writes the report)",
         "s           search crates.io by keyword; a digit then picks a hit",
         "            and opens the install line with its name",

@@ -46,6 +46,7 @@ pub struct ListCrate {
     pub version: String,
     pub bins: Vec<String>,
     pub locked: bool,
+    pub pinned: bool,
     pub status: ListStatus,
     /// The newest version the last check found; `null` when `status` is
     /// `unknown` — absent knowledge, not an empty version.
@@ -108,6 +109,7 @@ impl ListOutput {
                     version: entry.version.clone(),
                     bins: entry.bins.clone(),
                     locked: entry.locked,
+                    pinned: entry.pinned,
                     status,
                     latest,
                 }
@@ -164,10 +166,10 @@ mod tests {
 
     fn manifest() -> Manifest {
         let mut m = Manifest::default();
-        for (name, version, bins, locked) in [
-            ("bat", "0.26.0", vec!["bat"], false),
-            ("fd", "10.3.0", vec!["fd"], true),
-            ("ripgrep", "14.1.1", vec!["rg"], false),
+        for (name, version, bins, locked, pinned) in [
+            ("bat", "0.26.0", vec!["bat"], false, true),
+            ("fd", "10.3.0", vec!["fd"], true, false),
+            ("ripgrep", "14.1.1", vec!["rg"], false, false),
         ] {
             m.crates.insert(
                 name.to_owned(),
@@ -175,6 +177,7 @@ mod tests {
                     version: version.to_owned(),
                     bins: bins.into_iter().map(str::to_owned).collect(),
                     locked,
+                    pinned,
                 },
             );
         }
@@ -228,6 +231,7 @@ mod tests {
         "bat"
       ],
       "locked": false,
+      "pinned": true,
       "status": "outdated",
       "latest": "0.26.1"
     },
@@ -238,6 +242,7 @@ mod tests {
         "fd"
       ],
       "locked": true,
+      "pinned": false,
       "status": "unknown",
       "latest": null
     },
@@ -248,6 +253,7 @@ mod tests {
         "rg"
       ],
       "locked": false,
+      "pinned": false,
       "status": "up_to_date",
       "latest": "14.1.0"
     }

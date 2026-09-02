@@ -24,6 +24,15 @@ pub struct Entry {
     /// Whether the crate was built with `--locked`; reused on update.
     #[serde(default)]
     pub locked: bool,
+    /// Held at its installed version: excluded from `update --all`, and
+    /// refused by `update NAME` and `install NAME` until unpinned. A pin
+    /// is a statement about the future, so it survives everything that
+    /// is not an explicit `unpin` — including a rewrite of the entry.
+    /// Absent in manifests written before pins existed, which reads as
+    /// "not pinned", the only sensible meaning for a file that had no
+    /// way to say otherwise.
+    #[serde(default)]
+    pub pinned: bool,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -101,10 +110,25 @@ mod tests {
 
     fn entry(bins: &[&str]) -> Entry {
         Entry {
+            pinned: false,
             version: "1.0.0".to_owned(),
             bins: bins.iter().map(|s| (*s).to_owned()).collect(),
             locked: false,
         }
+    }
+
+    #[test]
+    fn pinned_defaults_to_false_for_older_manifests() {
+        // Written before pins existed: no `pinned` key at all.
+        let raw = r#"{"crates":{"bat":{"version":"0.26.0","bins":["bat"],"locked":true}}}"#;
+        let m: Manifest = serde_json::from_str(raw).unwrap();
+        assert!(!m.crates["bat"].pinned);
+        assert!(m.crates["bat"].locked);
+        // And the flag round-trips once set.
+        let mut m = m;
+        m.crates.get_mut("bat").unwrap().pinned = true;
+        let again: Manifest = serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();
+        assert!(again.crates["bat"].pinned);
     }
 
     #[test]

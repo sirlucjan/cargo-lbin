@@ -50,6 +50,7 @@ pub struct Row {
     pub version: String,
     pub bins: Vec<String>,
     pub locked: bool,
+    pub pinned: bool,
     pub status: RowStatus,
 }
 
@@ -128,6 +129,8 @@ enum PendingAction {
     UpdateAll,
     Install { crates: Vec<String>, locked: bool },
     Remove(String),
+    /// `pin` / `unpin`: a manifest write, so privileged like the rest.
+    SetPinned { name: String, pinned: bool },
 }
 
 /// Background work in flight. At most one at a time: the footer shows one
@@ -382,6 +385,9 @@ impl App {
             PendingAction::Remove(name) => {
                 crate::cmd_remove(&self.prefix, std::slice::from_ref(name))
             }
+            PendingAction::SetPinned { name, pinned } => {
+                crate::cmd_set_pinned(&self.prefix, std::slice::from_ref(name), *pinned)
+            }
         };
         if let Err(e) = &outcome {
             eprintln!("error: {e:#}");
@@ -474,6 +480,18 @@ impl App {
             // that would find a crate this list has never seen. If there
             // is nothing to do, the command says so.
             KeyCode::Char('U') => self.queue(PendingAction::UpdateAll),
+            // Toggle from what the row shows; the command itself re-reads
+            // the manifest under the lock, so a pin changed by another
+            // process since the last reload is reported, not overwritten
+            // blindly ("already pinned").
+            KeyCode::Char('p') => {
+                if let Some(row) = self.selected_row() {
+                    self.queue(PendingAction::SetPinned {
+                        name: row.name.clone(),
+                        pinned: !row.pinned,
+                    });
+                }
+            }
             KeyCode::Char('x') => {
                 if let Some(row) = self.selected_row() {
                     let prompt = format!("remove {} ({})? [y/N]", row.name, row.bins.join(", "));
@@ -576,6 +594,7 @@ impl App {
                         version: r.version.clone(),
                         bins: r.bins.clone(),
                         locked: r.locked,
+                        pinned: r.pinned,
                     },
                 )
             })
@@ -740,6 +759,8 @@ fn action_label(action: &PendingAction) -> String {
             label
         }
         PendingAction::Remove(name) => format!("remove {name}"),
+        PendingAction::SetPinned { name, pinned: true } => format!("pin {name}"),
+        PendingAction::SetPinned { name, pinned: false } => format!("unpin {name}"),
     }
 }
 
@@ -763,6 +784,7 @@ fn rows_from(manifest: &Manifest, report: Option<&Report>) -> Vec<Row> {
                 version: entry.version.clone(),
                 bins: entry.bins.clone(),
                 locked: entry.locked,
+                pinned: entry.pinned,
                 status,
             }
         })
@@ -820,6 +842,7 @@ mod tests {
                     version: (*version).to_owned(),
                     bins: vec![(*name).to_owned()],
                     locked: false,
+                    pinned: false,
                 },
             );
         }

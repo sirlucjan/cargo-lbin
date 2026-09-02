@@ -75,6 +75,17 @@ enum Cmd {
         #[arg(required = true)]
         crates: Vec<String>,
     },
+    /// Hold crates at their installed version: excluded from `update
+    /// --all`, refused by `update NAME` and `install NAME` until unpinned
+    Pin {
+        #[arg(required = true)]
+        crates: Vec<String>,
+    },
+    /// Release a pin
+    Unpin {
+        #[arg(required = true)]
+        crates: Vec<String>,
+    },
     /// List installed crates and their binaries
     List {
         /// Machine-readable output (schema documented in README)
@@ -155,6 +166,8 @@ fn main() -> ExitCode {
     let result = match cli.cmd {
         Cmd::Install { ref crates, locked } => cmd_install(&cli.prefix, crates, locked),
         Cmd::Remove { ref crates } => cmd_remove(&cli.prefix, crates),
+        Cmd::Pin { ref crates } => cmd_set_pinned(&cli.prefix, crates, true),
+        Cmd::Unpin { ref crates } => cmd_set_pinned(&cli.prefix, crates, false),
         Cmd::List { json } => cmd_list(&cli.prefix, json),
         #[cfg(feature = "tui")]
         Cmd::Tui => tui::run(&cli.prefix),
@@ -433,6 +446,12 @@ fn place_and_commit(
     }
 
     let bins_list = built.bins.join(", ");
+    // `install` and `update` refuse pinned crates before building, so
+    // this is only ever `false` here — but a pin is not something a
+    // rewrite of the entry gets to drop by omission. Read before the
+    // call: the first argument borrows `manifest` mutably, and a plain
+    // function call gets no two-phase borrow for a later argument.
+    let pinned = manifest.crates.get(name).is_some_and(|e| e.pinned);
     commit_entry(
         manifest,
         prefix,
@@ -441,6 +460,7 @@ fn place_and_commit(
             version: built.version.to_string(),
             bins: built.bins,
             locked,
+            pinned,
         },
     )?;
     // Announced only after the manifest commit: with a rollback path in
@@ -482,8 +502,64 @@ fn cmd_install(prefix: &Path, crates: &[String], locked: bool) -> Result<()> {
     let cache = cache_dir()?;
     let _lock = StateLock::acquire(prefix, &Mode::Exclusive)?;
     let mut manifest = Manifest::load(prefix)?;
+    // A reinstall builds the newest version, which is exactly what a pin
+    // forbids; refuse before the first build, naming every pinned crate.
+    refuse_pinned(&manifest, crates)?;
     for name in crates {
         install_and_commit(prefix, &cache, &mut manifest, name, locked)?;
+    }
+    Ok(())
+}
+
+/// Error if any of `crates` is pinned in `manifest`. Both `install` and
+/// `update NAME` are explicit requests, but a pin is the more deliberate
+/// and the more durable of the two statements, so it wins; the message
+/// says how to change that.
+fn refuse_pinned(manifest: &Manifest, crates: &[String]) -> Result<()> {
+    let pinned: Vec<&str> = crates
+        .iter()
+        .filter(|n| manifest.crates.get(n.as_str()).is_some_and(|e| e.pinned))
+        .map(String::as_str)
+        .collect();
+    if !pinned.is_empty() {
+        let names = pinned.join(" ");
+        bail!(
+            "pinned: {} (run `cargo lbin unpin {names}` first)",
+            pinned.join(", ")
+        );
+    }
+    Ok(())
+}
+
+/// `pin` / `unpin`: one manifest write for the whole selection. Already
+/// in the requested state is reported, not an error — the user's wish
+/// and the manifest agree, which is the point. "Already" is a statement
+/// about what is on disk and can be said at once; "pinned X" is a
+/// statement about what the store did and is said only after it did.
+fn cmd_set_pinned(prefix: &Path, crates: &[String], pinned: bool) -> Result<()> {
+    for name in crates {
+        validate_name(name)?;
+    }
+    let _lock = StateLock::acquire(prefix, &Mode::Exclusive)?;
+    let mut manifest = Manifest::load(prefix)?;
+    let targets = select_targets(&manifest, crates)?;
+    let verb = if pinned { "pinned" } else { "unpinned" };
+    let mut changed: Vec<String> = Vec::new();
+    for name in &targets {
+        if let Some(entry) = manifest.crates.get_mut(name) {
+            if entry.pinned == pinned {
+                println!("{name} is already {verb}");
+            } else {
+                entry.pinned = pinned;
+                changed.push(format!("{verb} {name} at {}", entry.version));
+            }
+        }
+    }
+    if !changed.is_empty() {
+        manifest.store(prefix)?;
+        for line in changed {
+            println!("{line}");
+        }
     }
     Ok(())
 }
@@ -538,6 +614,7 @@ fn cmd_list(prefix: &Path, json: bool) -> Result<()> {
     }
     for (name, entry) in &manifest.crates {
         let locked = if entry.locked { " [locked]" } else { "" };
+        let pinned = if entry.pinned { " [pinned]" } else { "" };
         // Three states, and the last must stay silent rather than
         // masquerade as either of the others: a newer version known, known
         // current, or not covered by the last check (installed or updated
@@ -551,7 +628,7 @@ fn cmd_list(prefix: &Path, json: bool) -> Result<()> {
             })
             .unwrap_or_default();
         println!(
-            "{name} {}{locked} ({}){status}",
+            "{name} {}{locked}{pinned} ({}){status}",
             entry.version,
             entry.bins.join(", ")
         );
@@ -865,11 +942,38 @@ fn cmd_update(prefix: &Path, crates: &[String], all: bool, yes: bool) -> Result<
     };
     // Selection is validated against the snapshot before any network
     // traffic: a typo in a crate name must fail in milliseconds.
-    let targets: BTreeSet<String> = if all {
-        snapshot.crates.keys().cloned().collect()
+    // With `--all`, pinned crates are not part of the plan and are not
+    // asked about: `check_versions` is all-or-error, and a pinned crate
+    // whose lookup fails (yanked from the index, say) must not stop
+    // every unpinned crate from updating. What a pin holds back is
+    // `checkupdate`'s job to show; `update` plans mutation, and a pin
+    // says this crate is not being mutated. Skipped ones are named, so
+    // the hold is visible without a query.
+    let skipped_pinned: Vec<&str> = if all {
+        snapshot
+            .crates
+            .iter()
+            .filter(|(_, entry)| entry.pinned)
+            .map(|(name, _)| name.as_str())
+            .collect()
     } else {
-        select_targets(&snapshot, crates)?
+        Vec::new()
     };
+    let targets: BTreeSet<String> = if all {
+        snapshot
+            .crates
+            .iter()
+            .filter(|(_, entry)| !entry.pinned)
+            .map(|(name, _)| name.clone())
+            .collect()
+    } else {
+        let targets = select_targets(&snapshot, crates)?;
+        refuse_pinned(&snapshot, crates)?;
+        targets
+    };
+    for name in &skipped_pinned {
+        println!("{name} {} [pinned, skipped]", snapshot.crates[*name].version);
+    }
     let outdated: Vec<Checked> = check_versions(
         snapshot
             .crates
@@ -891,8 +995,13 @@ fn cmd_update(prefix: &Path, crates: &[String], all: bool, yes: bool) -> Result<
         }
     }
     if outdated.is_empty() {
-        if all {
+        if all && skipped_pinned.is_empty() {
             println!("everything is up to date");
+        } else if all {
+            println!(
+                "nothing to update; {} pinned crate(s) skipped",
+                skipped_pinned.len()
+            );
         }
         return Ok(());
     }
@@ -921,8 +1030,10 @@ fn cmd_update(prefix: &Path, crates: &[String], all: bool, yes: bool) -> Result<
     let mut failed: Vec<&str> = Vec::new();
     for (i, o) in outdated.iter().enumerate() {
         println!("[{}/{total}] {}", i + 1, o.name);
+        // Pinned since confirmation counts as changed state too: the pin
+        // is newer than the plan, and the newer statement wins.
         match manifest.crates.get(&o.name) {
-            Some(entry) if entry.version == o.current.to_string() => {
+            Some(entry) if entry.version == o.current.to_string() && !entry.pinned => {
                 let locked = entry.locked;
                 // The stage may end up building something newer than
                 // `latest` if a release lands mid-update; the manifest
@@ -979,6 +1090,7 @@ mod tests {
                     version: "1.0.0".to_owned(),
                     bins: vec![(*n).to_owned()],
                     locked: false,
+                    pinned: false,
                 },
             );
         }
@@ -1098,6 +1210,30 @@ mod tests {
     }
 
     #[test]
+    fn pinned_crates_are_refused_by_name_all_at_once() {
+        let mut m = manifest_with(&["bat", "fd", "ripgrep"]);
+        m.crates.get_mut("bat").unwrap().pinned = true;
+        m.crates.get_mut("fd").unwrap().pinned = true;
+        let err = refuse_pinned(&m, &["ripgrep".into(), "bat".into(), "fd".into()])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("bat") && err.contains("fd"), "{err}");
+        assert!(!err.contains("ripgrep"), "{err}");
+        // The suggested command is complete and runnable as printed.
+        assert!(err.contains("`cargo lbin unpin bat fd`"), "{err}");
+        // Unpinned selection, and names not in the manifest, pass: the
+        // latter are `select_targets`' problem, not this check's.
+        assert!(refuse_pinned(&m, &["ripgrep".into(), "nope".into()]).is_ok());
+    }
+
+    #[test]
+    fn pin_commands_parse() {
+        assert!(Cli::try_parse_from(["cargo-lbin", "pin", "bat"]).is_ok());
+        assert!(Cli::try_parse_from(["cargo-lbin", "unpin", "bat", "fd"]).is_ok());
+        assert!(Cli::try_parse_from(["cargo-lbin", "pin"]).is_err());
+    }
+
+    #[test]
     fn select_targets_reports_all_unknown_names_at_once() {
         let m = manifest_with(&["foo", "bar"]);
         let err = select_targets(&m, &["foo".into(), "nope".into(), "nada".into()])
@@ -1128,6 +1264,7 @@ mod tests {
             version: v.to_owned(),
             bins: vec!["foo".to_owned()],
             locked: false,
+            pinned: false,
         };
         // Update of an existing crate: the old entry must come back.
         let mut m = manifest_with(&["foo"]);
@@ -1170,6 +1307,7 @@ mod tests {
                 version: "1.0.0".to_owned(),
                 bins: vec!["foo".to_owned()],
                 locked: false,
+                pinned: false,
             },
         );
         let new_bins = vec!["foo".to_owned(), "fooctl".to_owned(), "fooadmin".to_owned()];
@@ -1206,6 +1344,7 @@ mod tests {
                 version: "1.0.0".to_owned(),
                 bins: vec!["shared".to_owned()],
                 locked: false,
+                pinned: false,
             },
         );
 

@@ -88,6 +88,7 @@ cargo lbin tui
 | --- | --- |
 | `install <crate>... [--locked]` | Build crates with Cargo and install their binaries |
 | `remove <crate>...` | Remove managed crates and their binaries |
+| `pin <crate>...` / `unpin <crate>...` | Hold crates at their installed version / release the hold |
 | `list [--json]` | List managed crates, using the last update report for annotations |
 | `checkupdate [--json]` | Query crates.io for updates and save a full local report |
 | `update <crate>... [--yes]` | Update explicitly selected managed crates; `--yes` skips confirmation |
@@ -180,7 +181,7 @@ cargo lbin list
 Example:
 
 ```text
-hexyl 0.14.0 (hexyl) -> 0.16.0
+hexyl 0.14.0 [pinned] (hexyl) -> 0.16.0
 ripgrep 14.1.1 (rg) (up to date)
 some-tool 1.2.3 [locked] (some-tool, some-toolctl)
 update check: 3h ago
@@ -232,6 +233,7 @@ A successful check writes a full per-prefix snapshot, not merely the outdated en
       "version": "0.14.0",
       "bins": ["hexyl"],
       "locked": false,
+      "pinned": true,
       "status": "outdated",
       "latest": "0.16.0"
     },
@@ -240,6 +242,7 @@ A successful check writes a full per-prefix snapshot, not merely the outdated en
       "version": "1.3.0",
       "bins": ["some-tool", "some-toolctl"],
       "locked": true,
+      "pinned": false,
       "status": "unknown",
       "latest": null
     }
@@ -247,7 +250,7 @@ A successful check writes a full per-prefix snapshot, not merely the outdated en
 }
 ```
 
-`list --json` fields: `prefix` is the absolute, normalized prefix; `checked_at` is the Unix time of the last recorded check, or `null` if there is none; `status` is one of `up_to_date`, `outdated` or `unknown` (not covered by the last check — installed or updated since); `latest` is the newest version that check found, or `null` when the status is `unknown`. An empty prefix is `"crates": []`, not a message.
+`list --json` fields: `prefix` is the absolute, normalized prefix; `checked_at` is the Unix time of the last recorded check, or `null` if there is none; `pinned` mirrors the `pin` state; `status` is one of `up_to_date`, `outdated` or `unknown` (not covered by the last check — installed or updated since); `latest` is the newest version that check found, or `null` when the status is `unknown`. An empty prefix is `"crates": []`, not a message.
 
 `checkupdate --json` prints the snapshot the check just took, with the same `schema`, `prefix` and `checked_at`, and per crate `name`, `current`, `latest` and a derived `outdated` boolean:
 
@@ -278,6 +281,19 @@ The same flag works with an explicit crate list.
 Each selected crate is an independent unit. A failure is reported and the remaining crates are still processed; successful updates are not undone because a later crate failed. The command exits non-zero whenever fewer updates were applied than were confirmed, including a failed build/placement or a crate skipped because the manifest changed between confirmation and execution.
 
 The last update report is never authoritative for mutation. `update` performs its own fresh checks, and after confirmation it reloads the manifest under the exclusive lock before changing anything.
+
+## Pin
+
+Hold a crate at the version it has:
+
+```bash
+cargo lbin pin hexyl
+cargo lbin unpin hexyl
+```
+
+A pinned crate is left out of `update --all` — listed as `[pinned, skipped]` so the hold is visible, never silent, and not queried at all, so a pinned crate whose lookup fails cannot stop the others from updating — and refused by `update NAME` and by `install NAME` (a reinstall builds the newest version, which is what the pin forbids) until it is unpinned. `checkupdate` and `list` still check and report a newer version when one exists: the pin is a decision about what to do with that fact, not a reason to hide it. `list` marks pinned crates with `[pinned]`, and a pin set by another process between confirming an update and running it counts as changed state, so that crate is skipped. Removing a pinned crate is allowed; a pin holds a version, not a binary.
+
+Pinning writes the manifest, so it needs the same privilege as installing into the prefix.
 
 ## Remove
 
@@ -328,6 +344,7 @@ The TUI starts entirely from disk — the manifest and the last `checkupdate` re
 | `U` | Run a fresh `update --all` |
 | `i` | Open the install line (`NAME... [--locked]`) |
 | `x` | Remove the selected crate after TUI confirmation |
+| `p` | Pin or unpin the selected crate |
 | `r` | Run `checkupdate` and refresh the saved report |
 | `s` | Search crates.io by keyword |
 | `1`..`9` | With search results open, pick a visible hit into the install line |
