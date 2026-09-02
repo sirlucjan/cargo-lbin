@@ -5,6 +5,7 @@ mod lock;
 mod manifest;
 mod privileged;
 mod report;
+mod shadow;
 mod stage;
 #[cfg(feature = "tui")]
 mod tui;
@@ -379,6 +380,18 @@ fn install_and_commit(
     }
     let built = stage::build(name, locked, &stage_dir)?;
     check_collisions(manifest, name, &built.bins, &prefix.join("bin"))?;
+    // Only for names this crate did not provide before: on a first
+    // install that is every binary; on an update it is the ones the new
+    // version adds (`foo` 2.0 shipping a `fooctl` that 1.0 did not),
+    // which were never checked and may well exist in `/usr/bin`. Names
+    // carried over were reported when they were new.
+    let new_bins: Vec<String> = built
+        .bins
+        .iter()
+        .filter(|b| !manifest.crates.get(name).is_some_and(|e| e.bins.contains(b)))
+        .cloned()
+        .collect();
+    warn_shadows(prefix, &new_bins);
 
     // Snapshot before `place_and_commit` inserts the new manifest entry;
     // see `RollbackSet::snapshot` for why the order is load-bearing.
@@ -472,6 +485,38 @@ fn place_and_commit(
         bin_dir.display(),
     );
     Ok(())
+}
+
+/// One stderr line per binary that a `PATH` entry outside the prefix
+/// already provides — usually a distribution package — naming the file,
+/// its owner if the package manager will say, and which of the two
+/// directories comes first in `PATH`. A warning only; see `shadow` for why it is not a
+/// refusal. Given only for names new to this crate: a distro package
+/// that appears *after* ours took the name is a collision that arose
+/// outside cargo-lbin, and repeating the warning on every update would
+/// be the price of catching it.
+fn warn_shadows(prefix: &Path, bins: &[String]) {
+    if bins.is_empty() {
+        return;
+    }
+    let Some(path_var) = std::env::var_os("PATH") else {
+        return;
+    };
+    // The scan needs the working directory only to anchor relative
+    // `PATH` entries and a relative prefix; if it cannot be read, those
+    // entries cannot be judged, and a warning that might be wrong is
+    // worse than none.
+    let Ok(cwd) = std::env::current_dir() else {
+        return;
+    };
+    let prefix_bin = prefix.join("bin");
+    for s in shadow::find_shadows(&path_var, &prefix_bin, bins, &cwd, shadow::is_executable) {
+        let owner = shadow::owner_of(&s.existing);
+        eprintln!(
+            "warning: {}",
+            shadow::describe(&s, &prefix_bin, owner.as_deref())
+        );
+    }
 }
 
 /// Insert `entry` and persist the manifest as one unit: on a failed store the

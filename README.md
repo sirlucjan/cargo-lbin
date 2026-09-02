@@ -116,6 +116,14 @@ The `--locked` choice is stored per crate and reused on future updates.
 
 Installing an already managed crate is a full reinstall: it is rebuilt in a fresh staging directory and its managed binaries are replaced. Changing `--locked` on a reinstall therefore takes effect instead of being skipped as "already installed".
 
+Installing a binary name the prefix did not have before — every name on a first install, only the added ones when an update introduces a new binary — warns when a file of that name already exists on `PATH` outside the prefix, usually a distribution package:
+
+```text
+warning: `rg` already exists as /usr/bin/rg (/usr/bin/rg is owned by ripgrep 14.1.1-1); /usr/local/bin precedes /usr/bin in PATH
+```
+
+The owner comes from `/usr/bin/pacman -Qo`, `/usr/bin/rpm -qf` or `/usr/bin/dpkg -S` — the first of these that runs and claims the file; by absolute path, never a `PATH` lookup, since the prefix itself is usually on `PATH` ahead of `/usr/bin`. Without a claim, the file is still reported. The warning reports which directory comes first in `PATH` — the prefix's `bin`, the existing file's directory, or that `<prefix>/bin` is not on `PATH` at all; it does not attempt to determine which file the current user can actually execute. Paths and package-manager output are external data and pass through the same control-character sanitizing as crates.io responses before reaching the terminal. It is a warning, not a refusal: installing a newer version than the distribution ships is a normal reason to use this tool, and the person installing decides.
+
 ## Search
 
 Find crates by keyword:
