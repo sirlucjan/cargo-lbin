@@ -47,6 +47,16 @@ pub fn build(name: &str, version: Option<&Version>, locked: bool, stage: &Path) 
     if locked {
         cmd.arg("--locked");
     }
+    // Cargo otherwise tells the user to add the temporary stage/bin to PATH.
+    // Append it for the child process so Cargo suppresses that misleading
+    // warning without changing command resolution.
+    if let Some(path) = std::env::var_os("PATH") {
+        let mut dirs: Vec<PathBuf> = std::env::split_paths(&path).collect();
+        dirs.push(stage.join("bin"));
+        if let Ok(joined) = std::env::join_paths(dirs) {
+            cmd.env("PATH", joined);
+        }
+    }
     // Compiler output goes straight to the terminal; the user should see the
     // build exactly as cargo presents it.
     let status = cmd.status().context("failed to spawn cargo")?;
