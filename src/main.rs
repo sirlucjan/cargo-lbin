@@ -19,7 +19,7 @@ use report::{Checked, Report, Status};
 use semver::Version;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use validate::{InstallSpec, validate_name};
@@ -121,6 +121,12 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Pick an older version of an installed crate from crates.io,
+    /// install it and pin it
+    Downgrade {
+        #[arg(value_name = "NAME")]
+        name: String,
+    },
     /// Update installed crates to their newest crates.io versions
     // Either an explicit list of crates or `--all`, never neither: a bare
     // `update` has no obvious meaning once single-crate updates exist, and
@@ -176,6 +182,7 @@ fn main() -> ExitCode {
         Cmd::Info { ref crates } => cmd_info(&cli.prefix, crates),
         Cmd::Search { ref query, limit } => cmd_search(&cli.prefix, query, limit),
         Cmd::Checkupdate { json } => return cmd_checkupdate(&cli.prefix, json),
+        Cmd::Downgrade { ref name } => cmd_downgrade(&cli.prefix, name),
         Cmd::Update {
             ref crates,
             all,
@@ -947,6 +954,111 @@ fn cmd_search(prefix: &Path, query: &[String], limit: u8) -> Result<()> {
     Ok(())
 }
 
+/// How many older versions `downgrade` lists. Beyond that, the user
+/// knows the number they want and `install NAME@VERSION` takes it.
+const DOWNGRADE_CHOICES: usize = 10;
+
+/// Interpret the answer to the version prompt: a 1-based number within
+/// `count`, or nothing (Enter / `q`) to abort. Anything else is an error,
+/// not a re-prompt — one question, one answer, and the command can be
+/// run again.
+fn parse_choice(answer: &str, count: usize) -> Result<Option<usize>> {
+    let answer = answer.trim();
+    if answer.is_empty() || answer.eq_ignore_ascii_case("q") {
+        return Ok(None);
+    }
+    let n: usize = answer
+        .parse()
+        .with_context(|| format!("`{answer}` is not a number between 1 and {count}"))?;
+    if n == 0 || n > count {
+        bail!("`{n}` is not between 1 and {count}");
+    }
+    Ok(Some(n - 1))
+}
+
+/// Offer the older versions of an installed crate and install the one
+/// chosen, pinned. The list comes from the index, filtered by the same
+/// release-relevance policy `update` applies, here to versions older
+/// than the installed one. Interactive by design — the point is not
+/// knowing the number — so there is no `--yes`; a script that knows the
+/// version has `install NAME@VERSION`.
+fn cmd_downgrade(prefix: &Path, name: &str) -> Result<()> {
+    validate_name(name)?;
+    // Snapshot under a shared lock; the index query and the prompt run
+    // unlocked, as in `update`. The choice is made against this
+    // snapshot, and the install below re-checks it under the exclusive
+    // lock: `install_and_commit` guarantees the chosen version lands,
+    // but not that landing it is still a downgrade of anything.
+    let entry = {
+        let _lock = StateLock::acquire(prefix, &Mode::Shared)?;
+        Manifest::load(prefix)?
+            .crates
+            .remove(name)
+            .with_context(|| format!("`{name}` is not installed under {}", prefix.display()))?
+    };
+    let current = Version::parse(&entry.version)
+        .with_context(|| format!("manifest holds unparsable version for `{name}`"))?;
+    let releases = index::releases(name)?.ok_or_else(|| index::not_found(name))?;
+    let candidates = index::downgrade_candidates(&releases, &current);
+    if candidates.is_empty() {
+        println!("{name} {current} is installed; no older version to go back to");
+        return Ok(());
+    }
+    if !std::io::stdin().is_terminal() {
+        bail!("downgrade asks which version to install; without a terminal, use `cargo lbin install {name}@VERSION`");
+    }
+    println!("{name} {current} is installed; older versions on crates.io:");
+    let shown = &candidates[..candidates.len().min(DOWNGRADE_CHOICES)];
+    for (i, v) in shown.iter().enumerate() {
+        println!("  {}) {v}", i + 1);
+    }
+    if candidates.len() > shown.len() {
+        println!(
+            "  and {} older; use `cargo lbin install {name}@VERSION` for one of those",
+            candidates.len() - shown.len()
+        );
+    }
+    print!(
+        "select a version to install (1-{}), or Enter/q to abort: ",
+        shown.len()
+    );
+    std::io::stdout().flush()?;
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer)?;
+    let Some(pick) = parse_choice(&answer, shown.len())? else {
+        println!("aborted");
+        return Ok(());
+    };
+    let version = &shown[pick];
+    let cache = cache_dir()?;
+    let _lock = StateLock::acquire(prefix, &Mode::Exclusive)?;
+    let mut manifest = Manifest::load(prefix)?;
+    // The user chose relative to `current`; the operation is only a
+    // downgrade if that is still what is installed. Removed meanwhile:
+    // installing would resurrect the crate. Changed meanwhile: from
+    // 1.0.0, installing the "older" 1.1.0 would be an upgrade under a
+    // command called downgrade. Same rule as `update`'s per-crate check
+    // after confirmation — a newer statement about the prefix wins over
+    // an older plan. `--locked` is taken fresh for the same reason; the
+    // pin need not match, since the result is pinned either way.
+    let fresh = manifest.crates.get(name).with_context(|| {
+        format!("`{name}` was removed while a version was being chosen; run the command again")
+    })?;
+    let fresh_version = Version::parse(&fresh.version)
+        .with_context(|| format!("manifest holds unparsable version for `{name}`"))?;
+    if fresh_version != current {
+        bail!(
+            "`{name}` changed from {current} to {fresh_version} while a version was being chosen; \
+             run the command again"
+        );
+    }
+    let locked = fresh.locked;
+    println!("downgrading {name} {current} -> {version}");
+    // The chosen version is installed and pinned by the same path as
+    // `install NAME@VERSION`.
+    install_and_commit(prefix, &cache, &mut manifest, name, Some(version), locked)
+}
+
 fn cmd_checkupdate(prefix: &Path, json: bool) -> ExitCode {
     // Shared lock covers only the manifest snapshot; the index queries run
     // unlocked, so a slow crates.io cannot starve writers on the prefix.
@@ -1301,6 +1413,29 @@ mod tests {
         // Unpinned selection, and names not in the manifest, pass: the
         // latter are `select_targets`' problem, not this check's.
         assert!(refuse_pinned(&m, &["ripgrep".into(), "nope".into()]).is_ok());
+    }
+
+    #[test]
+    fn downgrade_choice_is_a_number_or_nothing() {
+        assert_eq!(parse_choice("2", 3).unwrap(), Some(1));
+        assert_eq!(parse_choice(" 3\n", 3).unwrap(), Some(2));
+        assert_eq!(parse_choice("", 3).unwrap(), None);
+        assert_eq!(parse_choice("\n", 3).unwrap(), None);
+        assert_eq!(parse_choice("q", 3).unwrap(), None);
+        assert_eq!(parse_choice("Q", 3).unwrap(), None);
+        for bad in ["0", "4", "-1", "1.1.2", "one", "1 2"] {
+            assert!(parse_choice(bad, 3).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn downgrade_command_takes_one_name() {
+        assert!(Cli::try_parse_from(["cargo-lbin", "downgrade", "bat"]).is_ok());
+        assert!(Cli::try_parse_from(["cargo-lbin", "downgrade"]).is_err());
+        assert!(Cli::try_parse_from(["cargo-lbin", "downgrade", "bat", "fd"]).is_err());
+        // No `--yes`: the answer is the version, and a script has
+        // `install NAME@VERSION`.
+        assert!(Cli::try_parse_from(["cargo-lbin", "downgrade", "bat", "--yes"]).is_err());
     }
 
     #[test]

@@ -232,7 +232,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     } else if app.input.is_some() {
         " Enter run · Esc cancel"
     } else {
-        " ↑/↓ select · Tab filter · Enter/u update · U update all · i install · x remove · p pin · r check · s search · ? help · q quit"
+        " ↑/↓ select · Tab filter · Enter/u update · U update all · i install · x remove · p pin · D downgrade · r check · s search · ? help · q quit"
     };
     frame.render_widget(
         Paragraph::new(Span::styled(keys, Style::default().fg(Color::DarkGray))),
@@ -310,6 +310,7 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         "i           install: NAME[@VERSION]... [--locked]  (@VERSION pins)",
         "x           remove selected crate (asks first)",
         "p           pin / unpin selected crate (held back by update --all)",
+        "D           downgrade: pick an older version in the terminal, pinned",
         "r           check crates.io for updates (writes the report)",
         "s           search crates.io by keyword; a digit then picks a hit",
         "            and opens the install line with its name",

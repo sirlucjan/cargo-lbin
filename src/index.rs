@@ -161,6 +161,24 @@ pub fn summarize(releases: &[Release]) -> Summary {
     }
 }
 
+/// Versions a `downgrade` from `current` may pick: published, not
+/// yanked, older than `current`, newest first — and pre-releases only
+/// if `current` is itself one, the release-relevance policy
+/// `latest_relevant` applies upward, applied here to the versions
+/// below. (Not a symmetry: from a pre-release one may step down to a
+/// stable, and from that stable `update` no longer considers
+/// pre-releases, so the way back is not offered.)
+pub fn downgrade_candidates(releases: &[Release], current: &Version) -> Vec<Version> {
+    let allow_pre = !current.pre.is_empty();
+    let mut out: Vec<Version> = releases
+        .iter()
+        .filter(|r| !r.yanked && r.version < *current && (allow_pre || r.version.pre.is_empty()))
+        .map(|r| r.version.clone())
+        .collect();
+    out.sort_by(|a, b| b.cmp(a));
+    out
+}
+
 /// Pick the newest version relevant to someone currently on `current`.
 ///
 /// Pre-releases are only considered if the installed version is itself a
@@ -267,6 +285,33 @@ mod tests {
         // beta is, yanked or not.
         assert_eq!(summary.latest_pre, Some(rel("1.1.0-beta.2", true)));
         assert_eq!((summary.total, summary.yanked), (6, 2));
+    }
+
+    #[test]
+    fn downgrade_candidates_are_older_live_and_relevant() {
+        let body = r#"{"vers":"0.9.0","yanked":false}
+{"vers":"1.0.0-rc.1","yanked":false}
+{"vers":"1.0.0","yanked":false}
+{"vers":"1.0.1","yanked":true}
+{"vers":"1.1.0","yanked":false}
+{"vers":"1.2.0-beta.1","yanked":false}
+{"vers":"1.2.0","yanked":false}"#;
+        let releases = parse_index_body("demo", body).unwrap();
+        let v = |s: &str| Version::parse(s).unwrap();
+        // From a stable 1.2.0: older stables only, newest first; the
+        // yanked 1.0.1 and the pre-releases are not offered.
+        assert_eq!(
+            downgrade_candidates(&releases, &v("1.2.0")),
+            [v("1.1.0"), v("1.0.0"), v("0.9.0")]
+        );
+        // From a pre-release, pre-releases count too — but nothing
+        // newer than or equal to the installed one.
+        assert_eq!(
+            downgrade_candidates(&releases, &v("1.2.0-beta.1")),
+            [v("1.1.0"), v("1.0.0"), v("1.0.0-rc.1"), v("0.9.0")]
+        );
+        // Nothing older: empty, not an error.
+        assert_eq!(downgrade_candidates(&releases, &v("0.9.0")), Vec::<Version>::new());
     }
 
     #[test]

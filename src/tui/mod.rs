@@ -131,6 +131,9 @@ enum PendingAction {
     Remove(String),
     /// `pin` / `unpin`: a manifest write, so privileged like the rest.
     SetPinned { name: String, pinned: bool },
+    /// `downgrade`: the version prompt appears in the terminal, like
+    /// `update`'s confirmation.
+    Downgrade(String),
 }
 
 /// Background work in flight. At most one at a time: the footer shows one
@@ -388,6 +391,7 @@ impl App {
             PendingAction::SetPinned { name, pinned } => {
                 crate::cmd_set_pinned(&self.prefix, std::slice::from_ref(name), *pinned)
             }
+            PendingAction::Downgrade(name) => crate::cmd_downgrade(&self.prefix, name),
         };
         if let Err(e) = &outcome {
             eprintln!("error: {e:#}");
@@ -490,6 +494,13 @@ impl App {
                         name: row.name.clone(),
                         pinned: !row.pinned,
                     });
+                }
+            }
+            // The choice of version is made in the terminal, by the
+            // command itself — one prompt, the real list, no TUI copy.
+            KeyCode::Char('D') => {
+                if let Some(name) = self.selected_name() {
+                    self.queue(PendingAction::Downgrade(name));
                 }
             }
             KeyCode::Char('x') => {
@@ -761,6 +772,7 @@ fn action_label(action: &PendingAction) -> String {
         PendingAction::Remove(name) => format!("remove {name}"),
         PendingAction::SetPinned { name, pinned: true } => format!("pin {name}"),
         PendingAction::SetPinned { name, pinned: false } => format!("unpin {name}"),
+        PendingAction::Downgrade(name) => format!("downgrade {name}"),
     }
 }
 
