@@ -89,6 +89,7 @@ cargo lbin tui
 | `install <crate[@version]>... [--locked]` | Build crates with Cargo and install their binaries; `@version` installs exactly that version and pins it |
 | `remove <crate>...` | Remove managed crates and their binaries |
 | `pin <crate>...` / `unpin <crate>...` | Hold crates at their installed version / release the hold |
+| `downgrade <crate>` | Pick an older version from crates.io, install it and pin it |
 | `list [--json]` | List managed crates, using the last update report for annotations |
 | `checkupdate [--json]` | Query crates.io for updates and save a full local report |
 | `update <crate>... [--yes]` | Update explicitly selected managed crates; `--yes` skips confirmation |
@@ -317,6 +318,29 @@ A pinned crate is left out of `update --all` — listed as `[pinned, skipped]` s
 
 Pinning writes the manifest, so it needs the same privilege as installing into the prefix.
 
+## Downgrade
+
+Go back to an older version without knowing its number:
+
+```bash
+cargo lbin downgrade scx_beerland
+```
+
+```text
+scx_beerland 1.1.3 is installed; older versions on crates.io:
+  1) 1.1.2
+  2) 1.1.1
+  3) 1.0.9
+select a version to install (1-3), or Enter/q to abort: 1
+downgrading scx_beerland 1.1.3 -> 1.1.2
+...
+installed scx_beerland 1.1.2 -> /usr/local/bin (scx_beerland) [pinned; `cargo lbin unpin scx_beerland` to allow updates]
+```
+
+The list is crates.io's, filtered by the same release-relevance policy `update` uses — published, not yanked, pre-releases only when the installed version is one — applied to versions older than the installed one. If the crate is removed or its installed version changes while the prompt is open, the command stops rather than applying a choice made against stale state. Newest first, at most ten; if there are more, `install NAME@VERSION` takes any of them. The chosen version is built like any install, with the crate's `--locked` setting carried over, and pinned for the same reason `install NAME@VERSION` pins: a downgrade the next `update --all` would undo is not a downgrade.
+
+The command is interactive on purpose and has no `--yes`; without a terminal it stops and points at `install NAME@VERSION`, which is what a script that knows the version needs. Any answer other than a listed number, an empty line or `q` is an error, and the command can simply be run again.
+
 ## Remove
 
 Remove one or more managed crates:
@@ -367,6 +391,7 @@ The TUI starts entirely from disk — the manifest and the last `checkupdate` re
 | `i` | Open the install line (`NAME[@VERSION]... [--locked]`; `@VERSION` pins) |
 | `x` | Remove the selected crate after TUI confirmation |
 | `p` | Pin or unpin the selected crate |
+| `D` | Downgrade the selected crate; the version prompt appears in the terminal |
 | `r` | Run `checkupdate` and refresh the saved report |
 | `s` | Search crates.io by keyword |
 | `1`..`9` | With search results open, pick a visible hit into the install line |
