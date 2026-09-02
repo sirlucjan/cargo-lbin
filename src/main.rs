@@ -62,8 +62,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Build crates from crates.io and install their binaries.
-    /// `NAME@VERSION` installs exactly that version and pins it
+    /// Build crates from crates.io and install their binaries
+    ///
+    /// `NAME@VERSION` installs exactly that version and pins it.
     Install {
         #[arg(required = true, value_name = "NAME[@VERSION]")]
         crates: Vec<String>,
@@ -77,8 +78,10 @@ enum Cmd {
         #[arg(required = true)]
         crates: Vec<String>,
     },
-    /// Hold crates at their installed version: excluded from `update
-    /// --all`, refused by `update NAME` and `install NAME` until unpinned
+    /// Hold crates at their installed version
+    ///
+    /// A pinned crate is left out of `update --all` and refused by
+    /// `update NAME` and `install NAME` until unpinned.
     Pin {
         #[arg(required = true)]
         crates: Vec<String>,
