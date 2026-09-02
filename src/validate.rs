@@ -6,9 +6,67 @@
 //! identifier (and a safe path component), and a bin name is exactly one
 //! plain filename, never a path.
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
+use semver::Version;
 use std::ffi::OsStr;
 use std::path::{Component, Path};
+
+/// What `install` was asked for: a crate, optionally at one exact
+/// version (`name@1.2.3`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstallSpec {
+    pub name: String,
+    pub version: Option<Version>,
+}
+
+impl InstallSpec {
+    /// Parse every spec and refuse a crate named more than once — with
+    /// or without versions, in any combination. One `install` call
+    /// checks pins once, against the manifest as it was before the
+    /// first build; a second spec for the same crate would run after
+    /// that check and see a pin the first one just set (or set a pin
+    /// the first one did not ask for), and `foo@1.2.3 foo` would end
+    /// with the newest version pinned. Two builds of one crate in one
+    /// command is never what anyone meant, so the whole command is
+    /// refused before anything is built.
+    pub fn parse_all(specs: &[String]) -> Result<Vec<Self>> {
+        let parsed = specs
+            .iter()
+            .map(|s| Self::parse(s))
+            .collect::<Result<Vec<_>>>()?;
+        let mut seen = std::collections::HashSet::new();
+        for spec in &parsed {
+            if !seen.insert(spec.name.as_str()) {
+                bail!("crate `{}` is given more than once", spec.name);
+            }
+        }
+        Ok(parsed)
+    }
+
+    /// Parse `NAME` or `NAME@VERSION`. The version is an exact semver
+    /// version, not a requirement: `foo@^1` is refused, because "any
+    /// matching version" is what `install foo` already means, and the
+    /// point of naming one is to get that one and keep it (the caller
+    /// pins it). The name is validated as every other name is.
+    pub fn parse(spec: &str) -> Result<Self> {
+        let (name, version) = match spec.split_once('@') {
+            Some((name, version)) => (name, Some(version)),
+            None => (spec, None),
+        };
+        validate_name(name)?;
+        let version = match version {
+            None => None,
+            Some("") => bail!("`{spec}`: empty version after `@`"),
+            Some(v) => Some(Version::parse(v).with_context(|| {
+                format!("`{spec}`: version must be an exact semver version such as 1.2.3")
+            })?),
+        };
+        Ok(Self {
+            name: name.to_owned(),
+            version,
+        })
+    }
+}
 
 /// crates.io package name: ASCII alphanumeric plus `-`/`_`, first character
 /// alphabetic (probes of digit-first names against the live index all 404).
@@ -60,6 +118,44 @@ pub fn validate_bin_list(bins: &[String]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn install_spec_parses_name_and_exact_version() {
+        let spec = InstallSpec::parse("scx_beerland@1.1.2").unwrap();
+        assert_eq!(spec.name, "scx_beerland");
+        assert_eq!(spec.version, Some(Version::parse("1.1.2").unwrap()));
+        let spec = InstallSpec::parse("bat").unwrap();
+        assert_eq!(spec.version, None);
+        // A pre-release is an exact version too.
+        assert!(InstallSpec::parse("foo@2.0.0-rc.1").is_ok());
+    }
+
+    #[test]
+    fn install_specs_refuse_a_crate_named_twice() {
+        let specs = |s: &[&str]| s.iter().map(|x| (*x).to_owned()).collect::<Vec<_>>();
+        for dup in [
+            &["foo", "foo"][..],
+            &["foo", "foo@1.2.3"],
+            &["foo@1.2.3", "foo"],
+            &["foo@1.2.3", "foo@1.3.0"],
+            &["bar", "foo@1.2.3", "baz", "foo"],
+        ] {
+            let err = InstallSpec::parse_all(&specs(dup)).unwrap_err().to_string();
+            assert!(err.contains("`foo`"), "{dup:?}: {err}");
+        }
+        let ok = InstallSpec::parse_all(&specs(&["foo@1.2.3", "bar", "baz@0.1.0"])).unwrap();
+        assert_eq!(ok.len(), 3);
+    }
+
+    #[test]
+    fn install_spec_refuses_requirements_and_junk() {
+        for bad in [
+            "foo@", "foo@^1", "foo@~1.2", "foo@1", "foo@1.2", "foo@=1.2.3", "foo@ 1.2.3",
+            "@1.2.3", "../x@1.2.3", "foo@1.2.3@4",
+        ] {
+            assert!(InstallSpec::parse(bad).is_err(), "{bad}");
+        }
+    }
 
     #[test]
     fn name_validation_matches_crates_io_rules() {

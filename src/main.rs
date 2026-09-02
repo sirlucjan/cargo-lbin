@@ -22,7 +22,7 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use validate::validate_name;
+use validate::{InstallSpec, validate_name};
 
 /// Exit codes for `checkupdate`, following the pacman-contrib
 /// `checkupdates` convention: 0 = updates available, 2 = none, 1 = error.
@@ -62,9 +62,10 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Build crates from crates.io and install their binaries
+    /// Build crates from crates.io and install their binaries.
+    /// `NAME@VERSION` installs exactly that version and pins it
     Install {
-        #[arg(required = true)]
+        #[arg(required = true, value_name = "NAME[@VERSION]")]
         crates: Vec<String>,
         /// Build with the crate's committed Cargo.lock (reproducible; skips
         /// newer dependency releases until the crate itself releases)
@@ -353,6 +354,7 @@ fn install_and_commit(
     cache: &Path,
     manifest: &mut Manifest,
     name: &str,
+    version: Option<&Version>,
     locked: bool,
 ) -> Result<()> {
     // Revalidate even though CLI input was already checked: on the update
@@ -378,7 +380,7 @@ fn install_and_commit(
         fs::remove_dir_all(&stage_dir)
             .with_context(|| format!("clearing stale stage {}", stage_dir.display()))?;
     }
-    let built = stage::build(name, locked, &stage_dir)?;
+    let built = stage::build(name, version, locked, &stage_dir)?;
     check_collisions(manifest, name, &built.bins, &prefix.join("bin"))?;
     // Only for names this crate did not provide before: on a first
     // install that is every binary; on an update it is the ones the new
@@ -396,7 +398,12 @@ fn install_and_commit(
     // Snapshot before `place_and_commit` inserts the new manifest entry;
     // see `RollbackSet::snapshot` for why the order is load-bearing.
     let mut rollback = RollbackSet::snapshot(manifest, name, &built.bins);
-    if let Err(err) = place_and_commit(prefix, policy, manifest, name, built, locked, &mut rollback)
+    // An exact version was chosen to be kept: the entry is pinned, or the
+    // next `update --all` would undo the choice. Without one, a pin
+    // already present is carried over (see below).
+    let pin = version.is_some();
+    if let Err(err) =
+        place_and_commit(prefix, policy, manifest, name, built, locked, pin, &mut rollback)
     {
         rollback_new_bins(policy, &rollback.placed);
         return Err(err);
@@ -420,6 +427,7 @@ fn install_and_commit(
 /// on any `Err`, so placement, obsolete cleanup, manifest serialization,
 /// the sealed memfd and the atomic manifest placement are all covered by
 /// the same rollback — without cleanup code at every `?`.
+#[allow(clippy::too_many_arguments)]
 fn place_and_commit(
     prefix: &Path,
     policy: privileged::Escalation,
@@ -427,6 +435,7 @@ fn place_and_commit(
     name: &str,
     built: stage::Built,
     locked: bool,
+    pin: bool,
     rollback: &mut RollbackSet,
 ) -> Result<()> {
     let bin_dir = prefix.join("bin");
@@ -459,12 +468,15 @@ fn place_and_commit(
     }
 
     let bins_list = built.bins.join(", ");
-    // `install` and `update` refuse pinned crates before building, so
-    // this is only ever `false` here — but a pin is not something a
-    // rewrite of the entry gets to drop by omission. Read before the
-    // call: the first argument borrows `manifest` mutably, and a plain
-    // function call gets no two-phase borrow for a later argument.
-    let pinned = manifest.crates.get(name).is_some_and(|e| e.pinned);
+    // Pinned if this install chose a version, or if the entry was
+    // pinned before. When `pin` is false the carried-over value can only
+    // be false too — `install` and `update` refuse pinned crates unless
+    // a version is named — but a pin is not something a rewrite of the
+    // entry gets to drop by omission. When `pin` is true (a re-pin over
+    // an already pinned crate), both agree. Read before the call: the
+    // first argument borrows `manifest` mutably, and a plain function
+    // call gets no two-phase borrow for a later argument.
+    let pinned = pin || manifest.crates.get(name).is_some_and(|e| e.pinned);
     commit_entry(
         manifest,
         prefix,
@@ -479,8 +491,13 @@ fn place_and_commit(
     // Announced only after the manifest commit: with a rollback path in
     // play, an "installed" printed before `store` could be followed by that
     // very installation being undone.
+    let pin_note = if pin {
+        format!(" [pinned; `cargo lbin unpin {name}` to allow updates]")
+    } else {
+        String::new()
+    };
     println!(
-        "installed {name} {} -> {} ({bins_list})",
+        "installed {name} {} -> {} ({bins_list}){pin_note}",
         built.version,
         bin_dir.display(),
     );
@@ -541,17 +558,32 @@ fn commit_entry(manifest: &mut Manifest, prefix: &Path, name: &str, entry: Entry
 }
 
 fn cmd_install(prefix: &Path, crates: &[String], locked: bool) -> Result<()> {
-    for name in crates {
-        validate_name(name)?;
-    }
+    // Parsed and de-duplicated by crate before anything else: the pin
+    // check below runs once, against the manifest as it is now, so the
+    // same crate must not appear twice in one command (see `parse_all`).
+    let specs = InstallSpec::parse_all(crates)?;
     let cache = cache_dir()?;
     let _lock = StateLock::acquire(prefix, &Mode::Exclusive)?;
     let mut manifest = Manifest::load(prefix)?;
-    // A reinstall builds the newest version, which is exactly what a pin
-    // forbids; refuse before the first build, naming every pinned crate.
-    refuse_pinned(&manifest, crates)?;
-    for name in crates {
-        install_and_commit(prefix, &cache, &mut manifest, name, locked)?;
+    // A bare reinstall builds the newest version, which is exactly what a
+    // pin forbids; refuse before the first build, naming every pinned
+    // crate. Naming a version is different: `install foo@1.2.3` on a
+    // pinned `foo` is the user re-pinning to that version, and is allowed.
+    let unversioned: Vec<String> = specs
+        .iter()
+        .filter(|s| s.version.is_none())
+        .map(|s| s.name.clone())
+        .collect();
+    refuse_pinned(&manifest, &unversioned)?;
+    for spec in &specs {
+        install_and_commit(
+            prefix,
+            &cache,
+            &mut manifest,
+            &spec.name,
+            spec.version.as_ref(),
+            locked,
+        )?;
     }
     Ok(())
 }
@@ -1083,7 +1115,7 @@ fn cmd_update(prefix: &Path, crates: &[String], all: bool, yes: bool) -> Result<
                 // The stage may end up building something newer than
                 // `latest` if a release lands mid-update; the manifest
                 // records what was built.
-                match install_and_commit(prefix, &cache, &mut manifest, &o.name, locked) {
+                match install_and_commit(prefix, &cache, &mut manifest, &o.name, None, locked) {
                     Ok(()) => updated += 1,
                     Err(err) => {
                         eprintln!("error: updating `{}` failed: {err:#}", o.name);

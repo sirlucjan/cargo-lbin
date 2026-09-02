@@ -39,7 +39,7 @@ use crate::api;
 use crate::lock::{Mode, StateLock};
 use crate::manifest::{Entry, Manifest};
 use crate::report::{Checked, Report, Status};
-use crate::validate::validate_name;
+use crate::validate::InstallSpec;
 
 /// How often the input poll wakes up to look for finished background work.
 const TICK: Duration = Duration::from_millis(100);
@@ -791,10 +791,11 @@ fn rows_from(manifest: &Manifest, report: Option<&Report>) -> Vec<Row> {
         .collect()
 }
 
-/// `i` input: crate names separated by whitespace, optionally with
-/// `--locked` anywhere — the same shape as the CLI, so nothing new to
-/// learn. Names are validated here so a typo fails in the footer, not
-/// after the screen has been handed over.
+/// `i` input: crate specs (`NAME` or `NAME@VERSION`) separated by
+/// whitespace, optionally with `--locked` anywhere — the same shape as
+/// the CLI, so nothing new to learn. Specs are validated here so a typo
+/// fails in the footer, not after the screen has been handed over; the
+/// strings are passed on as typed and parsed again by `install`.
 fn parse_install_input(buffer: &str) -> Result<(Vec<String>, bool)> {
     let mut crates = Vec::new();
     let mut locked = false;
@@ -802,15 +803,21 @@ fn parse_install_input(buffer: &str) -> Result<(Vec<String>, bool)> {
         if token == "--locked" {
             locked = true;
         } else {
-            validate_name(token)?;
-            if !crates.iter().any(|c| c == token) {
-                crates.push(token.to_owned());
-            }
+            // Kept as typed, duplicates included: `parse_all` is the one
+            // place that decides what a repeated crate means, and it
+            // refuses it. Silently collapsing `bat bat` here would let
+            // the TUI accept what the CLI rejects.
+            crates.push(token.to_owned());
         }
     }
     if crates.is_empty() {
         bail!("no crate name given");
     }
+    // The same validation `install` will apply, including "one crate
+    // once": `foo foo@1.2.3`, and `foo foo`, are two specs for one crate
+    // and are refused here, in the footer, rather than in the terminal
+    // after handoff.
+    InstallSpec::parse_all(&crates)?;
     Ok((crates, locked))
 }
 
@@ -889,7 +896,7 @@ mod tests {
     #[test]
     fn install_input_mirrors_cli_shape() {
         assert_eq!(
-            parse_install_input("ripgrep --locked bat ripgrep").unwrap(),
+            parse_install_input("ripgrep --locked bat").unwrap(),
             (vec!["ripgrep".to_owned(), "bat".to_owned()], true)
         );
         assert_eq!(
@@ -899,6 +906,18 @@ mod tests {
         assert!(parse_install_input("").is_err());
         assert!(parse_install_input("--locked").is_err());
         assert!(parse_install_input("../evil").is_err());
+        // Versioned specs pass through as typed; requirements do not.
+        assert_eq!(
+            parse_install_input("bat@0.26.0").unwrap(),
+            (vec!["bat@0.26.0".to_owned()], false)
+        );
+        assert!(parse_install_input("bat@^0.26").is_err());
+        // One crate, two specs: refused before the handoff — including
+        // identical tokens, which the CLI refuses too.
+        assert!(parse_install_input("bat bat@0.26.0").is_err());
+        assert!(parse_install_input("bat@0.26.0 bat@0.25.0").is_err());
+        assert!(parse_install_input("bat bat").is_err());
+        assert!(parse_install_input("bat@0.26.0 bat@0.26.0").is_err());
     }
 
     #[test]

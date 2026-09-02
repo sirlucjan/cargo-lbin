@@ -307,7 +307,7 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         "",
         "Enter, u    update selected crate (confirmed in the terminal)",
         "U           run update --all: fresh plan from crates.io, not the cache",
-        "i           install: NAME... [--locked]",
+        "i           install: NAME[@VERSION]... [--locked]  (@VERSION pins)",
         "x           remove selected crate (asks first)",
         "p           pin / unpin selected crate (held back by update --all)",
         "r           check crates.io for updates (writes the report)",

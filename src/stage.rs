@@ -32,11 +32,18 @@ struct InstallInfo {
     bins: Vec<String>,
 }
 
-/// Build `name` from crates.io into the stage root.
-pub fn build(name: &str, locked: bool, stage: &Path) -> Result<Built> {
+/// Build `name` from crates.io into the stage root — at exactly
+/// `version` if one is given, else the newest cargo picks. The exact
+/// form is spelled out (`--version =1.2.3`) rather than relying on
+/// cargo treating a bare version as exact: the intent should be in the
+/// command line, not in a default.
+pub fn build(name: &str, version: Option<&Version>, locked: bool, stage: &Path) -> Result<Built> {
     fs::create_dir_all(stage).with_context(|| format!("creating {}", stage.display()))?;
     let mut cmd = Command::new("cargo");
     cmd.arg("install").arg(name).arg("--root").arg(stage);
+    if let Some(version) = version {
+        cmd.arg("--version").arg(format!("={version}"));
+    }
     if locked {
         cmd.arg("--locked");
     }
@@ -46,7 +53,18 @@ pub fn build(name: &str, locked: bool, stage: &Path) -> Result<Built> {
     if !status.success() {
         bail!("cargo install {name} failed with {status}");
     }
-    staged_info(name, stage)
+    let built = staged_info(name, stage)?;
+    // What the stage holds is the truth about what was built; check it
+    // against what was asked rather than assume cargo honoured `=`.
+    if let Some(version) = version
+        && built.version != *version
+    {
+        bail!(
+            "asked for {name} {version} but the stage holds {}",
+            built.version
+        );
+    }
+    Ok(built)
 }
 
 /// Read what the stage actually contains for `name` from `.crates2.json`.
