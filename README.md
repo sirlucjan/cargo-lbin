@@ -97,6 +97,7 @@ cargo lbin tui
 | `search <terms>... [--limit N]` | Find crates by keyword |
 | `info <crate>...` | Show exact-name crate information and installed state |
 | `tui` | Interactive frontend over the same operations, when the `tui` feature is enabled |
+| `completions <shell>` | Print a shell completion script for the commands and flags |
 
 ## Install
 
@@ -351,6 +352,22 @@ cargo lbin remove foo bar
 ```
 
 `cargo-lbin` removes only binaries recorded as belonging to the selected managed crate.
+
+## Shell completion
+
+Completion scripts are generated from the same Clap definition as `--help`, so there is no separate handwritten command specification to maintain. The script is a snapshot of the CLI as of the version that generated it: regenerate it after upgrading `cargo-lbin` to pick up CLI changes.
+
+```bash
+cargo lbin completions bash       > ~/.local/share/bash-completion/completions/cargo-lbin
+cargo lbin completions zsh        > ~/.zfunc/_cargo-lbin            # with ~/.zfunc in fpath
+cargo lbin completions fish       > ~/.config/fish/completions/cargo-lbin.fish
+cargo lbin completions elvish     > ~/.config/elvish/lib/cargo-lbin.elv   # then `use cargo-lbin`
+cargo lbin completions powershell > $HOME\cargo-lbin.ps1              # then `. $HOME\cargo-lbin.ps1` in $PROFILE
+```
+
+Each of these writes a file that the shell loads; regenerating after an upgrade overwrites it. (Appending to `$PROFILE` directly would add a second copy on every regeneration — hence the separate `.ps1` that the profile dot-sources.)
+
+Static CLI completions only: subcommands, flags and known values (such as the shell names above). They are generated entirely from the command definition and never inspect the installation prefix, so installed crate names are deliberately not completed. The script completes the `cargo-lbin` binary; `cargo-lbin <Tab>` always works, while `cargo lbin <Tab>` depends on whether your cargo's own completion delegates to external subcommands.
 
 ## TUI
 

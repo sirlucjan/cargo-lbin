@@ -127,6 +127,12 @@ enum Cmd {
         #[arg(value_name = "NAME")]
         name: String,
     },
+    /// Print a shell completion script for cargo-lbin's commands and
+    /// flags to stdout
+    Completions {
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
+    },
     /// Update installed crates to their newest crates.io versions
     // Either an explicit list of crates or `--all`, never neither: a bare
     // `update` has no obvious meaning once single-crate updates exist, and
@@ -182,6 +188,10 @@ fn main() -> ExitCode {
         Cmd::Info { ref crates } => cmd_info(&cli.prefix, crates),
         Cmd::Search { ref query, limit } => cmd_search(&cli.prefix, query, limit),
         Cmd::Checkupdate { json } => return cmd_checkupdate(&cli.prefix, json),
+        Cmd::Completions { shell } => {
+            cmd_completions(shell);
+            Ok(())
+        }
         Cmd::Downgrade { ref name } => cmd_downgrade(&cli.prefix, name),
         Cmd::Update {
             ref crates,
@@ -966,6 +976,13 @@ fn cmd_search(prefix: &Path, query: &[String], limit: u8) -> Result<()> {
     Ok(())
 }
 
+/// Generate a static completion script from the Clap command definition.
+fn cmd_completions(shell: clap_complete::Shell) {
+    use clap::CommandFactory;
+    let mut cmd = Cli::command();
+    clap_complete::generate(shell, &mut cmd, "cargo-lbin", &mut std::io::stdout());
+}
+
 /// How many older versions `downgrade` lists. Beyond that, the user
 /// knows the number they want and `install NAME@VERSION` takes it.
 const DOWNGRADE_CHOICES: usize = 10;
@@ -1437,6 +1454,27 @@ mod tests {
         // Unpinned selection, and names not in the manifest, pass: the
         // latter are `select_targets`' problem, not this check's.
         assert!(refuse_pinned(&m, &["ripgrep".into(), "nope".into()]).is_ok());
+    }
+
+    #[test]
+    fn completions_cover_every_shell_and_every_command() {
+        use clap::{CommandFactory, ValueEnum};
+        let names: Vec<String> = Cli::command()
+            .get_subcommands()
+            .map(|c| c.get_name().to_owned())
+            .collect();
+        // Whatever the commands are at the time; the test does not keep
+        // its own list, which is the point.
+        assert!(!names.is_empty());
+        for shell in clap_complete::Shell::value_variants() {
+            let mut out = Vec::new();
+            clap_complete::generate(*shell, &mut Cli::command(), "cargo-lbin", &mut out);
+            let script = String::from_utf8(out).unwrap();
+            assert!(!script.is_empty(), "{shell}");
+            for name in &names {
+                assert!(script.contains(name.as_str()), "{shell}: missing `{name}`");
+            }
+        }
     }
 
     #[test]
