@@ -86,7 +86,7 @@ cargo lbin tui
 
 | Command | Purpose |
 | --- | --- |
-| `install <crate>... [--locked]` | Build crates with Cargo and install their binaries |
+| `install <crate[@version]>... [--locked]` | Build crates with Cargo and install their binaries; `@version` installs exactly that version and pins it |
 | `remove <crate>...` | Remove managed crates and their binaries |
 | `pin <crate>...` / `unpin <crate>...` | Hold crates at their installed version / release the hold |
 | `list [--json]` | List managed crates, using the last update report for annotations |
@@ -105,6 +105,18 @@ Install one or more crates:
 cargo lbin install ripgrep
 cargo lbin install ripgrep hexyl
 ```
+
+Install exactly one version, and keep it:
+
+```bash
+cargo lbin install scx_beerland@1.1.2
+```
+
+```text
+installed scx_beerland 1.1.2 -> /usr/local/bin (scx_beerland) [pinned; `cargo lbin unpin scx_beerland` to allow updates]
+```
+
+A version chosen by name is a version meant to stay, so `@version` pins the crate (see [Pin](#pin)); without the pin, the next `update --all` would rebuild the newest release and leave no trace of the choice. The version must be an exact semver version — `foo@^1` is refused, since "any matching version" is what plain `install foo` already means. Cargo refuses yanked versions; `info` shows which ones those are. Installing a named version over an already pinned crate is allowed — it is a re-pin to that version — whereas a bare `install foo` on a pinned crate is refused, because it would build the newest release. A crate may appear only once per `install` command, with or without a version: `install foo@1.2.3 foo` would otherwise end with the newest release pinned, and two builds of one crate in one command is never what was meant.
 
 Build using the crate's committed `Cargo.lock`:
 
@@ -299,6 +311,8 @@ cargo lbin pin hexyl
 cargo lbin unpin hexyl
 ```
 
+`install NAME@VERSION` pins as part of installing (see [Install](#install)); `pin` is for a crate already in place.
+
 A pinned crate is left out of `update --all` — listed as `[pinned, skipped]` so the hold is visible, never silent, and not queried at all, so a pinned crate whose lookup fails cannot stop the others from updating — and refused by `update NAME` and by `install NAME` (a reinstall builds the newest version, which is what the pin forbids) until it is unpinned. `checkupdate` and `list` still check and report a newer version when one exists: the pin is a decision about what to do with that fact, not a reason to hide it. `list` marks pinned crates with `[pinned]`, and a pin set by another process between confirming an update and running it counts as changed state, so that crate is skipped. Removing a pinned crate is allowed; a pin holds a version, not a binary.
 
 Pinning writes the manifest, so it needs the same privilege as installing into the prefix.
@@ -350,7 +364,7 @@ The TUI starts entirely from disk — the manifest and the last `checkupdate` re
 | `Tab` | Switch between Packages and Updates |
 | `Enter`, `u` | Update the selected crate |
 | `U` | Run a fresh `update --all` |
-| `i` | Open the install line (`NAME... [--locked]`) |
+| `i` | Open the install line (`NAME[@VERSION]... [--locked]`; `@VERSION` pins) |
 | `x` | Remove the selected crate after TUI confirmation |
 | `p` | Pin or unpin the selected crate |
 | `r` | Run `checkupdate` and refresh the saved report |
@@ -532,7 +546,6 @@ Keeping the scope small is deliberate. `cargo-lbin` does not try to become anoth
 It currently does **not** provide:
 
 - Git or local-path sources (`--git`, `--path`).
-- Arbitrary version selection such as `foo@1.2.3`.
 - Privileged installation into arbitrary custom prefixes.
 - Management of libraries, headers, systemd units, configuration files or other distro integration.
 - A dependency resolver of its own — Cargo remains responsible for builds and dependencies.
