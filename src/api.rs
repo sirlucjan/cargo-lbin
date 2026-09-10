@@ -132,18 +132,12 @@ pub fn search(query: &str, limit: usize) -> Result<Vec<Hit>> {
     Ok(hits)
 }
 
-/// Text from crates.io is data, never terminal control. Anything the
-/// response contains ends up on a terminal — printed by the CLI, or
-/// handed to a `Span` by the TUI — so control characters (ESC, BEL,
-/// newlines, tabs) are replaced here, at the boundary, and whitespace is
-/// collapsed to single spaces. Applied to every string field: a name is
-/// later typed into the install line and a version is displayed, and
-/// neither should be trusted more than a description just because it is
-/// usually well-formed.
+/// Registry text on top of the shared rule (`text::sanitize`): controls
+/// become spaces there; here whitespace additionally collapses, because
+/// a crate description is prose. Build output must NOT pass through
+/// this one — rustc's indentation is meaning, not noise.
 fn sanitize_text(text: &str) -> String {
-    text.chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
-        .collect::<String>()
+    crate::text::sanitize(text)
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")

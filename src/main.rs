@@ -4,9 +4,15 @@ mod json;
 mod lock;
 mod manifest;
 mod privileged;
+#[cfg(feature = "tui")]
+// Consumed by the TUI build gauge; the allow is temporary scaffolding
+// for this series and is removed by the commit that lands the consumer.
+#[allow(dead_code)]
+mod progress;
 mod report;
 mod shadow;
 mod stage;
+mod text;
 #[cfg(feature = "tui")]
 mod tui;
 mod validate;
