@@ -15,7 +15,9 @@ pub enum BuildEvent {
     /// `  Downloading crates ...` / `   Downloaded serde v1.0.219` —
     /// the pre-build phase; the gauge shows activity but does not count.
     Downloading,
-    /// `    Finished \`release\` profile [optimized] target(s) in 12.3s`
+    /// ```text
+    ///     Finished `release` profile [optimized] target(s) in 12.3s
+    /// ```
     Finished,
     /// `error[E0308]: ...` or `error: ...` — the tail buffer becomes
     /// interesting from the first of these.

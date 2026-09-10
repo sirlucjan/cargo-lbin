@@ -130,37 +130,44 @@ fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_stateful_widget(table, area, &mut state);
 }
 
+
+/// The sticky report panel: a failure's tail and log path, or a
+/// success's warnings. Split from `draw_details` for exactly the reason
+/// clippy suggests — it is its own panel with its own rules.
+fn draw_report(frame: &mut Frame, report: &crate::tui::BuildReport, area: Rect) {
+    let color = if report.failed {
+        Color::Red
+    } else {
+        Color::Yellow
+    };
+    let mut lines: Vec<Line> = vec![Line::from(Span::styled(
+        report.title.clone(),
+        Style::default().fg(color).add_modifier(Modifier::BOLD),
+    ))];
+    lines.extend(
+        report
+            .lines
+            .iter()
+            .map(|l| Line::from(Span::raw(l.clone()))),
+    );
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Esc/Enter dismisses ");
+    // Wrapped: the log path is one of the two most important lines
+    // here, and a panel that truncates it defeats its own purpose.
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(block)
+            .wrap(Wrap { trim: false }),
+        area,
+    );}
+
 fn draw_details(frame: &mut Frame, app: &App, area: Rect) {
     // A build's report owns the panel until dismissed: a failure's tail
     // and log path, or a success's warnings — either must survive longer
     // than one keypress.
     if let Some(report) = &app.build_report {
-        let color = if report.failed {
-            Color::Red
-        } else {
-            Color::Yellow
-        };
-        let mut lines: Vec<Line> = vec![Line::from(Span::styled(
-            report.title.clone(),
-            Style::default().fg(color).add_modifier(Modifier::BOLD),
-        ))];
-        lines.extend(
-            report
-                .lines
-                .iter()
-                .map(|l| Line::from(Span::raw(l.clone()))),
-        );
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .title(" Esc/Enter dismisses ");
-        // Wrapped: the log path is one of the two most important lines
-        // here, and a panel that truncates it defeats its own purpose.
-        frame.render_widget(
-            Paragraph::new(lines)
-                .block(block)
-                .wrap(Wrap { trim: false }),
-            area,
-        );
+        draw_report(frame, report, area);
         return;
     }
     // A finished search takes over the panel until dismissed; it is the

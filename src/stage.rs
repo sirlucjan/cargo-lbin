@@ -132,7 +132,7 @@ pub fn build(name: &str, version: Option<&Version>, locked: bool, stage: &Path) 
 /// line to `on_line`; nothing reaches the terminal. Plain text is
 /// enforced, not assumed: cargo's own coloring is disabled outright and
 /// every line is control-character sanitized, because a build script or
-/// linker answers to neither cargo nor CARGO_TERM_COLOR. stdout is discarded — `cargo install` speaks on
+/// linker answers to neither cargo nor `CARGO_TERM_COLOR`. stdout is discarded — `cargo install` speaks on
 /// stderr, and a stray stdout write must not corrupt an alternate
 /// screen.
 ///
@@ -192,7 +192,8 @@ pub fn build_captured(
                 on_line(&line);
                 lines.push(line);
             }
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            // EINTR: nothing read, nothing lost; simply try again.
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
             Err(e) => {
                 read_error = Some(e);
                 break;
@@ -280,7 +281,8 @@ fn failure_with_log(
             msg.push_str(&path.display().to_string());
         }
         Err(e) => {
-            msg.push_str(&format!("\n(could not write the full log: {e:#})"));
+            use std::fmt::Write as _;
+            let _ = write!(msg, "\n(could not write the full log: {e:#})");
         }
     }
     for l in tail {

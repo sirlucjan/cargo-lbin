@@ -169,7 +169,7 @@ enum PendingAction {
 }
 
 /// The render boundary in one function: every pipeline line becomes a
-/// BuildMsg here — sanitized, because past this point it is Span-bound,
+/// `BuildMsg` here — sanitized, because past this point it is Span-bound,
 /// and a shadow warning or a lock notice carries paths, and a path may
 /// hold ESC as legally as `a`. The worker forwards through this and
 /// nothing else; a future producer cannot route around it.
@@ -608,39 +608,8 @@ impl App {
                 return Ok(());
             }
         };
-        // Advisory state check before anyone is asked for a password:
-        // typing sudo's prompt only to hear "that crate is pinned" a
-        // hundred milliseconds later would be a bad joke. Advisory only —
-        // the authoritative check runs in the worker, under the
-        // exclusive lock, against the manifest as it is then.
-        if spec.version.is_none() {
-            // Advisory, silent, nonblocking: a busy lock yields "not
-            // now", never a frozen UI. The authoritative pass runs in
-            // the worker, under the real lock.
-            let advisory = StateLock::try_acquire_with(
-                &self.prefix,
-                &Mode::Shared,
-                crate::privileged::Policy::for_prefix(&self.prefix).screen_owned(),
-                &mut |_| {},
-            );
-            // Busy or unreadable falls through: skip the courtesy check
-            // and let the worker's exclusive pass decide.
-            if let Ok(Some(_lock)) = advisory {
-                match Manifest::load(&self.prefix) {
-                    Ok(m) if m.crates.get(&spec.name).is_some_and(|e| e.pinned) => {
-                        self.error(&format!(
-                            "{} is pinned; `p` unpins it, or name a version to re-pin",
-                            spec.name
-                        ));
-                        return Ok(());
-                    }
-                    Ok(_) => {}
-                    Err(e) => {
-                        self.error(&format!("{e:#}"));
-                        return Ok(());
-                    }
-                }
-            }
+        if self.refused_by_advisory_pin_check(&spec) {
+            return Ok(());
         }
         // A new attempt supersedes the previous report — a stale
         // "install foo failed" over a fresh run of foo would report on
@@ -670,7 +639,7 @@ impl App {
             };
             let prefix = self.prefix.clone();
             if !fresh
-                && let Err(e) = self.suspended(terminal, || {
+                && let Err(e) = Self::suspended(terminal, || {
                     crate::privileged::preauthorize(&prefix, true)
                 })?
             {
@@ -749,7 +718,7 @@ impl App {
     /// terminal and let the worker proceed (or fail, and say so).
     fn answer_auth(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
         let prefix = self.prefix.clone();
-        let outcome = self.suspended(terminal, || {
+        let outcome = Self::suspended(terminal, || {
             crate::privileged::preauthorize(&prefix, true)
         })?;
         let ok = match outcome {
@@ -787,14 +756,47 @@ impl App {
         Ok(())
     }
 
+    /// Advisory state check before anyone is asked for a password:
+    /// typing sudo's prompt only to hear "that crate is pinned" a
+    /// hundred milliseconds later would be a bad joke. Advisory, silent,
+    /// nonblocking: a busy lock yields "not now", never a frozen UI —
+    /// busy or unreadable skips the courtesy check, and the
+    /// authoritative pass runs in the worker, under the real lock.
+    /// Returns true when the install must stop here (refused or errored,
+    /// message already shown).
+    fn refused_by_advisory_pin_check(&mut self, spec: &InstallSpec) -> bool {
+        if spec.version.is_some() {
+            return false;
+        }
+        let advisory = StateLock::try_acquire_with(
+            &self.prefix,
+            &Mode::Shared,
+            crate::privileged::Policy::for_prefix(&self.prefix).screen_owned(),
+            &mut |_| {},
+        );
+        if let Ok(Some(_lock)) = advisory {
+            match Manifest::load(&self.prefix) {
+                Ok(m) if m.crates.get(&spec.name).is_some_and(|e| e.pinned) => {
+                    self.error(&format!(
+                        "{} is pinned; `p` unpins it, or name a version to re-pin",
+                        spec.name
+                    ));
+                    return true;
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    self.error(&format!("{e:#}"));
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     /// Leaves the TUI, runs `f` on the real terminal, and re-enters.
     /// The outer Result is the terminal handover itself — if that fails,
     /// the TUI cannot continue; `f`'s own result is the inner value.
-    fn suspended<T>(
-        &mut self,
-        terminal: &mut DefaultTerminal,
-        f: impl FnOnce() -> T,
-    ) -> Result<T> {
+    fn suspended<T>(terminal: &mut DefaultTerminal, f: impl FnOnce() -> T) -> Result<T> {
         terminal.show_cursor()?;
         ratatui::try_restore().context("leaving the TUI")?;
         println!();
@@ -814,7 +816,7 @@ impl App {
         &mut self,
         name: &str,
         result: Result<()>,
-        tail: VecDeque<String>,
+        tail: &VecDeque<String>,
         warnings: Vec<String>,
     ) {
         // The pipeline's error outranks a reload error: the tail and the
@@ -1239,7 +1241,7 @@ impl App {
                     }
                 }
                 match done {
-                    Some(result) => self.finish_build(&name, result, tail, warnings),
+                    Some(result) => self.finish_build(&name, result, &tail, warnings),
                     None => {
                         self.job = Some(Job::Build {
                             name,
@@ -1251,7 +1253,7 @@ impl App {
                             status_note,
                             warnings,
                             needs_auth,
-                        })
+                        });
                     }
                 }
             }
