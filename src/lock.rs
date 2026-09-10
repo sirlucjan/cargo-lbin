@@ -74,10 +74,9 @@ impl StateLock {
     /// an optimization that would freeze the screen for the length of
     /// someone else's build is no optimization, and the authoritative
     /// check under the real lock happens elsewhere anyway.
-    // Consumed by the TUI's advisory path; the allow is temporary
-    // scaffolding for this series and is removed by the commit that
-    // lands the consumer.
-    #[allow(dead_code)]
+    /// Only the TUI's advisory path calls this, so a CLI-only build
+    /// never does.
+    #[cfg_attr(not(feature = "tui"), allow(dead_code))]
     pub fn try_acquire_with(
         prefix: &Path,
         mode: &Mode,
@@ -94,10 +93,9 @@ impl StateLock {
     /// worker will see. A user-writable prefix answers `false` by
     /// creating the file here, which is the same file `acquire` would
     /// have created a moment later.
-    // Consumed by the TUI's advisory path; the allow is temporary
-    // scaffolding for this series and is removed by the commit that
-    // lands the consumer.
-    #[allow(dead_code)]
+    /// Only the TUI's advisory path calls this, so a CLI-only build
+    /// never does.
+    #[cfg_attr(not(feature = "tui"), allow(dead_code))]
     pub fn preparation_needs_privilege(prefix: &Path) -> bool {
         let path = prefix.join("share/cargo-lbin/lock");
         if let Some(parent) = path.parent() {

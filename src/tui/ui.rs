@@ -5,7 +5,7 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, Borders, Cell, Clear, Paragraph, Row as TableRow, Table, TableState, Tabs,
+    Block, Borders, Cell, Clear, Paragraph, Row as TableRow, Table, TableState, Tabs, Wrap,
 };
 
 use super::{App, Filter, InputPurpose, MessageKind, RowStatus};
@@ -131,6 +131,38 @@ fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_details(frame: &mut Frame, app: &App, area: Rect) {
+    // A build's report owns the panel until dismissed: a failure's tail
+    // and log path, or a success's warnings — either must survive longer
+    // than one keypress.
+    if let Some(report) = &app.build_report {
+        let color = if report.failed {
+            Color::Red
+        } else {
+            Color::Yellow
+        };
+        let mut lines: Vec<Line> = vec![Line::from(Span::styled(
+            report.title.clone(),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ))];
+        lines.extend(
+            report
+                .lines
+                .iter()
+                .map(|l| Line::from(Span::raw(l.clone()))),
+        );
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(" Esc/Enter dismisses ");
+        // Wrapped: the log path is one of the two most important lines
+        // here, and a panel that truncates it defeats its own purpose.
+        frame.render_widget(
+            Paragraph::new(lines)
+                .block(block)
+                .wrap(Wrap { trim: false }),
+            area,
+        );
+        return;
+    }
     // A finished search takes over the panel until dismissed; it is the
     // one piece of information here that did not come from the manifest.
     if let Some(search) = &app.search_result {
@@ -300,6 +332,16 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
             cursor_x.min(line_area.right().saturating_sub(1)),
             line_area.y,
         ));
+    } else if let Some(gauge) = app.build_progress() {
+        // The build gauge: a spinner so the line is visibly alive between
+        // units, a unit count instead of a guessed percentage.
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                format!(" {gauge}"),
+                Style::default().fg(Color::Yellow),
+            )),
+            line_area,
+        );
     } else if let Some(label) = app.busy() {
         let line = Span::styled(format!(" {label}"), Style::default().fg(Color::Cyan));
         frame.render_widget(Paragraph::new(line), line_area);
@@ -321,7 +363,9 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         "",
         "Enter, u    update selected crate (confirmed in the terminal)",
         "U           run update --all: fresh plan from crates.io, not the cache",
-        "i           install: NAME[@VERSION]... [--locked]  (@VERSION pins)",
+        "i           install: NAME[@VERSION]... [--locked]  (@VERSION pins);",
+        "            a single crate builds in place behind a footer gauge,",
+        "            a batch hands the terminal over as before",
         "x           remove selected crate (asks first)",
         "p           pin / unpin selected crate (held back by update --all)",
         "D           downgrade: pick an older version in the terminal, pinned",
@@ -330,8 +374,12 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         "            and opens the install line with its name",
         "",
         "Nothing runs on its own: no refresh or network access on start.",
-        "Commands that build hand the terminal to cargo and sudo and",
-        "return when you press Enter.",
+        "Single-crate installs build inside the TUI: sudo credentials are",
+        "checked up front and prompts happen on the real terminal (again",
+        "only if the timestamp expires); a failed build",
+        "keeps its last lines and the log path in the details panel.",
+        "update, downgrade and batch installs hand the terminal to cargo",
+        "and sudo as before, and return when you press Enter.",
         "",
         "q / Esc     quit (from the list)",
         "",

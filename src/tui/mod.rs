@@ -22,9 +22,10 @@
 
 mod ui;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread;
 use std::time::Duration;
 
@@ -39,6 +40,7 @@ use crate::api;
 use crate::lock::{Mode, StateLock};
 use crate::manifest::{Entry, Manifest};
 use crate::report::{Checked, Report, Status};
+use crate::progress;
 use crate::validate::InstallSpec;
 
 /// How often the input poll wakes up to look for finished background work.
@@ -166,6 +168,58 @@ enum PendingAction {
     Downgrade(String),
 }
 
+/// The render boundary in one function: every pipeline line becomes a
+/// BuildMsg here — sanitized, because past this point it is Span-bound,
+/// and a shadow warning or a lock notice carries paths, and a path may
+/// hold ESC as legally as `a`. The worker forwards through this and
+/// nothing else; a future producer cannot route around it.
+fn build_msg(kind: crate::LineKind, line: &str) -> BuildMsg {
+    let line = crate::text::sanitize(line);
+    match kind {
+        crate::LineKind::Cargo => BuildMsg::Cargo(line),
+        crate::LineKind::Notice => BuildMsg::Notice(line),
+        crate::LineKind::Warning => BuildMsg::Warning(line),
+    }
+}
+
+/// Messages a build worker streams to the UI thread — the protocol
+/// mirrors the pipeline's classification, because capture is not
+/// presentation and the UI decides differently per kind.
+enum BuildMsg {
+    /// cargo's own output: parsed for the gauge, kept for the tail.
+    Cargo(String),
+    /// The pipeline narrating itself; promoted to the live status so
+    /// "waiting for the state lock" is what the person sees, not a
+    /// gauge frozen at zero units.
+    Notice(String),
+    /// Kept past success: a shadowed binary does not stop being
+    /// shadowed because the install succeeded.
+    Warning(String),
+    /// Placement wants sudo revalidated on a real terminal. The worker
+    /// blocks on the auth channel until the run loop — the only place
+    /// that owns the terminal — answers.
+    NeedAuth,
+    /// The pipeline finished, one way or the other.
+    Done(Result<()>),
+}
+
+/// A build's sticky report, held in the details panel until dismissed.
+/// A failure carries the error tail and the log path (see
+/// `stage::build_captured`); a success carries warnings — a shadowed
+/// binary does not stop being shadowed because the install succeeded —
+/// and either would be wasted by a message that scrolls away with the
+/// next keypress.
+pub struct BuildReport {
+    pub title: String,
+    pub lines: Vec<String>,
+    pub failed: bool,
+}
+
+/// How many output lines the gauge keeps around for the failure panel.
+/// The full text is in the log file; this is only what a placement or
+/// commit error — which carries no tail of its own — gets to show.
+const BUILD_TAIL: usize = 40;
+
 /// Background work in flight. At most one at a time: the footer shows one
 /// busy label and the user should know what it stands for.
 enum Job {
@@ -174,6 +228,30 @@ enum Job {
         query: String,
         rx: Receiver<Result<Vec<api::Hit>>>,
     },
+    /// A captured single-crate install: `tui_install_one` on a worker
+    /// thread, its lines streaming in over `rx`.
+    Build {
+        name: String,
+        rx: Receiver<BuildMsg>,
+        /// The run loop's answer to `BuildMsg::NeedAuth`.
+        auth_tx: Sender<bool>,
+        /// Units started, per the progress parser. Started, not
+        /// finished: cargo announces a unit when it begins.
+        units_started: usize,
+        /// The unit last announced by cargo.
+        current: Option<String>,
+        /// Rolling tail for the failure panel.
+        tail: VecDeque<String>,
+        /// The last pipeline notice, shown as the live status until
+        /// cargo speaks again.
+        status_note: Option<String>,
+        /// Warnings; shown past a success, dropped on failure — a
+        /// rollback removes the binaries they described.
+        warnings: Vec<String>,
+        /// Set by `poll_job` when the worker asked for revalidation;
+        /// answered by the run loop, which owns the terminal.
+        needs_auth: bool,
+    },
 }
 
 impl Job {
@@ -181,6 +259,7 @@ impl Job {
         match self {
             Job::Check(_) => "checking crates.io for updates…".to_owned(),
             Job::Search { query, .. } => format!("searching crates.io for `{query}`…"),
+            Job::Build { name, .. } => format!("building {name}…"),
         }
     }
 }
@@ -213,9 +292,16 @@ pub struct App {
     pub input: Option<Input>,
     pub confirm: Option<Confirm>,
     pub search_result: Option<SearchResult>,
+    /// A build's sticky report pinned to the details panel until dismissed.
+    pub build_report: Option<BuildReport>,
     pub show_help: bool,
     pending: Option<PendingAction>,
+    /// A captured install waiting for the run loop, which owns the
+    /// terminal and must preauthorize sudo before spawning the worker.
+    pending_build: Option<(String, bool)>,
     job: Option<Job>,
+    /// Frame counter; drives the gauge spinner.
+    ticks: usize,
     should_quit: bool,
 }
 
@@ -267,6 +353,9 @@ impl App {
             input: None,
             confirm: None,
             search_result: None,
+            build_report: None,
+            pending_build: None,
+            ticks: 0,
             show_help: false,
             pending: None,
             job: None,
@@ -367,6 +456,36 @@ impl App {
         self.job.as_ref().map(Job::label)
     }
 
+    /// The live gauge line for a running build, or `None`. The spinner
+    /// keeps the line visibly alive between units — one large crate can
+    /// compile for minutes without a new `Compiling` line.
+    pub fn build_progress(&self) -> Option<String> {
+        const FRAMES: [char; 8] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧'];
+        let Some(Job::Build {
+            name,
+            units_started,
+            current,
+            status_note,
+            ..
+        }) = &self.job
+        else {
+            return None;
+        };
+        let frame = FRAMES[self.ticks % FRAMES.len()];
+        // A pipeline notice is the live truth of the moment — "waiting
+        // for the state lock…" beats a gauge frozen at zero units, which
+        // is exactly the impression the notice exists to prevent.
+        if let Some(note) = status_note {
+            return Some(format!("{frame} {name}: {note}"));
+        }
+        let unit_word = if *units_started == 1 { "unit" } else { "units" };
+        let mut line = format!("{frame} building {name} · {units_started} {unit_word}");
+        if let Some(current) = current {
+            let _ = write!(line, " · compiling {current}");
+        }
+        Some(line)
+    }
+
     pub fn prefix(&self) -> &Path {
         &self.prefix
     }
@@ -382,11 +501,25 @@ impl App {
 
     fn run(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
         while !self.should_quit {
+            self.ticks = self.ticks.wrapping_add(1);
             terminal.draw(|frame| ui::draw(frame, self))?;
 
             if let Some(action) = self.pending.take() {
                 self.run_in_terminal(terminal, &action)?;
                 continue;
+            }
+            if let Some((spec, locked)) = self.pending_build.take() {
+                self.start_build(terminal, &spec, locked)?;
+                continue;
+            }
+            if matches!(
+                &self.job,
+                Some(Job::Build {
+                    needs_auth: true,
+                    ..
+                })
+            ) {
+                self.answer_auth(terminal)?;
             }
 
             if event::poll(TICK)?
@@ -458,6 +591,309 @@ impl App {
         Ok(())
     }
 
+    /// A captured single-crate install. The run loop calls this because
+    /// only it owns the terminal: when placement will need sudo and the
+    /// credential timestamp is stale, the initial prompt happens here, up
+    /// front, on a real terminal — never inside the alternate screen.
+    fn start_build(
+        &mut self,
+        terminal: &mut DefaultTerminal,
+        raw_spec: &str,
+        locked: bool,
+    ) -> Result<()> {
+        let spec = match InstallSpec::parse_all(std::slice::from_ref(&raw_spec.to_owned())) {
+            Ok(mut specs) => specs.remove(0),
+            Err(e) => {
+                self.error(&format!("{e:#}"));
+                return Ok(());
+            }
+        };
+        // Advisory state check before anyone is asked for a password:
+        // typing sudo's prompt only to hear "that crate is pinned" a
+        // hundred milliseconds later would be a bad joke. Advisory only —
+        // the authoritative check runs in the worker, under the
+        // exclusive lock, against the manifest as it is then.
+        if spec.version.is_none() {
+            // Advisory, silent, nonblocking: a busy lock yields "not
+            // now", never a frozen UI. The authoritative pass runs in
+            // the worker, under the real lock.
+            let advisory = StateLock::try_acquire_with(
+                &self.prefix,
+                &Mode::Shared,
+                crate::privileged::Policy::for_prefix(&self.prefix).screen_owned(),
+                &mut |_| {},
+            );
+            // Busy or unreadable falls through: skip the courtesy check
+            // and let the worker's exclusive pass decide.
+            if let Ok(Some(_lock)) = advisory {
+                match Manifest::load(&self.prefix) {
+                    Ok(m) if m.crates.get(&spec.name).is_some_and(|e| e.pinned) => {
+                        self.error(&format!(
+                            "{} is pinned; `p` unpins it, or name a version to re-pin",
+                            spec.name
+                        ));
+                        return Ok(());
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        self.error(&format!("{e:#}"));
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        // A new attempt supersedes the previous report — a stale
+        // "install foo failed" over a fresh run of foo would report on
+        // the wrong world. Cleared here, once the attempt is definitely
+        // starting, so the terminal-fallback path supersedes it too.
+        self.build_report = None;
+        let policy = crate::privileged::Policy::for_prefix(&self.prefix);
+        // The pipeline's own union (bin + state) plus the lock file —
+        // the worker's first privileged touch. Mixed ownership needs the
+        // state term up front; lock preparation is consulted only where
+        // escalation is possible at all.
+        let escalate = match crate::install_needs_privilege(policy, &self.prefix) {
+            Ok(escalate) => escalate,
+            Err(e) => {
+                self.error(&format!("{e:#}"));
+                return Ok(());
+            }
+        } || (matches!(policy.sudo, crate::privileged::Sudo::Allowed)
+            && StateLock::preparation_needs_privilege(&self.prefix));
+        if escalate {
+            let fresh = match crate::privileged::credentials_fresh() {
+                Ok(fresh) => fresh,
+                Err(e) => {
+                    self.error(&format!("{e:#}"));
+                    return Ok(());
+                }
+            };
+            let prefix = self.prefix.clone();
+            if !fresh
+                && let Err(e) = self.suspended(terminal, || {
+                    crate::privileged::preauthorize(&prefix, true)
+                })?
+            {
+                self.error(&format!("{e:#}"));
+                return Ok(());
+            }
+            // Captured placement runs `sudo -n`, so a sudo that does not
+            // cache credentials (timestamp_timeout=0, per-TTY quirks)
+            // would be asked a question it cannot voice. Detect that now
+            // — right after a successful validation the timestamp should
+            // be warm — and hand the terminal over the old way instead
+            // of starting a build that must end in an error.
+            match crate::privileged::credentials_fresh() {
+                Ok(true) => {}
+                Ok(false) => {
+                    self.info("sudo does not cache credentials here; handing the terminal over");
+                    self.pending = Some(PendingAction::Install {
+                        crates: vec![raw_spec.to_owned()],
+                        locked,
+                    });
+                    return Ok(());
+                }
+                Err(e) => {
+                    self.error(&format!("{e:#}"));
+                    return Ok(());
+                }
+            }
+        }
+        let (tx, rx) = mpsc::channel();
+        let (auth_tx, auth_rx) = mpsc::channel();
+        let prefix = self.prefix.clone();
+        let name = spec.name.clone();
+        let worker_tx = tx.clone();
+        std::thread::spawn(move || {
+            let line_tx = worker_tx.clone();
+            let result = crate::tui_install_one(
+                &prefix,
+                &spec,
+                locked,
+                &mut |k: crate::LineKind, l: &str| {
+                    let _ = line_tx.send(build_msg(k, l));
+                },
+                &mut || match crate::privileged::credentials_fresh() {
+                    // The common case: the up-front validation is still
+                    // fresh and placement proceeds without a word.
+                    Ok(true) => Ok(()),
+                    Ok(false) => {
+                        let _ = worker_tx.send(BuildMsg::NeedAuth);
+                        match auth_rx.recv() {
+                            Ok(true) => Ok(()),
+                            Ok(false) => anyhow::bail!("sudo authentication failed"),
+                            Err(_) => anyhow::bail!("the interface went away mid-authorization"),
+                        }
+                    }
+                    Err(e) => Err(e),
+                },
+            );
+            let _ = tx.send(BuildMsg::Done(result));
+        });
+        self.job = Some(Job::Build {
+            name,
+            rx,
+            auth_tx,
+            units_started: 0,
+            current: None,
+            tail: VecDeque::new(),
+            status_note: None,
+            warnings: Vec::new(),
+            needs_auth: false,
+        });
+        Ok(())
+    }
+
+    /// The worker hit the placement checkpoint with a stale credential
+    /// timestamp — the build outlived it. Revalidate on the real
+    /// terminal and let the worker proceed (or fail, and say so).
+    fn answer_auth(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
+        let prefix = self.prefix.clone();
+        let outcome = self.suspended(terminal, || {
+            crate::privileged::preauthorize(&prefix, true)
+        })?;
+        let ok = match outcome {
+            Ok(()) => match crate::privileged::credentials_fresh() {
+                Ok(true) => true,
+                // Validated and immediately stale again: this sudo does
+                // not cache, and the noninteractive placement ahead
+                // cannot ask. Fail loudly rather than let `sudo -n`
+                // discover it a moment later with a terser message.
+                Ok(false) => {
+                    self.warn(
+                        "sudo did not retain credentials; noninteractive placement cannot proceed",
+                    );
+                    false
+                }
+                Err(e) => {
+                    self.warn(&format!("{e:#}"));
+                    false
+                }
+            },
+            Err(e) => {
+                self.warn(&format!("{e:#}"));
+                false
+            }
+        };
+        if let Some(Job::Build {
+            auth_tx,
+            needs_auth,
+            ..
+        }) = &mut self.job
+        {
+            *needs_auth = false;
+            let _ = auth_tx.send(ok);
+        }
+        Ok(())
+    }
+
+    /// Leaves the TUI, runs `f` on the real terminal, and re-enters.
+    /// The outer Result is the terminal handover itself — if that fails,
+    /// the TUI cannot continue; `f`'s own result is the inner value.
+    fn suspended<T>(
+        &mut self,
+        terminal: &mut DefaultTerminal,
+        f: impl FnOnce() -> T,
+    ) -> Result<T> {
+        terminal.show_cursor()?;
+        ratatui::try_restore().context("leaving the TUI")?;
+        println!();
+        let value = f();
+        enable_raw_mode().context("re-entering raw mode")?;
+        std::io::stdout()
+            .execute(EnterAlternateScreen)
+            .context("re-entering the alternate screen")?;
+        terminal.clear()?;
+        Ok(value)
+    }
+
+    /// A finished captured install: reload, then speak in the pipeline's
+    /// own words when it left any — the "installed …" note is more
+    /// informative than a generic "finished".
+    fn finish_build(
+        &mut self,
+        name: &str,
+        result: Result<()>,
+        tail: VecDeque<String>,
+        warnings: Vec<String>,
+    ) {
+        // The pipeline's error outranks a reload error: the tail and the
+        // log path are the diagnosis, and a failed screen refresh must
+        // not eat them. On success the roles flip — the reload *is* the
+        // remaining work, so its failure is the headline.
+        let reload = self.reload();
+        match result {
+            Ok(()) => {
+                let note = tail
+                    .iter()
+                    .rev()
+                    .find(|l| l.starts_with("installed "))
+                    .cloned()
+                    .unwrap_or_else(|| format!("install {name} finished"));
+                // A failed reload does not eat the outcome: the install
+                // happened and a shadow warning stays true, so the
+                // report is pinned first and the reload complains after.
+                if warnings.is_empty() {
+                    match reload {
+                        Ok(()) => self.info(&note),
+                        Err(e) => self.error(&format!("{note} — but reload failed: {e:#}")),
+                    }
+                } else {
+                    // Captured is not shown: a warning that reached the
+                    // channel but never a human would make the whole
+                    // classification pointless. The panel keeps them
+                    // until acknowledged; the message says why it is up.
+                    let mut lines = warnings;
+                    if let Err(e) = &reload {
+                        lines.push(String::new());
+                        lines.push(crate::text::sanitize(&format!(
+                            "(and the list reload failed: {e:#})"
+                        )));
+                    }
+                    self.build_report = Some(BuildReport {
+                        title: format!("install {name}: warnings"),
+                        lines,
+                        failed: false,
+                    });
+                    self.warn(&format!(
+                        "{note} — with warnings in the panel; Esc/Enter dismisses"
+                    ));
+                }
+            }
+            Err(e) => {
+                // An anyhow chain carries paths too; same boundary rule.
+                let text = format!("{e:#}");
+                let mut lines: Vec<String> =
+                    text.lines().map(crate::text::sanitize).collect();
+                if lines.len() <= 1 {
+                    // A placement or commit error carries no tail of its
+                    // own; give the panel the build's last lines instead.
+                    lines.extend(tail.iter().rev().take(8).rev().cloned());
+                }
+                // Deliberately no warnings here: they were spoken about
+                // binaries the rollback has since removed — "foo is
+                // shadowed" is not true of an install that did not
+                // happen. On success they are the whole point; see above.
+                if let Err(re) = reload {
+                    lines.push(crate::text::sanitize(&format!(
+                        "(and the list reload failed: {re:#})"
+                    )));
+                }
+                self.build_report = Some(BuildReport {
+                    // "install", not "build": the failure may be the
+                    // placement or the manifest commit after a clean
+                    // cargo run, and the title must not narrow it.
+                    title: format!("install {name} failed"),
+                    lines,
+                    failed: true,
+                });
+                self.error(&format!(
+                    "install {name} failed — details in the panel; Esc/Enter dismisses"
+                ));
+            }
+        }
+    }
+
     fn on_key(&mut self, key: KeyEvent) {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             self.should_quit = true;
@@ -465,6 +901,15 @@ impl App {
         }
         if self.show_help {
             self.show_help = false;
+            return;
+        }
+        if self.build_report.is_some()
+            && self.input.is_none()
+            && self.confirm.is_none()
+            && matches!(key.code, KeyCode::Esc | KeyCode::Enter)
+        {
+            self.build_report = None;
+            self.message = None;
             return;
         }
         if self.confirm.is_some() {
@@ -478,9 +923,20 @@ impl App {
 
     fn on_key_list(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Char('q') => self.should_quit = true,
+            KeyCode::Char('q') => {
+                if matches!(self.job, Some(Job::Build { .. })) {
+                    self.error("a build is running; Ctrl-C abandons it");
+                } else {
+                    self.should_quit = true;
+                }
+            }
             KeyCode::Esc => {
-                if self.search_result.take().is_none() {
+                if self.search_result.take().is_some() {
+                    // Dismissing a result is fine mid-build; only the
+                    // exit is held back, symmetrically with `q`.
+                } else if matches!(self.job, Some(Job::Build { .. })) {
+                    self.error("a build is running; Ctrl-C abandons it");
+                } else {
                     self.should_quit = true;
                 }
             }
@@ -600,6 +1056,13 @@ impl App {
     fn submit_input(&mut self, purpose: InputPurpose, buffer: &str) {
         match purpose {
             InputPurpose::Install => match parse_install_input(buffer) {
+                // One crate builds in place, behind the gauge; a batch is
+                // a longer conversation and keeps the terminal handoff.
+                Ok((crates, locked)) if crates.len() == 1 => {
+                    let spec = crates.into_iter().next().expect("len checked");
+                    self.info(&format!("building {spec}…"));
+                    self.pending_build = Some((spec, locked));
+                }
                 Ok((crates, locked)) => self.queue(PendingAction::Install { crates, locked }),
                 Err(e) => self.error(&format!("{e:#}")),
             },
@@ -611,8 +1074,8 @@ impl App {
     }
 
     fn open_input(&mut self, purpose: InputPurpose) {
-        if self.job.is_some() && purpose == InputPurpose::Search {
-            self.error("busy; wait for the current lookup to finish");
+        if self.job.is_some() {
+            self.error("busy; wait for the current job to finish");
             return;
         }
         self.input = Some(Input {
@@ -624,6 +1087,10 @@ impl App {
     /// Queues a terminal-taking command behind a notice, so the notice
     /// renders before the screen is handed over.
     fn queue(&mut self, action: PendingAction) {
+        if self.job.is_some() {
+            self.error("busy; wait for the current job to finish");
+            return;
+        }
         self.info(&format!("running {}…", action_label(&action)));
         self.pending = Some(action);
     }
@@ -709,6 +1176,85 @@ impl App {
                     bail!("search worker aborted; the terminal was reset by the panic")
                 }
             },
+            Job::Build {
+                name,
+                rx,
+                auth_tx,
+                mut units_started,
+                mut current,
+                mut tail,
+                mut status_note,
+                mut warnings,
+                mut needs_auth,
+            } => {
+                // Drain everything queued since the last frame: a fast
+                // build emits many lines per tick, and rendering one line
+                // per 100ms would show a gauge lagging minutes behind.
+                let mut done: Option<Result<()>> = None;
+                loop {
+                    match rx.try_recv() {
+                        Ok(BuildMsg::Cargo(line)) => {
+                            match progress::parse_line(&line) {
+                                progress::BuildEvent::Compiling { name, version } => {
+                                    units_started += 1;
+                                    current = Some(format!("{name} {version}"));
+                                }
+                                // Compilation is over; collision checks,
+                                // placement and the manifest commit are
+                                // not "compiling foo", and the gauge must
+                                // not claim they are.
+                                progress::BuildEvent::Finished => current = None,
+                                _ => {}
+                            }
+                            // cargo speaking again supersedes a notice:
+                            // "waiting for the state lock" is over once
+                            // Compiling lines flow.
+                            status_note = None;
+                            tail.push_back(line);
+                            if tail.len() > BUILD_TAIL {
+                                tail.pop_front();
+                            }
+                        }
+                        Ok(BuildMsg::Notice(line)) => {
+                            status_note = Some(line.clone());
+                            tail.push_back(line);
+                            if tail.len() > BUILD_TAIL {
+                                tail.pop_front();
+                            }
+                        }
+                        // Warnings live in `warnings` alone: the panel
+                        // appends them itself, and a copy in the tail
+                        // would print them twice under a one-line
+                        // placement error.
+                        Ok(BuildMsg::Warning(line)) => warnings.push(line),
+                        Ok(BuildMsg::NeedAuth) => needs_auth = true,
+                        Ok(BuildMsg::Done(result)) => {
+                            done = Some(result);
+                            break;
+                        }
+                        Err(TryRecvError::Empty) => break,
+                        Err(TryRecvError::Disconnected) => {
+                            bail!("build worker aborted; the terminal was reset by the panic")
+                        }
+                    }
+                }
+                match done {
+                    Some(result) => self.finish_build(&name, result, tail, warnings),
+                    None => {
+                        self.job = Some(Job::Build {
+                            name,
+                            rx,
+                            auth_tx,
+                            units_started,
+                            current,
+                            tail,
+                            status_note,
+                            warnings,
+                            needs_auth,
+                        })
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -806,8 +1352,10 @@ impl App {
     }
 
     fn notify(&mut self, text: &str, kind: MessageKind) {
+        // The footer is Span-bound like everything else; one funnel,
+        // one rule — a reload error carries paths too.
         self.message = Some(Message {
-            text: text.to_owned(),
+            text: crate::text::sanitize(text),
             kind,
         });
     }
@@ -1047,6 +1595,96 @@ mod tests {
 
         for r in [&pinned_behind, &pinned_current, &outdated, &current] {
             assert!(admits(Filter::All, r));
+        }
+    }
+
+    #[test]
+    fn captured_kinds_survive_to_the_person() {
+        // The exact regression: a warning was once captured, tailed and
+        // then dropped by a successful finish; a notice was captured
+        // and never shown while the gauge sat at zero units.
+        let prefix = std::env::temp_dir().join("cargo-lbin-test-tui-kinds");
+        let _ = std::fs::remove_dir_all(&prefix);
+        std::fs::create_dir_all(&prefix).unwrap();
+        let mut app = App::new(&prefix).unwrap();
+
+        let (tx, rx) = mpsc::channel();
+        let (auth_tx, _auth_rx) = mpsc::channel();
+        app.job = Some(Job::Build {
+            name: "foo".into(),
+            rx,
+            auth_tx,
+            units_started: 0,
+            current: None,
+            tail: VecDeque::new(),
+            status_note: None,
+            warnings: Vec::new(),
+            needs_auth: false,
+        });
+
+        // A notice becomes the live status, wins over the unit counter…
+        tx.send(BuildMsg::Notice("waiting for the state lock…".into()))
+            .unwrap();
+        app.poll_job().unwrap();
+        let gauge = app.build_progress().expect("job is running");
+        assert!(
+            gauge.contains("waiting for the state lock"),
+            "a notice is the live truth of the moment: {gauge}"
+        );
+        // …and cargo speaking again supersedes it.
+        tx.send(BuildMsg::Cargo("   Compiling serde v1.0.0".into()))
+            .unwrap();
+        app.poll_job().unwrap();
+        let gauge = app.build_progress().expect("job is running");
+        assert!(
+            gauge.contains("1 unit") && !gauge.contains("1 units") && !gauge.contains("waiting"),
+            "cargo's stream supersedes a stale notice: {gauge}"
+        );
+
+        // A warning survives a successful finish, pinned to the report.
+        // (Raw here: this test injects past the worker's sanitizing
+        // boundary on purpose — the boundary itself is exercised below.)
+        tx.send(BuildMsg::Warning("`foo` is shadowed by /usr/bin/foo".into()))
+            .unwrap();
+        tx.send(BuildMsg::Done(Ok(()))).unwrap();
+        app.poll_job().unwrap();
+        assert!(app.job.is_none(), "the job is finished");
+        let report = app
+            .build_report
+            .as_ref()
+            .expect("warnings pin a report past a success");
+        assert!(!report.failed);
+        assert!(
+            report.lines.iter().any(|l| l.contains("shadowed")),
+            "the captured warning reaches the person: {:?}",
+            report.lines
+        );
+        let _ = std::fs::remove_dir_all(&prefix);
+    }
+
+    #[test]
+    fn the_render_boundary_sanitizes_every_kind() {
+        // A path may hold ESC as legally as `a`. build_msg IS the
+        // boundary — the worker forwards through it and nothing else —
+        // so this test guards the exact function whose removal would
+        // re-open the hole.
+        let hostile = "warning: `foo` shadowed by /tmp/\u{1b}]0;pwned\u{7}/foo";
+        for kind in [
+            crate::LineKind::Cargo,
+            crate::LineKind::Notice,
+            crate::LineKind::Warning,
+        ] {
+            let line = match build_msg(kind, hostile) {
+                BuildMsg::Cargo(l) | BuildMsg::Notice(l) | BuildMsg::Warning(l) => l,
+                BuildMsg::NeedAuth | BuildMsg::Done(_) => {
+                    panic!("a line kind maps to a line message")
+                }
+            };
+            assert!(
+                !line.chars().any(char::is_control),
+                "no control byte crosses the boundary: {line:?}"
+            );
+            assert!(line.contains("shadowed"), "the words do survive");
         }
     }
 }

@@ -5,9 +5,6 @@ mod lock;
 mod manifest;
 mod privileged;
 #[cfg(feature = "tui")]
-// Consumed by the TUI build gauge; the allow is temporary scaffolding
-// for this series and is removed by the commit that lands the consumer.
-#[allow(dead_code)]
 mod progress;
 mod report;
 mod shadow;
@@ -411,10 +408,6 @@ pub(crate) enum Frontend<'a> {
     /// still fresh, because a hidden password prompt would hang an
     /// alternate screen rather than show on it.
     #[cfg(feature = "tui")]
-    // Constructed by the TUI build job; the allow is temporary
-    // scaffolding for this series and is removed by the commit that
-    // lands the consumer.
-    #[allow(dead_code)]
     Captured {
         on_line: &'a mut dyn FnMut(LineKind, &str),
         before_placement: &'a mut dyn FnMut() -> Result<()>,
@@ -800,6 +793,48 @@ fn commit_entry(
         return Err(err);
     }
     Ok(())
+}
+
+/// One crate for the TUI, end to end: the same locking, pin refusal and
+/// pipeline as `cmd_install`, for a single already-parsed spec, with a
+/// captured frontend. The exclusive lock spans build and placement, as
+/// it does on the CLI: serialization per prefix is a documented
+/// invariant, not an implementation accident.
+#[cfg(feature = "tui")]
+pub(crate) fn tui_install_one(
+    prefix: &Path,
+    spec: &InstallSpec,
+    locked: bool,
+    on_line: &mut dyn FnMut(LineKind, &str),
+    before_placement: &mut dyn FnMut() -> Result<()>,
+) -> Result<()> {
+    let cache = cache_dir()?;
+    // The same contract as placement: the one sudo this acquisition can
+    // reach runs noninteractively, and its human lines — initializing
+    // state, waiting on another instance — go through the frontend's
+    // stream, not to a terminal the TUI currently owns.
+    let _lock = StateLock::acquire_with(
+        prefix,
+        &Mode::Exclusive,
+        privileged::Policy::for_prefix(prefix).screen_owned(),
+        &mut |s| on_line(LineKind::Notice, s),
+    )?;
+    let mut manifest = Manifest::load(prefix)?;
+    if spec.version.is_none() {
+        refuse_pinned(&manifest, std::slice::from_ref(&spec.name))?;
+    }
+    install_and_commit(
+        prefix,
+        &cache,
+        &mut manifest,
+        &spec.name,
+        spec.version.as_ref(),
+        locked,
+        &mut Frontend::Captured {
+            on_line,
+            before_placement,
+        },
+    )
 }
 
 fn cmd_install(prefix: &Path, crates: &[String], locked: bool) -> Result<()> {

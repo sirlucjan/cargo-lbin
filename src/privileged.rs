@@ -219,11 +219,13 @@ pub fn needs_privilege(dir: &Path) -> bool {
 /// command-specific sudoers policy can still treat the later privileged
 /// calls differently than `-v`. Those calls authorize on their own
 /// terms either way; this merely times the common case's prompt well.
-pub fn preauthorize(prefix: &Path, escalate: bool) -> Result<()> {
-    if !escalate {
-        return Ok(());
-    }
-    let fresh = Command::new(SUDO)
+/// Is sudo's credential timestamp fresh enough that `sudo` would not
+/// prompt right now? `-n -v` asks exactly that, noninteractively: the
+/// question is the timestamp itself, not authorization for any
+/// particular command. A frontend uses this to decide whether it must
+/// hand the terminal to sudo before a privileged step.
+pub fn credentials_fresh() -> Result<bool> {
+    Ok(Command::new(SUDO)
         .arg("-n")
         .arg("-v")
         .stdin(Stdio::null())
@@ -231,8 +233,14 @@ pub fn preauthorize(prefix: &Path, escalate: bool) -> Result<()> {
         .stderr(Stdio::null())
         .status()
         .with_context(|| format!("failed to spawn {SUDO}"))?
-        .success();
-    if fresh {
+        .success())
+}
+
+pub fn preauthorize(prefix: &Path, escalate: bool) -> Result<()> {
+    if !escalate {
+        return Ok(());
+    }
+    if credentials_fresh()? {
         return Ok(());
     }
     // Named by prefix, not by bin: the privileged writes may be the

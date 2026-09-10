@@ -142,9 +142,6 @@ pub fn build(name: &str, version: Option<&Version>, locked: bool, stage: &Path) 
 /// one, the last lines otherwise — plus the log path, so "failed" is
 /// never blind even when the frontend showed only a gauge.
 #[cfg(feature = "tui")]
-// Consumed by the TUI build gauge; the allow is temporary scaffolding
-// for this series and is removed by the commit that lands the consumer.
-#[allow(dead_code)]
 pub fn build_captured(
     name: &str,
     version: Option<&Version>,
@@ -294,7 +291,6 @@ fn failure_with_log(
 }
 
 #[cfg(feature = "tui")]
-#[allow(dead_code)]
 const TAIL_LINES: usize = 12;
 
 #[cfg(feature = "tui")]
@@ -307,7 +303,6 @@ const TAIL_LINES: usize = 12;
 /// umask (0777 would leave the log unreadable to its own owner), so a
 /// chmod on the descriptor restores the owner's rw — safe against the
 /// window, since the file is born at most tighter, never looser.
-#[allow(dead_code)]
 fn write_build_log(log_dir: &Path, name: &str, lines: &[String]) -> Result<PathBuf> {
     fs::create_dir_all(log_dir)
         .with_context(|| format!("creating log directory {}", log_dir.display()))?;
