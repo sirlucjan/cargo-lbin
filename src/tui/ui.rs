@@ -394,7 +394,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         // The Build panel owns build status; a footer that also said
         // "building foo…" would say the same thing twice. Skipping the
         // generic label here is also what lets the message branch below
-        // fire during a build — "build is running; Ctrl-C abandons it"
+        // fire during a build — "a build is running; c cancels it"
         // must show exactly while the gauge is up, and before this skip
         // the busy label sat in front of it for the whole build.
         let line = Span::styled(format!(" {label}"), Style::default().fg(Color::Cyan));
@@ -418,9 +418,12 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         "Enter, u    update selected crate (confirmed in the terminal)",
         "U           run update --all: fresh plan from crates.io, not the cache",
         "i           install: NAME[@VERSION]... [--locked]  (@VERSION pins);",
-        "            a single crate builds in place behind a footer gauge,",
+        "            a single crate builds in place inside the Build panel,",
         "            a batch hands the terminal over as before",
         "x           remove selected crate (asks first)",
+        "c           cancel the running build (again, or automatically",
+        "            after ~2s of no effect: SIGKILL); placement, once",
+        "            started, always finishes",
         "p           pin / unpin selected crate (held back by update --all)",
         "D           downgrade: pick an older version in the terminal, pinned",
         "r           check crates.io for updates (writes the report)",
@@ -435,7 +438,8 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         "update, downgrade and batch installs hand the terminal to cargo",
         "and sudo as before, and return when you press Enter.",
         "",
-        "q / Esc     quit (from the list)",
+        "q / Esc     quit (from the list); during a build, Ctrl-C",
+        "            cancels it and quits once the worker stops",
         "",
         "any key closes this help",
     ];

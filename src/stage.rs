@@ -126,6 +126,39 @@ pub fn build(name: &str, version: Option<&Version>, locked: bool, stage: &Path) 
     verified_info(name, version, stage)
 }
 
+/// Wait up to one tick for the kernel side of the pipe to become
+/// readable (or hung up). `Ok(true)` means "read now"; `Ok(false)` is a
+/// quiet tick for the read loop's cancel check — including EINTR, which
+/// interrupted the wait without producing data: nothing read, nothing
+/// lost, and the tick's bounded latency is precisely the property the
+/// poll exists for, so a signal must not become a license to block. A
+/// real poll error is an error: it goes down the same teardown as a
+/// read error, not into a blocking read that would wedge on the very
+/// pipe poll just failed to ask about.
+#[cfg(feature = "tui")]
+fn poll_readable(fd: std::os::fd::RawFd) -> std::io::Result<bool> {
+    let mut pfd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: poll(2) reads/writes the one pollfd it is given; the
+    // struct lives on this stack frame for the whole call.
+    let n = unsafe { libc::poll(&raw mut pfd, 1, 100) };
+    match n {
+        0 => Ok(false),
+        1.. => Ok(true),
+        _ => {
+            let e = std::io::Error::last_os_error();
+            if e.kind() == std::io::ErrorKind::Interrupted {
+                Ok(false)
+            } else {
+                Err(e)
+            }
+        }
+    }
+}
+
 /// `build` for a frontend that owns the screen: cargo's stderr is piped
 /// (which makes cargo drop its own progress bar) and forwarded line by
 /// line to `on_line`; nothing reaches the terminal. Plain text is
@@ -148,6 +181,7 @@ pub fn build_captured(
     stage: &Path,
     log_dir: &Path,
     on_line: &mut dyn FnMut(&str),
+    control: &crate::BuildControl,
 ) -> Result<Built> {
     fs::create_dir_all(stage).with_context(|| format!("creating {}", stage.display()))?;
     let mut cmd = command(name, version, locked, stage);
@@ -170,7 +204,16 @@ pub fn build_captured(
         .stderr(std::process::Stdio::piped())
         .spawn()
         .context("failed to spawn cargo")?;
-
+    // The child is its own group leader, so its pid is the group id.
+    // Announced before the first read: a cancel that arrives while
+    // cargo is spawning must find something to signal, not a
+    // forever-empty slot — and `spawned` also delivers a cancel that
+    // was accepted before there was anything to signal. Kept locally
+    // too, for the sweep below.
+    let pgid = i32::try_from(child.id()).ok();
+    if let Some(pgid) = pgid {
+        control.spawned(pgid);
+    }
     let stderr = child
         .stderr
         .take()
@@ -184,7 +227,45 @@ pub fn build_captured(
     let mut lines: Vec<String> = Vec::new();
     let mut read_error: Option<std::io::Error> = None;
     let mut buf: Vec<u8> = Vec::new();
+    // EOF is the loop's exit — and EOF is withheld for as long as *any*
+    // group member keeps the inherited stderr open. A TERM-ignoring
+    // child would otherwise wedge a cancellation in a perfect circle:
+    // the sweep waits for the reap, the reap waits for EOF, EOF waits
+    // for the stray, the stray waits for the sweep. So the blocking
+    // read is fronted by a bounded poll, and on quiet ticks the loop
+    // checks for exactly that circle: a cancel in flight with the
+    // leader already gone means the survivors' supervisor is dead, no
+    // further grace is owed, and the remainder of the group is
+    // SIGKILLed here — the strays die, EOF arrives, the loop ends.
+    // `try_wait` reaps the leader when it answers; `Child` caches the
+    // status, so the `wait()` below still returns it.
+    let mut swept = false;
     loop {
+        if control.cancelled() && !swept && matches!(child.try_wait(), Ok(Some(_))) {
+            swept = true;
+            if let Some(pgid) = pgid {
+                // SAFETY: kill(2) with a negative pid signals the
+                // process group; ESRCH — already empty — is a no-op.
+                unsafe {
+                    libc::kill(-pgid, libc::SIGKILL);
+                }
+            }
+        }
+        // The poll asks the kernel — but `read_until` serves from the
+        // BufReader first, and one kernel read can park several lines in
+        // that buffer. Polling an already-drained pipe while buffered
+        // lines wait would hold them hostage to cargo's next write; the
+        // buffer is consulted first, and only an empty one earns a tick.
+        if reader.buffer().is_empty() {
+            match poll_readable(std::os::fd::AsRawFd::as_raw_fd(reader.get_ref())) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(e) => {
+                    read_error = Some(e);
+                    break;
+                }
+            }
+        }
         buf.clear();
         match std::io::BufRead::read_until(&mut reader, b'\n', &mut buf) {
             Ok(0) => break,
@@ -224,7 +305,39 @@ pub fn build_captured(
             }
         }
     }
-    let status = child.wait().context("waiting for cargo")?;
+    let status = child.wait();
+    // The leader's death does not end the group: a child that ignores
+    // SIGTERM — a build script, say: precisely the population the group
+    // exists to cover — survives it, and the group id stays alive with
+    // any surviving member. On a cancellation those survivors are
+    // strays: their supervisor is gone, so no further grace is owed,
+    // and the stage they may still be writing to is about to be removed
+    // — the remainder of the group is therefore SIGKILLed as cleanup,
+    // not escalation, before the address is withdrawn. SIGKILL cannot
+    // be ignored; this sweep is what makes "a cancel leaves no orphans
+    // writing into the stage" true rather than merely usual. Usually it
+    // already ran from the read loop (a stray holding stderr is exactly
+    // how EOF gets withheld — see there); this one covers the leader
+    // dying after the last line without ever wedging the pipe, and a
+    // repeat is a no-op.
+    if control.cancelled()
+        && let Some(pgid) = pgid
+    {
+        // SAFETY: kill(2) with a negative pid signals the process
+        // group; no memory is touched, and ESRCH — the group already
+        // empty — is the happy case.
+        unsafe {
+            libc::kill(-pgid, libc::SIGKILL);
+        }
+    }
+    // The announcement is withdrawn once this side is done signalling:
+    // after the leader's reap and, on a cancellation, after the sweep —
+    // the post-wait I/O (failure log, stage verification) stays outside
+    // the window. Withdrawn on a failed wait too: the child's state is
+    // then unknown, and "never signal" is the only safe direction to be
+    // wrong in.
+    control.reaped();
+    let status = status.context("waiting for cargo")?;
     if let Some(e) = read_error {
         return Err(failure_with_log(
             log_dir,
@@ -235,6 +348,21 @@ pub fn build_captured(
         ));
     }
     if !status.success() {
+        // Ended by the cancel, not by cargo: no failure log — an error
+        // that says the person's own decision was carried out is not a
+        // diagnosis — and the stage is removed rather than kept, since
+        // the only thing it is evidence of is that decision. Both
+        // conditions, deliberately: the phase alone would lose the race
+        // where cargo dies of its own causes an instant before a late
+        // cancel is accepted (a normal exit code is cargo's own verdict
+        // and must surface as the failure it is, phase notwithstanding);
+        // exit-by-signal alone would misfile an external kill — an OOM,
+        // say — as a cancellation nobody requested.
+        use std::os::unix::process::ExitStatusExt;
+        if control.cancelled() && status.signal().is_some() {
+            let _ = fs::remove_dir_all(stage);
+            return Err(anyhow::Error::new(crate::BuildCancelled));
+        }
         // Tail from the first compiler error when there is one — the
         // lines before it are successful units, noise here.
         let start = lines
@@ -482,9 +610,18 @@ mod tests {
         let _fake = FakeCargo::install(&script);
 
         let mut seen: Vec<String> = Vec::new();
-        let err = build_captured("boomcrate", None, false, &stage, &logs, &mut |l| {
-            seen.push(l.to_owned());
-        })
+        let control = crate::BuildControl::new();
+        let err = build_captured(
+            "boomcrate",
+            None,
+            false,
+            &stage,
+            &logs,
+            &mut |l| {
+                seen.push(l.to_owned());
+            },
+            &control,
+        )
         .unwrap_err();
         let msg = format!("{err:#}");
         assert_eq!(seen.len(), 4, "every stderr line reaches the frontend");
@@ -521,14 +658,22 @@ mod tests {
         )
         .unwrap();
         let mut count = 0usize;
-        let built = build_captured("okcrate", None, false, &stage, &logs, &mut |l| {
-            if matches!(
-                crate::progress::parse_line(l),
-                crate::progress::BuildEvent::Compiling { .. }
-            ) {
-                count += 1;
-            }
-        })
+        let built = build_captured(
+            "okcrate",
+            None,
+            false,
+            &stage,
+            &logs,
+            &mut |l| {
+                if matches!(
+                    crate::progress::parse_line(l),
+                    crate::progress::BuildEvent::Compiling { .. }
+                ) {
+                    count += 1;
+                }
+            },
+            &crate::BuildControl::new(),
+        )
         .unwrap();
         assert_eq!(count, 1);
         assert_eq!(built.bins, vec!["okcrate"]);
@@ -537,7 +682,16 @@ mod tests {
         // contract must hold past the exit code, log included.
         fs::write(&script, "#!/bin/sh\nexit 0\n").unwrap();
         let _ = fs::remove_dir_all(&logs);
-        let err = build_captured("ghost", None, false, &stage, &logs, &mut |_| {}).unwrap_err();
+        let err = build_captured(
+            "ghost",
+            None,
+            false,
+            &stage,
+            &logs,
+            &mut |_| {},
+            &crate::BuildControl::new(),
+        )
+        .unwrap_err();
         let msg = format!("{err:#}");
         assert!(
             msg.contains("cargo exited successfully, but:"),

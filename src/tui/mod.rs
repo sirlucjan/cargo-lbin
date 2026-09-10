@@ -46,6 +46,12 @@ use crate::validate::InstallSpec;
 /// How often the input poll wakes up to look for finished background work.
 const TICK: Duration = Duration::from_millis(100);
 
+/// How long an accepted cancel is given before the run loop escalates
+/// to SIGKILL on its own. Two seconds: enough for any well-behaved
+/// build tree to fold after SIGTERM, short enough that a wedged one
+/// does not hold the person hostage.
+const CANCEL_GRACE: Duration = Duration::from_secs(2);
+
 /// One installed crate as the list shows it.
 pub struct Row {
     pub name: String,
@@ -203,8 +209,21 @@ enum BuildMsg {
     /// blocks on the auth channel until the run loop — the only place
     /// that owns the terminal — answers.
     NeedAuth,
-    /// The pipeline finished, one way or the other.
-    Done(Result<()>),
+    /// The pipeline finished, one way or the other — classified by the
+    /// worker, where the error itself is at hand: the UI must not guess
+    /// "cancelled" from a phase flag that a late `c` can set an instant
+    /// after cargo died of its own causes.
+    Done(BuildOutcome),
+}
+
+/// How a build ended. `Cancelled` is a real outcome of the pipeline
+/// (the `BuildCancelled` marker travelling up as an error), not a UI
+/// interpretation: a cancelled build writes no failure log and leaves
+/// no stage behind.
+enum BuildOutcome {
+    Success,
+    Cancelled,
+    Failed(anyhow::Error),
 }
 
 /// A build's sticky report, held in the details panel until dismissed.
@@ -259,6 +278,17 @@ enum Job {
         /// Set by `poll_job` when the worker asked for revalidation;
         /// answered by the run loop, which owns the terminal.
         needs_auth: bool,
+        /// The cancel state machine shared with the worker: `c` and
+        /// Ctrl-C talk to the build through this and nothing else.
+        control: std::sync::Arc<crate::BuildControl>,
+        /// When the grace period of an accepted cancel runs out; armed
+        /// by the first Accepted, one-shot. The run loop escalates to
+        /// SIGKILL when it passes, because the worker cannot be trusted
+        /// to reach its own sweep — a group member holding the inherited
+        /// stderr can wedge it *inside* read_until, past the poll: a
+        /// partial line with no terminating newline is enough to turn
+        /// "readable" into a blocking read on a pipe nobody will close.
+        cancel_deadline: Option<std::time::Instant>,
     },
 }
 
@@ -289,6 +319,10 @@ pub struct SearchResult {
 pub struct App {
     prefix: PathBuf,
     cache: PathBuf,
+    /// Ctrl-C during a build: quit, but only once the worker has
+    /// reported back — leaving earlier would orphan a cargo that is
+    /// still being torn down.
+    quit_after_build: bool,
     /// Every manifest entry, in manifest (alphabetical) order.
     rows: Vec<Row>,
     /// Age of the report the rows' statuses came from; `None` = no report.
@@ -368,6 +402,7 @@ impl App {
             pending: None,
             job: None,
             should_quit: false,
+            quit_after_build: false,
         };
         app.reload()?;
         Ok(app)
@@ -518,6 +553,7 @@ impl App {
     fn run(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
         while !self.should_quit {
             self.ticks = self.ticks.wrapping_add(1);
+            self.escalate_overdue_cancel();
             terminal.draw(|frame| ui::draw(frame, self))?;
 
             if let Some(action) = self.pending.take() {
@@ -685,11 +721,14 @@ impl App {
         }
         let (tx, rx) = mpsc::channel();
         let (auth_tx, auth_rx) = mpsc::channel();
+        let control = std::sync::Arc::new(crate::BuildControl::new());
+        let worker_control = std::sync::Arc::clone(&control);
         let prefix = self.prefix.clone();
         let name = spec.name.clone();
         let worker_tx = tx.clone();
         std::thread::spawn(move || {
             let line_tx = worker_tx.clone();
+            let control = worker_control;
             let result = crate::tui_install_one(
                 &prefix,
                 &spec,
@@ -697,22 +736,48 @@ impl App {
                 &mut |k: crate::LineKind, l: &str| {
                     let _ = line_tx.send(build_msg(k, l));
                 },
-                &mut || match crate::privileged::credentials_fresh() {
-                    // The common case: the up-front validation is still
-                    // fresh and placement proceeds without a word.
-                    Ok(true) => Ok(()),
-                    Ok(false) => {
-                        let _ = worker_tx.send(BuildMsg::NeedAuth);
-                        match auth_rx.recv() {
-                            Ok(true) => Ok(()),
-                            Ok(false) => anyhow::bail!("sudo authentication failed"),
-                            Err(_) => anyhow::bail!("the interface went away mid-authorization"),
-                        }
+                &mut || {
+                    // A cancelled build must not ask anyone for a
+                    // password: refuse here instead of raising NeedAuth
+                    // for an install that will never place. The run
+                    // loop guards the other side of the same race.
+                    if control.cancelled() {
+                        return Err(anyhow::Error::new(crate::BuildCancelled));
                     }
-                    Err(e) => Err(e),
+                    match crate::privileged::credentials_fresh() {
+                        // The common case: the up-front validation is still
+                        // fresh and placement proceeds without a word.
+                        Ok(true) => Ok(()),
+                        Ok(false) => {
+                            let _ = worker_tx.send(BuildMsg::NeedAuth);
+                            match auth_rx.recv() {
+                                Ok(true) => Ok(()),
+                                // A denial that answers a cancel *is*
+                                // the cancel; a real refusal keeps its
+                                // own name.
+                                Ok(false) if control.cancelled() => {
+                                    Err(anyhow::Error::new(crate::BuildCancelled))
+                                }
+                                Ok(false) => anyhow::bail!("sudo authentication failed"),
+                                Err(_) => {
+                                    anyhow::bail!("the interface went away mid-authorization")
+                                }
+                            }
+                        }
+                        Err(e) => Err(e),
+                    }
                 },
+                &control,
             );
-            let _ = tx.send(BuildMsg::Done(result));
+            // Classified here, once, by downcast — see `BuildOutcome`.
+            let outcome = match result {
+                Ok(()) => BuildOutcome::Success,
+                Err(e) if e.downcast_ref::<crate::BuildCancelled>().is_some() => {
+                    BuildOutcome::Cancelled
+                }
+                Err(e) => BuildOutcome::Failed(e),
+            };
+            let _ = tx.send(BuildMsg::Done(outcome));
         });
         self.job = Some(Job::Build {
             name,
@@ -725,6 +790,8 @@ impl App {
             warnings: Vec::new(),
             started: std::time::Instant::now(),
             needs_auth: false,
+            control,
+            cancel_deadline: None,
         });
         Ok(())
     }
@@ -732,7 +799,68 @@ impl App {
     /// The worker hit the placement checkpoint with a stale credential
     /// timestamp — the build outlived it. Revalidate on the real
     /// terminal and let the worker proceed (or fail, and say so).
+    /// Arm the one-shot grace deadline of an accepted cancel; a repeat
+    /// keeps the original deadline (the person pressing `c` twice fast
+    /// escalates through `request_cancel` itself, not through here).
+    fn arm_cancel_grace(&mut self) {
+        if let Some(Job::Build {
+            cancel_deadline, ..
+        }) = &mut self.job
+        {
+            cancel_deadline.get_or_insert(std::time::Instant::now() + CANCEL_GRACE);
+        }
+    }
+
+    /// The cancel's dead-man switch, run every tick. Once the grace of
+    /// an accepted cancel expires, SIGKILL goes out from this thread —
+    /// the worker cannot be trusted to reach its own sweep (see
+    /// `cancel_deadline`), and signalling from the UI is precisely what
+    /// stays possible no matter where the worker is stuck. One-shot;
+    /// Killed is worth a line, "already stopping" is quiet success.
+    fn escalate_overdue_cancel(&mut self) {
+        let due = matches!(
+            &self.job,
+            Some(Job::Build {
+                cancel_deadline: Some(d),
+                ..
+            }) if std::time::Instant::now() >= *d
+        );
+        if !due {
+            return;
+        }
+        let outcome = if let Some(Job::Build {
+            control,
+            cancel_deadline,
+            ..
+        }) = &mut self.job
+        {
+            *cancel_deadline = None;
+            Some(control.request_cancel())
+        } else {
+            None
+        };
+        if matches!(outcome, Some(crate::CancelOutcome::Killed)) {
+            self.warn("the build ignored the cancel; SIGKILL sent");
+        }
+    }
+
     fn answer_auth(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
+        // A cancel that landed after the worker raised NeedAuth: answer
+        // no without suspending the screen — nobody types a password
+        // for a build that will never place. The worker checks before
+        // asking; this guards the other side of the same race.
+        if let Some(Job::Build {
+            control,
+            auth_tx,
+            needs_auth,
+            ..
+        }) = &mut self.job
+            && control.cancelled()
+        {
+            *needs_auth = false;
+            let _ = auth_tx.send(false);
+            return Ok(());
+        }
         let prefix = self.prefix.clone();
         let outcome = Self::suspended(terminal, || crate::privileged::preauthorize(&prefix, true))?;
         let ok = match outcome {
@@ -829,17 +957,30 @@ impl App {
     fn finish_build(
         &mut self,
         name: &str,
-        result: Result<()>,
+        outcome: BuildOutcome,
         tail: &VecDeque<String>,
         warnings: Vec<String>,
     ) {
+        // A cancelled build ended exactly as asked: no failure panel,
+        // no log path — the pipeline wrote no log and removed the stage
+        // — one line saying the person's own decision was carried out.
+        // Nothing was placed and nothing committed (the placement door
+        // refused), so there is nothing to reload. The classification
+        // is the worker's, by type, not this thread's guess from a
+        // phase flag: a cancel that lost every race arrives here as the
+        // Success or Failed it truly was on disk.
+        if matches!(outcome, BuildOutcome::Cancelled) {
+            self.info(&format!("install {name} cancelled"));
+            return;
+        }
         // The pipeline's error outranks a reload error: the tail and the
         // log path are the diagnosis, and a failed screen refresh must
         // not eat them. On success the roles flip — the reload *is* the
         // remaining work, so its failure is the headline.
         let reload = self.reload();
-        match result {
-            Ok(()) => {
+        match outcome {
+            BuildOutcome::Cancelled => unreachable!("returned above"),
+            BuildOutcome::Success => {
                 let note = tail
                     .iter()
                     .rev()
@@ -876,7 +1017,7 @@ impl App {
                     ));
                 }
             }
-            Err(e) => {
+            BuildOutcome::Failed(e) => {
                 // An anyhow chain carries paths too; same boundary rule.
                 let text = format!("{e:#}");
                 let mut lines: Vec<String> = text.lines().map(crate::text::sanitize).collect();
@@ -911,7 +1052,35 @@ impl App {
 
     fn on_key(&mut self, key: KeyEvent) {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-            self.should_quit = true;
+            // Quit — but never orphan cargo. With a build running the
+            // exit is a cancel first: SIGTERM to the group, leave when
+            // the worker reports back (a second Ctrl-C escalates to
+            // SIGKILL through the same state machine). Placement cannot
+            // be cancelled, so there the exit simply waits it out —
+            // placement is seconds, and killing `sudo install` between
+            // two binaries is not an option.
+            if let Some(Job::Build { control, .. }) = &self.job {
+                match control.request_cancel() {
+                    crate::CancelOutcome::Accepted => {
+                        self.arm_cancel_grace();
+                        self.info(
+                            "cancelling; quitting when the build stops (Ctrl-C again: SIGKILL)",
+                        );
+                    }
+                    crate::CancelOutcome::Killed => {
+                        self.warn("SIGKILL sent; quitting when the build stops");
+                    }
+                    crate::CancelOutcome::AlreadyStopping => {
+                        self.info("the build is already stopping; quitting when it does");
+                    }
+                    crate::CancelOutcome::TooLate => {
+                        self.info("placement in progress; quitting when it finishes");
+                    }
+                }
+                self.quit_after_build = true;
+            } else {
+                self.should_quit = true;
+            }
             return;
         }
         if self.show_help {
@@ -940,7 +1109,7 @@ impl App {
         match key.code {
             KeyCode::Char('q') => {
                 if matches!(self.job, Some(Job::Build { .. })) {
-                    self.error("a build is running; Ctrl-C abandons it");
+                    self.error("a build is running; c cancels it, Ctrl-C cancels and quits");
                 } else {
                     self.should_quit = true;
                 }
@@ -950,9 +1119,33 @@ impl App {
                     // Dismissing a result is fine mid-build; only the
                     // exit is held back, symmetrically with `q`.
                 } else if matches!(self.job, Some(Job::Build { .. })) {
-                    self.error("a build is running; Ctrl-C abandons it");
+                    self.error("a build is running; c cancels it, Ctrl-C cancels and quits");
                 } else {
                     self.should_quit = true;
+                }
+            }
+            // Cancel the running build and stay: first press SIGTERMs
+            // cargo's group, a second SIGKILLs it. Without a build the
+            // key means nothing — silence, not an error, because there
+            // is nothing the person could have meant instead.
+            KeyCode::Char('c') => {
+                if let Some(Job::Build { name, control, .. }) = &self.job {
+                    let name = name.clone();
+                    match control.request_cancel() {
+                        crate::CancelOutcome::Accepted => {
+                            self.arm_cancel_grace();
+                            self.info(&format!("cancelling {name}… (c again sends SIGKILL)"));
+                        }
+                        crate::CancelOutcome::Killed => {
+                            self.warn(&format!("SIGKILL sent to the {name} build"));
+                        }
+                        crate::CancelOutcome::AlreadyStopping => {
+                            self.info("the build is already stopping");
+                        }
+                        crate::CancelOutcome::TooLate => {
+                            self.info("placement already started; too late to cancel");
+                        }
+                    }
                 }
             }
             KeyCode::Char('?') => self.show_help = true,
@@ -1202,11 +1395,13 @@ impl App {
                 mut warnings,
                 started,
                 mut needs_auth,
+                control,
+                cancel_deadline,
             } => {
                 // Drain everything queued since the last frame: a fast
                 // build emits many lines per tick, and rendering one line
                 // per 100ms would show a gauge lagging minutes behind.
-                let mut done: Option<Result<()>> = None;
+                let mut done: Option<BuildOutcome> = None;
                 loop {
                     match rx.try_recv() {
                         Ok(BuildMsg::Cargo(line)) => {
@@ -1244,8 +1439,8 @@ impl App {
                         // placement error.
                         Ok(BuildMsg::Warning(line)) => warnings.push(line),
                         Ok(BuildMsg::NeedAuth) => needs_auth = true,
-                        Ok(BuildMsg::Done(result)) => {
-                            done = Some(result);
+                        Ok(BuildMsg::Done(outcome)) => {
+                            done = Some(outcome);
                             break;
                         }
                         Err(TryRecvError::Empty) => break,
@@ -1255,7 +1450,14 @@ impl App {
                     }
                 }
                 match done {
-                    Some(result) => self.finish_build(&name, result, &tail, warnings),
+                    Some(outcome) => {
+                        self.finish_build(&name, outcome, &tail, warnings);
+                        // A Ctrl-C during this build asked to leave once
+                        // the worker was collected; that is now.
+                        if self.quit_after_build {
+                            self.should_quit = true;
+                        }
+                    }
                     None => {
                         self.job = Some(Job::Build {
                             name,
@@ -1268,6 +1470,8 @@ impl App {
                             warnings,
                             started,
                             needs_auth,
+                            control,
+                            cancel_deadline,
                         });
                     }
                 }
@@ -1635,6 +1839,68 @@ mod tests {
     }
 
     #[test]
+    fn the_grace_timer_is_one_shot_and_fires_only_past_the_deadline() {
+        let prefix = std::env::temp_dir().join("cargo-lbin-test-tui-grace");
+        let _ = std::fs::remove_dir_all(&prefix);
+        std::fs::create_dir_all(&prefix).unwrap();
+        let mut app = App::new(&prefix).unwrap();
+
+        let control = std::sync::Arc::new(crate::BuildControl::new());
+        // The deadline is armed only after an accepted cancel, so the
+        // control is already Cancelling when the timer looks at it.
+        assert!(matches!(
+            control.request_cancel(),
+            crate::CancelOutcome::Accepted
+        ));
+        let (_tx, rx) = mpsc::channel();
+        let (auth_tx, _auth_rx) = mpsc::channel();
+        app.job = Some(Job::Build {
+            name: "foo".into(),
+            rx,
+            auth_tx,
+            units_started: 0,
+            current: None,
+            tail: VecDeque::new(),
+            status_note: None,
+            warnings: Vec::new(),
+            started: std::time::Instant::now(),
+            needs_auth: false,
+            control: std::sync::Arc::clone(&control),
+            cancel_deadline: Some(std::time::Instant::now() + Duration::from_secs(60)),
+        });
+
+        // Not due: the deadline stays armed and nothing is escalated.
+        app.escalate_overdue_cancel();
+        assert!(matches!(
+            &app.job,
+            Some(Job::Build {
+                cancel_deadline: Some(_),
+                ..
+            })
+        ));
+
+        // Due: fires once (no live group here, so it lands on the quiet
+        // "already stopping" arm) and disarms itself.
+        if let Some(Job::Build {
+            cancel_deadline, ..
+        }) = &mut app.job
+        {
+            *cancel_deadline = Some(std::time::Instant::now() - Duration::from_millis(1));
+        }
+        app.escalate_overdue_cancel();
+        assert!(matches!(
+            &app.job,
+            Some(Job::Build {
+                cancel_deadline: None,
+                ..
+            })
+        ));
+        // One-shot: a second pass finds nothing armed and does nothing.
+        app.escalate_overdue_cancel();
+        let _ = std::fs::remove_dir_all(&prefix);
+    }
+
+    #[test]
     fn captured_kinds_survive_to_the_person() {
         // The exact regression: a warning was once captured, tailed and
         // then dropped by a successful finish; a notice was captured
@@ -1657,6 +1923,8 @@ mod tests {
             warnings: Vec::new(),
             started: std::time::Instant::now(),
             needs_auth: false,
+            control: std::sync::Arc::new(crate::BuildControl::new()),
+            cancel_deadline: None,
         });
 
         // A notice becomes the live status, wins over the unit counter…
@@ -1685,7 +1953,7 @@ mod tests {
             "`foo` is shadowed by /usr/bin/foo".into(),
         ))
         .unwrap();
-        tx.send(BuildMsg::Done(Ok(()))).unwrap();
+        tx.send(BuildMsg::Done(BuildOutcome::Success)).unwrap();
         app.poll_job().unwrap();
         assert!(app.job.is_none(), "the job is finished");
         let report = app

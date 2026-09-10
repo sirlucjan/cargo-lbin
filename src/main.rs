@@ -443,6 +443,203 @@ pub(crate) enum LineKind {
     Warning,
 }
 
+/// The phases one in-place build moves through. Stored as a `u8` inside
+/// `BuildControl`; the numeric values are the atomic encoding, nothing
+/// more.
+#[cfg(feature = "tui")]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u8)]
+pub(crate) enum BuildPhase {
+    /// Building — or not even started yet. Cancellable.
+    Building = 0,
+    /// Placement has begun: privileged writes may be in flight, and a
+    /// signal now could stop `sudo install` between two binaries. Too
+    /// late to cancel; placement is seconds, not minutes.
+    Placement = 1,
+    /// A cancel was accepted while building. cargo hears it as SIGTERM
+    /// to its group; the worker sees it at the placement door at the
+    /// latest and never commits anything.
+    Cancelling = 2,
+}
+
+/// Shared control block between the UI thread and one in-place build:
+/// the worker's phase and cargo's process group id, both crossing
+/// threads. The phase moves only by compare-and-swap, so the worker
+/// stepping into placement and a cancel arriving at that exact moment
+/// have exactly one winner — a plain "cancelled" flag read before the
+/// checkpoint would let the request be accepted on screen after the
+/// point of no return had already been crossed.
+#[cfg(feature = "tui")]
+pub(crate) struct BuildControl {
+    phase: std::sync::atomic::AtomicU8,
+    /// cargo's process group id: 0 before the spawn and again from the
+    /// reap. Zeroing matters — a group id whose last member has been
+    /// collected is the kernel's to reuse — and the withdrawal runs
+    /// inside `build_captured`, immediately after `wait()` returns,
+    /// ahead of the failure-log and stage-verification I/O that zeroing
+    /// after the function's return would have left inside the window.
+    /// The UI holds this block in an `Arc` per job, so a late signal
+    /// can never address a different *cargo-lbin* build's group. What
+    /// remains is small but honestly nonzero: the UI can load the id,
+    /// lose the CPU across the reap, and signal a number the kernel has
+    /// since handed to a stranger. Closing that for real means pidfds —
+    /// a power plant for a mosquito; the window is accepted, and named
+    /// here instead of denied.
+    pgid: std::sync::atomic::AtomicI32,
+}
+
+/// What a cancel request found; the UI phrases each differently.
+#[cfg(feature = "tui")]
+#[derive(Debug)]
+pub(crate) enum CancelOutcome {
+    /// The request won: the build will not reach placement. SIGTERM
+    /// went to the group if cargo was already running; if not, the
+    /// spawn announcement delivers it (see `spawned`).
+    Accepted,
+    /// Already cancelling and the group still stood — escalated to
+    /// SIGKILL. The person asked twice; cargo is not asked politely a
+    /// second time.
+    Killed,
+    /// Already cancelling, with nothing left to signal: the group is
+    /// not yet spawned or already reaped, and the worker is winding
+    /// down on its own.
+    AlreadyStopping,
+    /// Placement had already begun; nothing was signalled.
+    TooLate,
+}
+
+#[cfg(feature = "tui")]
+impl BuildControl {
+    const ORD: std::sync::atomic::Ordering = std::sync::atomic::Ordering::SeqCst;
+
+    pub fn new() -> Self {
+        Self {
+            phase: std::sync::atomic::AtomicU8::new(BuildPhase::Building as u8),
+            pgid: std::sync::atomic::AtomicI32::new(0),
+        }
+    }
+
+    fn phase(&self) -> BuildPhase {
+        match self.phase.load(Self::ORD) {
+            0 => BuildPhase::Building,
+            1 => BuildPhase::Placement,
+            _ => BuildPhase::Cancelling,
+        }
+    }
+
+    /// Whether a cancel has been accepted. A cheap read for courtesy
+    /// checks — refusing to start cargo, refusing to prompt for a
+    /// password — never for the placement decision, which belongs to
+    /// the compare-and-swap in `begin_placement` alone.
+    pub fn cancelled(&self) -> bool {
+        self.phase() == BuildPhase::Cancelling
+    }
+
+    /// The worker announces cargo's process group, straight from the
+    /// spawn. A cancel accepted before there was anything to signal is
+    /// delivered here: the order is store-then-check, mirroring
+    /// `request_cancel`'s swap-then-load, so whichever side runs second
+    /// sees the other's write and the signal is delivered at least once
+    /// — possibly twice when the two interleave, which is harmless: a
+    /// second SIGTERM to a group already dying changes nothing.
+    pub fn spawned(&self, pgid: i32) {
+        self.pgid.store(pgid, Self::ORD);
+        if self.cancelled() {
+            Self::signal(pgid, libc::SIGTERM);
+        }
+    }
+
+    /// This side is done signalling the group: the leader is reaped
+    /// and, on a cancellation, the survivors have been swept with
+    /// SIGKILL — a group id stays alive with *any* member, so the
+    /// leader's reap alone frees nothing. Called by `build_captured`
+    /// itself; from here the id must not be signalled again, and once
+    /// the group truly empties the kernel is free to reuse it.
+    pub fn reaped(&self) {
+        self.pgid.store(0, Self::ORD);
+    }
+
+    /// The one-way door into placement, crossed by the worker right
+    /// before the first write anything would have to roll back. Refusal
+    /// means a cancel won the race; the worker unwinds with nothing
+    /// placed and nothing committed.
+    pub fn begin_placement(&self) -> Result<()> {
+        self.phase
+            .compare_exchange(
+                BuildPhase::Building as u8,
+                BuildPhase::Placement as u8,
+                Self::ORD,
+                Self::ORD,
+            )
+            .map(|_| ())
+            .map_err(|_| anyhow::Error::new(BuildCancelled))
+    }
+
+    /// A cancel from the UI thread. First request: SIGTERM to the
+    /// group. Second: SIGKILL. After placement began: refused.
+    pub fn request_cancel(&self) -> CancelOutcome {
+        match self.phase.compare_exchange(
+            BuildPhase::Building as u8,
+            BuildPhase::Cancelling as u8,
+            Self::ORD,
+            Self::ORD,
+        ) {
+            Ok(_) => {
+                let pgid = self.pgid.load(Self::ORD);
+                if pgid != 0 {
+                    Self::signal(pgid, libc::SIGTERM);
+                }
+                CancelOutcome::Accepted
+            }
+            Err(current) if current == BuildPhase::Cancelling as u8 => {
+                let pgid = self.pgid.load(Self::ORD);
+                if pgid == 0 {
+                    // Nothing left to signal: the group is not yet
+                    // spawned or already reaped, and the worker is
+                    // winding down on its own. Saying "SIGKILL sent"
+                    // here would be a lie the UI repeats.
+                    CancelOutcome::AlreadyStopping
+                } else {
+                    Self::signal(pgid, libc::SIGKILL);
+                    CancelOutcome::Killed
+                }
+            }
+            Err(_) => CancelOutcome::TooLate,
+        }
+    }
+
+    /// Negative pid: the whole group — cargo and every rustc and build
+    /// script it is running. The result is ignored on purpose: ESRCH
+    /// means the group is already gone, which is the goal.
+    fn signal(pgid: i32, sig: i32) {
+        // SAFETY: kill(2) with a negative pid signals a process group;
+        // no memory is touched and any error is an acceptable no-op.
+        unsafe {
+            libc::kill(-pgid, sig);
+        }
+    }
+}
+
+/// Marker error for a build that ended because the person cancelled it.
+/// A distinct type, not a string: the worker classifies the outcome by
+/// downcast instead of the UI guessing from the phase flag — a guess
+/// that loses the race where cargo dies of its own causes an instant
+/// before a late cancel is accepted, and would present cargo's real
+/// error as "cancelled".
+#[cfg(feature = "tui")]
+#[derive(Debug)]
+pub(crate) struct BuildCancelled;
+
+#[cfg(feature = "tui")]
+impl std::fmt::Display for BuildCancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("build cancelled")
+    }
+}
+
+#[cfg(feature = "tui")]
+impl std::error::Error for BuildCancelled {}
+
 /// How a build-and-place operation talks to the person while it runs.
 pub(crate) enum Frontend<'a> {
     /// The CLI owns the terminal: cargo output is inherited verbatim,
@@ -461,6 +658,10 @@ pub(crate) enum Frontend<'a> {
     Captured {
         on_line: &'a mut dyn FnMut(LineKind, &str),
         before_placement: &'a mut dyn FnMut() -> Result<()>,
+        /// The cancel state machine shared with the UI thread; the
+        /// pipeline reports the spawn and the reap through it and asks
+        /// it for permission to place.
+        control: &'a BuildControl,
     },
     /// Keeps the lifetime honest when the tui feature is off.
     #[cfg(not(feature = "tui"))]
@@ -482,14 +683,30 @@ impl Frontend<'_> {
         match self {
             Frontend::Terminal => stage::build(name, version, locked, stage_dir),
             #[cfg(feature = "tui")]
-            Frontend::Captured { on_line, .. } => stage::build_captured(
-                name,
-                version,
-                locked,
-                stage_dir,
-                &cache.join("logs"),
-                &mut |l| on_line(LineKind::Cargo, l),
-            ),
+            Frontend::Captured {
+                on_line, control, ..
+            } => {
+                // Courtesy check only: a cancel accepted while the lock
+                // was being waited on should not cost a spawn. The race
+                // (cancel landing mid-spawn) is closed by `spawned`,
+                // not here.
+                if control.cancelled() {
+                    return Err(anyhow::Error::new(BuildCancelled));
+                }
+                stage::build_captured(
+                    name,
+                    version,
+                    locked,
+                    stage_dir,
+                    &cache.join("logs"),
+                    &mut |l| on_line(LineKind::Cargo, l),
+                    // Spawn announcement, reap withdrawal and the
+                    // cancelled-vs-failed classification all live inside
+                    // `build_captured` — the only place that holds the
+                    // child and its exit status.
+                    control,
+                )
+            }
             #[cfg(not(feature = "tui"))]
             Frontend::Never(_) => unreachable!(),
         }
@@ -527,6 +744,23 @@ impl Frontend<'_> {
     /// this type exists to prevent.
     fn wants_preauthorize(&self) -> bool {
         matches!(self, Frontend::Terminal)
+    }
+
+    /// The cancel door: crossed unconditionally right before the first
+    /// write that would need rolling back. Distinct from
+    /// `before_placement`, which exists for sudo and never runs at a
+    /// user-writable prefix — "too late to cancel" must mean the same
+    /// thing at every prefix. Deliberately the last checkpoint: the
+    /// sudo revalidation above it can block on a human, and a cancel
+    /// arriving during that wait must still win.
+    fn placement_begins(&mut self) -> Result<()> {
+        match self {
+            Frontend::Terminal => Ok(()),
+            #[cfg(feature = "tui")]
+            Frontend::Captured { control, .. } => control.begin_placement(),
+            #[cfg(not(feature = "tui"))]
+            Frontend::Never(_) => unreachable!(),
+        }
     }
 
     /// The placement checkpoint: a no-op on the terminal, the frontend's
@@ -650,9 +884,30 @@ fn install_and_commit(
     // need — failing the install with no chance to reauth. "The
     // checkpoint precedes the first privileged write" is a claim about
     // now, not about the pre-build world.
-    if install_needs_privilege(policy, prefix)? {
-        frontend.before_placement()?;
+    // The two pre-placement checkpoints, fallible as one unit — because
+    // the sudo revalidation can itself answer with a cancellation (a
+    // `c` pressed while NeedAuth was waiting on the run loop), and the
+    // invariant is "BuildCancelled from anywhere before placement means
+    // no stage left", not "cancelled at the atomic door means no stage
+    // left". A cancel leaves nothing worth keeping: the stage is
+    // evidence of nothing but the person's own decision. Every other
+    // refusal — a migrate checkpoint abort, a real sudo failure — keeps
+    // its stage like any other pipeline failure, and the downcast does
+    // not match it. With the tui feature off no cancel exists and the
+    // result propagates bare.
+    let checkpoints = (|| -> Result<()> {
+        if install_needs_privilege(policy, prefix)? {
+            frontend.before_placement()?;
+        }
+        frontend.placement_begins()
+    })();
+    #[cfg(feature = "tui")]
+    if let Err(e) = &checkpoints
+        && e.downcast_ref::<BuildCancelled>().is_some()
+    {
+        let _ = fs::remove_dir_all(&stage_dir);
     }
+    checkpoints?;
     if let Err(err) = place_and_commit(
         prefix,
         policy,
@@ -858,6 +1113,7 @@ pub(crate) fn tui_install_one(
     locked: bool,
     on_line: &mut dyn FnMut(LineKind, &str),
     before_placement: &mut dyn FnMut() -> Result<()>,
+    control: &BuildControl,
 ) -> Result<()> {
     let cache = cache_dir()?;
     // The same contract as placement: the one sudo this acquisition can
@@ -884,6 +1140,7 @@ pub(crate) fn tui_install_one(
         &mut Frontend::Captured {
             on_line,
             before_placement,
+            control,
         },
     )
 }
@@ -2087,6 +2344,368 @@ mod tests {
 
     #[cfg(feature = "tui")]
     #[test]
+    fn cancel_and_placement_have_exactly_one_winner() {
+        // Cancel first: the placement door refuses, and the refusal is
+        // the typed cancellation, not an anonymous error. A second
+        // cancel with no live group (nothing spawned here) reports
+        // "already stopping" rather than claiming a SIGKILL nobody sent
+        // — the Killed escalation needs a live group and is exercised
+        // end to end by `a_second_cancel_kills_a_term_ignoring_build`.
+        let control = BuildControl::new();
+        assert!(matches!(control.request_cancel(), CancelOutcome::Accepted));
+        assert!(control.cancelled());
+        let door = control.begin_placement().unwrap_err();
+        assert!(
+            door.downcast_ref::<BuildCancelled>().is_some(),
+            "cancel won the race, and says so by type"
+        );
+        assert!(matches!(
+            control.request_cancel(),
+            CancelOutcome::AlreadyStopping
+        ));
+
+        // Placement first: the door is one-way and a cancel after it is
+        // told so, with nothing signalled.
+        let control = BuildControl::new();
+        control.begin_placement().unwrap();
+        assert!(matches!(control.request_cancel(), CancelOutcome::TooLate));
+        assert!(!control.cancelled(), "TooLate never flips the phase");
+
+        // A cancel accepted before the spawn is not lost: `spawned`
+        // still reports Cancelling afterwards, which is what routes the
+        // deferred SIGTERM (exercised here without a live process — the
+        // pgid slot merely records; `spawned` on a cancelled control
+        // signals the group, and signalling is best-effort by design).
+        let control = BuildControl::new();
+        assert!(matches!(control.request_cancel(), CancelOutcome::Accepted));
+        assert!(control.cancelled());
+    }
+
+    #[cfg(feature = "tui")]
+    #[test]
+    fn a_second_cancel_kills_a_term_ignoring_build() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join("cargo-lbin-test-cancel-escalate");
+        let _ = fs::remove_dir_all(&root);
+        let fake_bin = root.join("fakebin");
+        let prefix = root.join("prefix");
+        fs::create_dir_all(&fake_bin).unwrap();
+        fs::create_dir_all(prefix.join("bin")).unwrap();
+        fs::create_dir_all(prefix.join("share/cargo-lbin")).unwrap();
+
+        // A leader that ignores SIGTERM: the first cancel is accepted
+        // and changes nothing; only the escalation ends it. This is the
+        // Killed arm of `request_cancel`, live.
+        let script = fake_bin.join("cargo");
+        fs::write(&script, "#!/bin/sh\ntrap '' TERM\nsleep 30\n").unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        let _fake = crate::stage::FakeCargo::install(&script);
+
+        let control = std::sync::Arc::new(BuildControl::new());
+        let worker_control = std::sync::Arc::clone(&control);
+        let cache = root.join("cache");
+        let prefix_w = prefix.clone();
+        let started = std::time::Instant::now();
+        let worker = std::thread::spawn(move || {
+            let mut manifest = Manifest::default();
+            install_and_commit(
+                &prefix_w,
+                &cache,
+                &mut manifest,
+                "stubborncrate",
+                None,
+                false,
+                &mut Frontend::Captured {
+                    on_line: &mut |_, _| {},
+                    before_placement: &mut || Ok(()),
+                    control: &worker_control,
+                },
+            )
+        });
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(matches!(control.request_cancel(), CancelOutcome::Accepted));
+        // The escalation needs a spawned, still-living group; poll until
+        // the second cancel finds one rather than racing the spawn.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match control.request_cancel() {
+                CancelOutcome::Killed => break,
+                CancelOutcome::AlreadyStopping if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                other => panic!("expected Killed before the deadline, got {other:?}"),
+            }
+        }
+        let err = worker.join().unwrap().expect_err("SIGKILL ended the build");
+        assert!(
+            err.downcast_ref::<BuildCancelled>().is_some(),
+            "an escalated cancel is still the typed cancellation: {err:#}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "SIGKILL ended the build, not the sleep"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(feature = "tui")]
+    #[test]
+    fn a_cancel_sweeps_group_members_that_ignore_sigterm() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join("cargo-lbin-test-cancel-sweep");
+        let _ = fs::remove_dir_all(&root);
+        let fake_bin = root.join("fakebin");
+        let prefix = root.join("prefix");
+        fs::create_dir_all(&fake_bin).unwrap();
+        fs::create_dir_all(prefix.join("bin")).unwrap();
+        fs::create_dir_all(prefix.join("share/cargo-lbin")).unwrap();
+
+        // The reason the sweep exists: the leader dies politely on
+        // SIGTERM, but a group member ignoring TERM survives it — and
+        // the group id stays alive with any member, so "the leader was
+        // reaped" must not be read as "the group is gone". The stray
+        // records its own pid so the test can watch it die.
+        let stray_pid_file = root.join("stray.pid");
+        let script = fake_bin.join("cargo");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\n\
+                 sh -c 'trap \"\" TERM; echo $$ > \"{pidfile}\"; while :; do sleep 0.1; done' &\n\
+                 sleep 30\n",
+                pidfile = stray_pid_file.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        let _fake = crate::stage::FakeCargo::install(&script);
+
+        let control = std::sync::Arc::new(BuildControl::new());
+        let worker_control = std::sync::Arc::clone(&control);
+        let cache = root.join("cache");
+        let cache_w = cache.clone();
+        let prefix_w = prefix.clone();
+        let worker = std::thread::spawn(move || {
+            let mut manifest = Manifest::default();
+            install_and_commit(
+                &prefix_w,
+                &cache_w,
+                &mut manifest,
+                "straycrate",
+                None,
+                false,
+                &mut Frontend::Captured {
+                    on_line: &mut |_, _| {},
+                    before_placement: &mut || Ok(()),
+                    control: &worker_control,
+                },
+            )
+        });
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(matches!(control.request_cancel(), CancelOutcome::Accepted));
+        let err = worker.join().unwrap().expect_err("cancelled");
+        assert!(err.downcast_ref::<BuildCancelled>().is_some(), "{err:#}");
+
+        // The stray must not survive the sweep. SIGKILL delivery is
+        // asynchronous, so poll briefly instead of asserting an instant.
+        let stray_pid: u32 = fs::read_to_string(&stray_pid_file)
+            .expect("the stray recorded its pid before the cancel")
+            .trim()
+            .parse()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while PathBuf::from(format!("/proc/{stray_pid}")).exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the TERM-ignoring group member survived the cancel sweep"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(
+            !cache
+                .join("stage")
+                .join(std::process::id().to_string())
+                .join("straycrate")
+                .exists(),
+            "the stage is gone, and nothing is left alive to touch it"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(feature = "tui")]
+    #[test]
+    fn escalation_unwedges_a_partial_line_holding_the_pipe() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join("cargo-lbin-test-cancel-partial");
+        let _ = fs::remove_dir_all(&root);
+        let fake_bin = root.join("fakebin");
+        let prefix = root.join("prefix");
+        fs::create_dir_all(&fake_bin).unwrap();
+        fs::create_dir_all(prefix.join("bin")).unwrap();
+        fs::create_dir_all(prefix.join("share/cargo-lbin")).unwrap();
+
+        // The nastiest stray: it writes a *fragment* — no newline — to
+        // the inherited stderr and then just holds it. The poll reports
+        // readable, read_until consumes the fragment and walks straight
+        // into a blocking read hunting for the newline, past the loop's
+        // cancel check; the first cancel then kills only the leader and
+        // the worker stays wedged. The escalation — driven manually
+        // here; the run loop's grace timer fires the very same call —
+        // SIGKILLs the group, the stray dies, the pipe closes, and the
+        // worker unwedges into the typed cancellation.
+        let stray_pid_file = root.join("stray.pid");
+        let script = fake_bin.join("cargo");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\n\
+                 sh -c 'trap \"\" TERM; printf partial >&2; echo $$ > \"{pidfile}\"; while :; do sleep 1; done' &\n\
+                 sleep 30\n",
+                pidfile = stray_pid_file.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        let _fake = crate::stage::FakeCargo::install(&script);
+
+        let control = std::sync::Arc::new(BuildControl::new());
+        let worker_control = std::sync::Arc::clone(&control);
+        let cache = root.join("cache");
+        let prefix_w = prefix.clone();
+        let started = std::time::Instant::now();
+        let worker = std::thread::spawn(move || {
+            let mut manifest = Manifest::default();
+            install_and_commit(
+                &prefix_w,
+                &cache,
+                &mut manifest,
+                "partialcrate",
+                None,
+                false,
+                &mut Frontend::Captured {
+                    on_line: &mut |_, _| {},
+                    before_placement: &mut || Ok(()),
+                    control: &worker_control,
+                },
+            )
+        });
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(matches!(control.request_cancel(), CancelOutcome::Accepted));
+        // Give SIGTERM time to take the leader while the worker sits
+        // wedged in read_until — the exact state the escalation exists
+        // for. The leader is an unreaped zombie, so the group id is
+        // certainly alive and the escalation must find it.
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        assert!(matches!(control.request_cancel(), CancelOutcome::Killed));
+        let err = worker.join().unwrap().expect_err("cancelled");
+        assert!(
+            err.downcast_ref::<BuildCancelled>().is_some(),
+            "the unwedged worker still reports the typed cancellation: {err:#}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "the escalation ended the wedge, not the sleep"
+        );
+        let stray_pid: u32 = fs::read_to_string(&stray_pid_file)
+            .expect("the stray recorded its pid")
+            .trim()
+            .parse()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while PathBuf::from(format!("/proc/{stray_pid}")).exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the pipe-holding stray survived the escalation"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(feature = "tui")]
+    #[test]
+    fn a_cancel_stops_a_running_captured_build() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join("cargo-lbin-test-cancel-running");
+        let _ = fs::remove_dir_all(&root);
+        let fake_bin = root.join("fakebin");
+        let prefix = root.join("prefix");
+        fs::create_dir_all(&fake_bin).unwrap();
+        fs::create_dir_all(prefix.join("bin")).unwrap();
+        fs::create_dir_all(prefix.join("share/cargo-lbin")).unwrap();
+
+        // A fake cargo that would take far longer than this test is
+        // allowed to: only a delivered signal ends it early.
+        let script = fake_bin.join("cargo");
+        fs::write(&script, "#!/bin/sh\nsleep 30\n").unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        let _fake = crate::stage::FakeCargo::install(&script);
+
+        let control = std::sync::Arc::new(BuildControl::new());
+        let worker_control = std::sync::Arc::clone(&control);
+        let cache = root.join("cache");
+        let cache_w = cache.clone();
+        let prefix_w = prefix.clone();
+        let started = std::time::Instant::now();
+        let worker = std::thread::spawn(move || {
+            let mut manifest = Manifest::default();
+            install_and_commit(
+                &prefix_w,
+                &cache_w,
+                &mut manifest,
+                "slowcrate",
+                None,
+                false,
+                &mut Frontend::Captured {
+                    on_line: &mut |_, _| {},
+                    before_placement: &mut || Ok(()),
+                    control: &worker_control,
+                },
+            )
+        });
+        // Give the worker time to spawn the fake; a cancel landing even
+        // earlier is also correct (`spawned` delivers it), it just would
+        // not exercise the running-build path this test is about.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(matches!(control.request_cancel(), CancelOutcome::Accepted));
+        let result = worker.join().unwrap();
+        let err = result.expect_err("a cancelled build never commits");
+        assert!(
+            err.downcast_ref::<BuildCancelled>().is_some(),
+            "the outcome is a typed cancellation, not an anonymous failure: {err:#}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "SIGTERM to the group ended the build, not the sleep"
+        );
+        assert!(
+            !Manifest::path(&prefix).exists() || Manifest::load(&prefix).unwrap().crates.is_empty(),
+            "nothing was recorded"
+        );
+        // A cancellation is not a diagnosis: no failure log is written…
+        let logs = cache.join("logs");
+        assert!(
+            !logs.exists() || fs::read_dir(&logs).unwrap().next().is_none(),
+            "a cancelled build writes no failure log"
+        );
+        // …and the stage is removed rather than kept as evidence.
+        assert!(
+            !cache
+                .join("stage")
+                .join(std::process::id().to_string())
+                .join("slowcrate")
+                .exists(),
+            "a cancelled build leaves no stage behind"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(feature = "tui")]
+    #[test]
     fn captured_frontend_runs_the_whole_pipeline() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -2122,6 +2741,7 @@ mod tests {
         let mut manifest = Manifest::default();
         let mut lines: Vec<(LineKind, String)> = Vec::new();
         let mut checkpoints = 0usize;
+        let control = BuildControl::new();
         let result = install_and_commit(
             &prefix,
             &cache,
@@ -2135,9 +2755,14 @@ mod tests {
                     checkpoints += 1;
                     Ok(())
                 },
+                control: &control,
             },
         );
         result.unwrap();
+        assert!(
+            matches!(control.phase(), BuildPhase::Placement),
+            "a finished install crossed the placement door"
+        );
 
         assert_eq!(
             checkpoints, 0,
