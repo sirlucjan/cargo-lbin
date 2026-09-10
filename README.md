@@ -508,6 +508,27 @@ to one question); `--user` over an exported `CARGO_LBIN_PREFIX` wins
 silently — an alias exists to be typed ad hoc, and ad hoc beats ambient
 configuration.
 
+### Cross-prefix awareness
+
+With more than one prefix in use, `list` (and the TUI) annotates crates
+installed in the *other* known prefixes:
+
+```text
+hexyl 0.17.0 [also in /usr/local @0.17.0] (hexyl)
+```
+
+The set of prefixes is finite and closed — `/usr/local` and `~/.local` —
+and only cargo-lbin's own manifests are consulted: this is a "you also
+installed this over there" reminder, not a `PATH` scanner (installed
+binaries shadowed by anything else on `PATH` are reported at install
+time). Foreign manifests are read without taking their lock: the
+manifest is replaced atomically, so a lockless read always sees a
+complete document, and a listing must never wait behind someone's build
+in a prefix it was not even asked about. In `--json` output the same
+information is the additive, optional `also_in` field, omitted when
+empty — schema 1 documents for a single-prefix system are byte-identical
+to pre-0.8 ones.
+
 Custom prefixes must be writable by the invoking user. `cargo-lbin` only permits privilege escalation for the canonical `/usr/local` prefix; it will not use `sudo` to write into an arbitrary custom path.
 
 Build staging and the update-report cache live under:

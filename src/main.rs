@@ -3,6 +3,7 @@ mod index;
 mod json;
 mod lock;
 mod manifest;
+mod prefixes;
 mod privileged;
 #[cfg(feature = "tui")]
 mod progress;
@@ -1025,7 +1026,10 @@ fn cmd_pinned(prefix: &Path, check: bool, json: bool) -> ExitCode {
                 .is_some_and(|status| matches!(status, Status::Outdated(_)))
         });
     if json {
-        let output = json::PinnedOutput::build(identity, &manifest, report.as_ref());
+        // The same cross-prefix map list --json uses: the two documents
+        // promise entry-for-entry equality on the pinned subset.
+        let also = prefixes::also_installed(prefix);
+        let output = json::PinnedOutput::build(identity, &manifest, report.as_ref(), &also);
         if let Err(e) = json::print(&output) {
             eprintln!("error: {e:#}");
             return ExitCode::from(EXIT_ERROR);
@@ -1100,6 +1104,10 @@ fn cmd_remove(prefix: &Path, crates: &[String]) -> Result<()> {
 fn cmd_list(prefix: &Path, json: bool) -> Result<()> {
     let _lock = StateLock::acquire(prefix, &Mode::Shared)?;
     let manifest = Manifest::load(prefix)?;
+    // What the other known prefixes carry — lockless by design; see the
+    // prefixes module for why an annotation must never wait on a
+    // foreign lock.
+    let also = prefixes::also_installed(prefix);
     // Purely local: the last `checkupdate` result, if any. An unreadable
     // report is a warning — the listing itself does not depend on it.
     let report = match cache_dir().and_then(|cache| Report::load(&cache, prefix)) {
@@ -1112,7 +1120,12 @@ fn cmd_list(prefix: &Path, json: bool) -> Result<()> {
     if json {
         // A document either way: an empty prefix is `"crates": []`, not a
         // sentence a script would have to recognize.
-        let output = json::ListOutput::build(report::identity(prefix)?, &manifest, report.as_ref());
+        let output = json::ListOutput::build(
+            report::identity(prefix)?,
+            &manifest,
+            report.as_ref(),
+            &also,
+        );
         return json::print(&output);
     }
     if manifest.crates.is_empty() {
@@ -1134,8 +1147,9 @@ fn cmd_list(prefix: &Path, json: bool) -> Result<()> {
                 Status::UpToDate => " (up to date)".to_owned(),
             })
             .unwrap_or_default();
+        let also = prefixes::describe_for(&also, name);
         println!(
-            "{name} {}{locked}{pinned} ({}){status}",
+            "{name} {}{locked}{pinned}{also} ({}){status}",
             entry.version,
             entry.bins.join(", ")
         );

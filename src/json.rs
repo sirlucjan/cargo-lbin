@@ -51,6 +51,18 @@ pub struct ListCrate {
     /// The newest version the last check found; `null` when `status` is
     /// `unknown` — absent knowledge, not an empty version.
     pub latest: Option<Version>,
+    /// Other known lbin prefixes carrying this crate. Additive and
+    /// skipped when empty, so schema 1 consumers keep parsing untouched
+    /// documents; anyone who wants it, asks for it by name.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub also_in: Vec<AlsoInJson>,
+}
+
+/// One foreign installation, mirrored from `prefixes::AlsoIn`.
+#[derive(Serialize)]
+pub struct AlsoInJson {
+    pub prefix: PathBuf,
+    pub version: String,
 }
 
 /// The three states of `report::Status`, plus the one it expresses as
@@ -83,11 +95,16 @@ pub struct CheckCrate {
 }
 
 impl ListOutput {
-    pub fn build(prefix: PathBuf, manifest: &Manifest, report: Option<&Report>) -> Self {
+    pub fn build(
+        prefix: PathBuf,
+        manifest: &Manifest,
+        report: Option<&Report>,
+        also: &std::collections::BTreeMap<String, Vec<crate::prefixes::AlsoIn>>,
+    ) -> Self {
         let crates = manifest
             .crates
             .iter()
-            .map(|(name, entry)| ListCrate::annotated(name, entry, report))
+            .map(|(name, entry)| ListCrate::annotated_with(name, entry, report, also))
             .collect();
         Self {
             schema: SCHEMA,
@@ -99,6 +116,28 @@ impl ListOutput {
 }
 
 impl ListCrate {
+    /// `annotated` plus the cross-prefix annotation — the one
+    /// constructor both `ListOutput` and `PinnedOutput` use, so the
+    /// subset invariant between them cannot silently rot.
+    fn annotated_with(
+        name: &str,
+        entry: &crate::manifest::Entry,
+        report: Option<&Report>,
+        also: &std::collections::BTreeMap<String, Vec<crate::prefixes::AlsoIn>>,
+    ) -> Self {
+        let mut c = Self::annotated(name, entry, report);
+        if let Some(entries) = also.get(name) {
+            c.also_in = entries
+                .iter()
+                .map(|a| AlsoInJson {
+                    prefix: a.prefix.clone(),
+                    version: a.version.clone(),
+                })
+                .collect();
+        }
+        c
+    }
+
     /// One manifest entry annotated from a report — the single mapping
     /// shared by JSON views of manifest state, so no two views can
     /// drift in how they read the same record.
@@ -127,6 +166,7 @@ impl ListCrate {
             pinned: entry.pinned,
             status,
             latest,
+            also_in: Vec::new(),
         }
     }
 }
@@ -147,12 +187,21 @@ pub struct PinnedOutput {
 }
 
 impl PinnedOutput {
-    pub fn build(prefix: PathBuf, manifest: &Manifest, report: Option<&Report>) -> Self {
+    pub fn build(
+        prefix: PathBuf,
+        manifest: &Manifest,
+        report: Option<&Report>,
+        also: &std::collections::BTreeMap<String, Vec<crate::prefixes::AlsoIn>>,
+    ) -> Self {
+        // The same annotation path as ListOutput, deliberately: the
+        // documented invariant is "pinned --json is list --json filtered
+        // to pinned == true, entry for entry", and an entry that gains
+        // also_in in one document and not the other is two entries.
         let crates = manifest
             .crates
             .iter()
             .filter(|(_, entry)| entry.pinned)
-            .map(|(name, entry)| ListCrate::annotated(name, entry, report))
+            .map(|(name, entry)| ListCrate::annotated_with(name, entry, report, also))
             .collect();
         Self {
             schema: SCHEMA,
@@ -256,7 +305,7 @@ mod tests {
     /// field changes (see the module doc).
     #[test]
     fn list_output_golden() {
-        let out = ListOutput::build(PathBuf::from("/usr/local"), &manifest(), Some(&report()));
+        let out = ListOutput::build(PathBuf::from("/usr/local"), &manifest(), Some(&report()), &std::collections::BTreeMap::new());
         let json = serde_json::to_string_pretty(&out).unwrap();
         let expected = r#"{
   "schema": 1,
@@ -303,7 +352,7 @@ mod tests {
 
     #[test]
     fn list_output_without_report_is_all_unknown() {
-        let out = ListOutput::build(PathBuf::from("/p"), &manifest(), None);
+        let out = ListOutput::build(PathBuf::from("/p"), &manifest(), None, &std::collections::BTreeMap::new());
         let value = serde_json::to_value(&out).unwrap();
         assert_eq!(value["checked_at"], serde_json::Value::Null);
         for c in value["crates"].as_array().unwrap() {
@@ -311,7 +360,7 @@ mod tests {
             assert_eq!(c["latest"], serde_json::Value::Null);
         }
         // An empty prefix is still a complete document, not a message.
-        let out = ListOutput::build(PathBuf::from("/p"), &Manifest::default(), None);
+        let out = ListOutput::build(PathBuf::from("/p"), &Manifest::default(), None, &std::collections::BTreeMap::new());
         let value = serde_json::to_value(&out).unwrap();
         assert_eq!(value["crates"], serde_json::json!([]));
         assert_eq!(value["schema"], SCHEMA);
@@ -351,7 +400,7 @@ mod tests {
 
     #[test]
     fn pinned_output_golden() {
-        let out = PinnedOutput::build(PathBuf::from("/usr/local"), &manifest(), Some(&report()));
+        let out = PinnedOutput::build(PathBuf::from("/usr/local"), &manifest(), Some(&report()), &std::collections::BTreeMap::new());
         let json = serde_json::to_string_pretty(&out).unwrap();
         let expected = r#"{
   "schema": 1,
@@ -378,8 +427,19 @@ mod tests {
     fn pinned_output_is_the_pinned_subset_of_list() {
         // The invariant a consumer may rely on: `pinned --json` is
         // `list --json` filtered to `pinned == true`, entry for entry.
-        let list = ListOutput::build(PathBuf::from("/p"), &manifest(), Some(&report()));
-        let pinned = PinnedOutput::build(PathBuf::from("/p"), &manifest(), Some(&report()));
+        // A non-empty map, and one that touches a pinned crate: an
+        // invariant test fed an empty map would stay green while
+        // pinned --json silently lost the annotation list --json has.
+        let mut also = std::collections::BTreeMap::new();
+        also.insert(
+            "bat".to_owned(),
+            vec![crate::prefixes::AlsoIn {
+                prefix: PathBuf::from("/usr/local"),
+                version: "0.25.0".to_owned(),
+            }],
+        );
+        let list = ListOutput::build(PathBuf::from("/p"), &manifest(), Some(&report()), &also);
+        let pinned = PinnedOutput::build(PathBuf::from("/p"), &manifest(), Some(&report()), &also);
         let expected: Vec<_> = list
             .crates
             .iter()
@@ -393,7 +453,7 @@ mod tests {
             .collect();
         assert_eq!(got, expected);
         // No pins is a complete document, not a message.
-        let none = PinnedOutput::build(PathBuf::from("/p"), &Manifest::default(), None);
+        let none = PinnedOutput::build(PathBuf::from("/p"), &Manifest::default(), None, &std::collections::BTreeMap::new());
         let value = serde_json::to_value(&none).unwrap();
         assert_eq!(value["crates"], serde_json::json!([]));
         assert_eq!(value["checked_at"], serde_json::Value::Null);
@@ -407,5 +467,37 @@ mod tests {
         let a = crate::report::identity(Path::new("/usr/local/")).unwrap();
         let b = crate::report::identity(Path::new("/usr/./local")).unwrap();
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn also_in_is_additive_and_absent_when_empty() {
+        // Schema stays 1: the field is skipped entirely for a crate
+        // installed nowhere else, so untouched documents are
+        // byte-compatible with pre-0.8 consumers; when present it names
+        // prefix and version, because version skew is what the reader
+        // wants to notice.
+        let empty = ListOutput::build(
+            PathBuf::from("/p"),
+            &manifest(),
+            None,
+            &std::collections::BTreeMap::new(),
+        );
+        let text = serde_json::to_string(&empty).unwrap();
+        assert!(!text.contains("also_in"), "absent, not an empty array: {text}");
+
+        let mut also = std::collections::BTreeMap::new();
+        also.insert(
+            "ripgrep".to_owned(),
+            vec![crate::prefixes::AlsoIn {
+                prefix: PathBuf::from("/usr/local"),
+                version: "9.9.9".to_owned(),
+            }],
+        );
+        let full = ListOutput::build(PathBuf::from("/p"), &manifest(), None, &also);
+        let text = serde_json::to_string(&full).unwrap();
+        assert!(
+            text.contains(r#""also_in":[{"prefix":"/usr/local","version":"9.9.9"}]"#),
+            "{text}"
+        );
     }
 }
