@@ -38,6 +38,7 @@ fn draw_tabs(frame: &mut Frame, app: &App, area: Rect) {
     let titles = Filter::ALL.iter().map(|f| match f {
         Filter::All => format!(" Packages ({}) ", app.total()),
         Filter::Updates => format!(" Updates ({}) ", app.updates_available()),
+        Filter::Pinned => format!(" Pinned ({}) ", app.pinned_count()),
     });
     let tabs = Tabs::new(titles)
         .select(app.filter.index())
@@ -89,7 +90,8 @@ fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
 
     let empty_note = match app.filter {
         Filter::All => "nothing installed under this prefix — press i to install",
-        Filter::Updates => "no updates known — press r to check crates.io",
+        Filter::Updates => "no unpinned updates known — press r to check crates.io",
+        Filter::Pinned => "no pinned crates — p in Packages pins the selected crate",
     };
     let block = Block::default().borders(Borders::ALL);
     if rows.is_empty() {
@@ -250,6 +252,18 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         app.total(),
         app.updates_available()
     );
+    // The pinned backlog is deliberately absent from the updates count
+    // (it is not something `U` will do), so it must be voiced here: a
+    // held-back update stays loud, it just moved homes.
+    match (app.pinned_count(), app.pinned_outdated()) {
+        (0, _) => {}
+        (p, 0) => {
+            let _ = write!(status, " · {p} pinned");
+        }
+        (p, held) => {
+            let _ = write!(status, " · {p} pinned ({held} behind)");
+        }
+    }
     if app.not_checked() > 0 {
         let _ = write!(status, " · {} not checked", app.not_checked());
     }
@@ -302,7 +316,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
 
 fn draw_help(frame: &mut Frame, area: Rect) {
     let lines = [
-        "↑/↓ j/k     select        Tab       Packages / Updates",
+        "↑/↓ j/k     select        Tab       Packages / Updates / Pinned",
         "g / G       first / last  ?         this help",
         "",
         "Enter, u    update selected crate (confirmed in the terminal)",

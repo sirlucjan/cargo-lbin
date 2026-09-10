@@ -68,23 +68,47 @@ pub enum RowStatus {
 pub enum Filter {
     All,
     Updates,
+    Pinned,
 }
 
 impl Filter {
-    pub const ALL: [Filter; 2] = [Filter::All, Filter::Updates];
+    pub const ALL: [Filter; 3] = [Filter::All, Filter::Updates, Filter::Pinned];
 
     pub fn index(self) -> usize {
         match self {
             Filter::All => 0,
             Filter::Updates => 1,
+            Filter::Pinned => 2,
         }
     }
 
     fn next(self) -> Self {
         match self {
             Filter::All => Filter::Updates,
-            Filter::Updates => Filter::All,
+            Filter::Updates => Filter::Pinned,
+            Filter::Pinned => Filter::All,
         }
+    }
+
+    fn prev(self) -> Self {
+        match self {
+            Filter::All => Filter::Pinned,
+            Filter::Updates => Filter::All,
+            Filter::Pinned => Filter::Updates,
+        }
+    }
+}
+
+/// Whether a row belongs to a view. Updates means what `update --all`
+/// will act on: a pinned crate is held back by it, so a pinned crate
+/// with a newer version does not belong in a view whose count promises
+/// actionable updates. Its backlog is not hidden — it lives in the
+/// Pinned tab, whose count is always on screen.
+fn admits(filter: Filter, row: &Row) -> bool {
+    match filter {
+        Filter::All => true,
+        Filter::Updates => matches!(row.status, RowStatus::Outdated(_)) && !row.pinned,
+        Filter::Pinned => row.pinned,
     }
 }
 
@@ -294,10 +318,7 @@ impl App {
     pub fn visible(&self) -> Vec<&Row> {
         self.rows
             .iter()
-            .filter(|r| match self.filter {
-                Filter::All => true,
-                Filter::Updates => matches!(r.status, RowStatus::Outdated(_)),
-            })
+            .filter(|r| admits(self.filter, r))
             .collect()
     }
 
@@ -306,9 +327,26 @@ impl App {
     }
 
     pub fn updates_available(&self) -> usize {
+        // Keep the cached Updates view aligned with update --all
+        // semantics: pinned crates are held back and counted separately.
+        // Alignment of meaning, not of outcome — this number comes from
+        // the recorded report, while `U` computes a fresh plan.
         self.rows
             .iter()
-            .filter(|r| matches!(r.status, RowStatus::Outdated(_)))
+            .filter(|r| matches!(r.status, RowStatus::Outdated(_)) && !r.pinned)
+            .count()
+    }
+
+    pub fn pinned_count(&self) -> usize {
+        self.rows.iter().filter(|r| r.pinned).count()
+    }
+
+    /// Pinned crates the last check found a newer version for — the
+    /// backlog the pin is deliberately sitting on.
+    pub fn pinned_outdated(&self) -> usize {
+        self.rows
+            .iter()
+            .filter(|r| r.pinned && matches!(r.status, RowStatus::Outdated(_)))
             .count()
     }
 
@@ -453,8 +491,12 @@ impl App {
             KeyCode::End | KeyCode::Char('G') => {
                 self.selected = self.visible().len().saturating_sub(1);
             }
-            KeyCode::Tab | KeyCode::BackTab => {
+            KeyCode::Tab => {
                 self.filter = self.filter.next();
+                self.clamp_selection();
+            }
+            KeyCode::BackTab => {
+                self.filter = self.filter.prev();
                 self.clamp_selection();
             }
             KeyCode::Char('r') => self.start_check(),
@@ -689,11 +731,18 @@ impl App {
             return;
         }
         let n = self.updates_available();
+        // The count matches the Updates tab — what `U` would do. A pinned
+        // backlog is reported alongside rather than folded in, so the
+        // number never promises an update that `update --all` will skip.
+        let held = self.pinned_outdated();
+        let summary = if held > 0 {
+            format!("{n} update(s) available; {held} pinned held back")
+        } else {
+            format!("{n} update(s) available")
+        };
         match persisted {
-            Ok(()) => self.info(&format!("checked: {n} update(s) available")),
-            Err(e) => self.warn(&format!(
-                "checked: {n} update(s) available; report not saved: {e:#}"
-            )),
+            Ok(()) => self.info(&format!("checked: {summary}")),
+            Err(e) => self.warn(&format!("checked: {summary}; report not saved: {e:#}")),
         }
     }
 
@@ -955,9 +1004,49 @@ mod tests {
     #[test]
     fn filter_cycles_and_indexes() {
         assert_eq!(Filter::All.next(), Filter::Updates);
-        assert_eq!(Filter::Updates.next(), Filter::All);
+        assert_eq!(Filter::Updates.next(), Filter::Pinned);
+        assert_eq!(Filter::Pinned.next(), Filter::All);
         for (i, f) in Filter::ALL.iter().enumerate() {
             assert_eq!(f.index(), i);
+            // prev is next's inverse — BackTab retraces Tab exactly.
+            assert_eq!(f.next().prev(), *f);
+        }
+    }
+
+    #[test]
+    fn view_membership_is_consistent() {
+        let row = |pinned: bool, status: RowStatus| Row {
+            name: "x".into(),
+            version: "1.0.0".into(),
+            bins: vec!["x".into()],
+            locked: false,
+            pinned,
+            status,
+        };
+        let newer = Version::new(2, 0, 0);
+        let pinned_behind = row(true, RowStatus::Outdated(newer.clone()));
+        let pinned_current = row(true, RowStatus::UpToDate);
+        let outdated = row(false, RowStatus::Outdated(newer));
+        let current = row(false, RowStatus::UpToDate);
+
+        // Updates is what `update --all` will act on: a pinned crate is
+        // held back, so its backlog must not be counted there.
+        assert!(admits(Filter::Updates, &outdated));
+        assert!(!admits(Filter::Updates, &pinned_behind));
+        assert!(!admits(Filter::Updates, &current));
+
+        // Pinned is a state, not a relation to a newer version: a pin on
+        // the latest release belongs there just as much.
+        assert!(admits(Filter::Pinned, &pinned_behind));
+        assert!(admits(Filter::Pinned, &pinned_current));
+        assert!(!admits(Filter::Pinned, &outdated));
+        // The remaining two cells of the 4-state matrix, so the test
+        // closes it rather than samples it.
+        assert!(!admits(Filter::Updates, &pinned_current));
+        assert!(!admits(Filter::Pinned, &current));
+
+        for r in [&pinned_behind, &pinned_current, &outdated, &current] {
+            assert!(admits(Filter::All, r));
         }
     }
 }
