@@ -1744,7 +1744,7 @@ mod tests {
         let one = rows.iter().find(|r| r.name == "one").unwrap();
         assert_eq!(one.also, " [also in /usr/local @0.9.0]");
         let two = rows.iter().find(|r| r.name == "two").unwrap();
-        assert!(two.also.is_empty(), "installed nowhere else, no suffix");
+        assert_eq!(two.also, "", "installed nowhere else, no suffix");
     }
 
     #[test]

@@ -129,7 +129,7 @@ mod tests {
         assert!(!map.contains_key("local-only"), "the current prefix is not 'also'");
         let s = describe_for(&map, "elsewhere");
         assert!(s.contains("[also in") && s.contains("@2.3.4"), "{s}");
-        assert!(describe_for(&map, "local-only").is_empty());
+        assert_eq!(describe_for(&map, "local-only"), "");
 
         // The closed set itself: current is excluded, the list is finite.
         let others = known_others(Path::new("/usr/local"));

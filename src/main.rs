@@ -1901,7 +1901,7 @@ mod tests {
             let mut out = Vec::new();
             clap_complete::generate(*shell, &mut Cli::command(), "cargo-lbin", &mut out);
             let script = String::from_utf8(out).unwrap();
-            assert!(!script.is_empty(), "{shell}");
+            assert_ne!(script, "", "{shell}");
             for name in &names {
                 assert!(script.contains(name.as_str()), "{shell}: missing `{name}`");
             }
