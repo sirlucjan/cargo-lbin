@@ -51,6 +51,13 @@ The terminal UI is enabled by the default `tui` feature. To build only the CLI, 
 cargo install cargo-lbin --no-default-features
 ```
 
+Invoked through rustup's `cargo` proxy, `cargo lbin` may print a harmless
+`default toolchain implicitly overridden` warning: the proxy exports
+`RUSTUP_TOOLCHAIN` and the nested `cargo install` inherits it. This is
+expected, `cargo +toolchain lbin` still selects the toolchain it names,
+and `cargo-lbin` deliberately does not clear the variable — second-guessing
+rustup's environment is not its job.
+
 Do **not** run `cargo-lbin` itself with `sudo`. Build scripts and proc macros must run as your normal user; `cargo-lbin` requests `sudo` itself only when placement under the canonical `/usr/local` prefix requires it.
 
 ## Quick start
@@ -89,6 +96,7 @@ cargo lbin tui
 | `install <crate[@version]>... [--locked]` | Build crates with Cargo and install their binaries; `@version` installs exactly that version and pins it |
 | `remove <crate>...` | Remove managed crates and their binaries |
 | `pin <crate>...` / `unpin <crate>...` | Hold crates at their installed version / release the hold |
+| `pinned [--check] [--json]` | List pinned crates and whether newer versions exist |
 | `downgrade <crate>` | Pick an older version from crates.io, install it and pin it |
 | `list [--json]` | List managed crates, using the last update report for annotations |
 | `checkupdate [--json]` | Query crates.io for updates and save a full local report |
@@ -319,6 +327,31 @@ A pinned crate is left out of `update --all` — listed as `[pinned, skipped]` s
 
 Pinning writes the manifest, so it needs the same privilege as installing into the prefix.
 
+The backlog a pin is sitting on has its own read-only view:
+
+```
+cargo lbin pinned
+```
+
+```
+hexyl 0.14.0 -> 0.16.0
+update check: 3h ago
+```
+
+By default `pinned` reads the last recorded `checkupdate` report, so it is
+offline and deterministic; in text output the report age is printed to
+stderr, and a crate the report does not cover is listed without an
+annotation rather than guessed about. `--json` keeps stdout
+machine-clean: one document, no age line; warnings still go to stderr. `--check` asks crates.io about the pinned crates now — and
+only about them — without touching the recorded report: the recorded
+snapshot belongs to `checkupdate`, and a partial one would misinform
+`list`. Exit codes follow `checkupdate`: `0` when a pinned crate is known to have
+a newer version, `2` when no pinned crate is known to have one, `1` on
+error, so a shell hook or cron job can stay quiet until a held-back
+update actually exists. `pinned --json` uses the same per-crate JSON
+shape as `list --json`; without `--check`, it is the pinned subset of the
+same recorded snapshot, entry for entry.
+
 ## Downgrade
 
 Go back to an older version without knowing its number:
@@ -379,12 +412,12 @@ cargo lbin tui
 
 ```text
 ┌ cargo-lbin — /usr/local ──────────────────────────────────┐
-│ Packages (3)  Updates (2)                                 │
+│ Packages (3)  Updates (1)  Pinned (1)                     │
 ├───────────────────────────────────────────────────────────┤
 │ NAME             VERSION       STATUS                     │
 │ > ripgrep        14.1.1        ✓ up to date               │
 │   bat            0.26.0        ↑ 0.26.1                   │
-│   fd             10.2.0        ↑ 10.3.0                   │
+│   fd [pinned]    10.2.0        ↑ 10.3.0                   │
 ├ Selected ─────────────────────────────────────────────────┤
 │ Crate      bat                                            │
 │ Installed  0.26.0                                         │
@@ -392,7 +425,7 @@ cargo lbin tui
 │ Binaries   bat                                            │
 ├───────────────────────────────────────────────────────────┤
 │ ↑/↓ select · Tab filter · Enter/u update · U update all … │
-│ 3 packages · 2 updates · checked 3h ago                   │
+│ 3 packages · 1 updates · 1 pinned (1 behind) · checked 3h │
 └───────────────────────────────────────────────────────────┘
 ```
 
@@ -402,7 +435,7 @@ The TUI starts entirely from disk — the manifest and the last `checkupdate` re
 | --- | --- |
 | `↑` / `↓`, `j` / `k` | Move selection |
 | `g` / `G` | First / last row |
-| `Tab` | Switch between Packages and Updates |
+| `Tab` | Cycle Packages, Updates and Pinned (Shift-Tab cycles back) |
 | `Enter`, `u` | Update the selected crate |
 | `U` | Run a fresh `update --all` |
 | `i` | Open the install line (`NAME[@VERSION]... [--locked]`; `@VERSION` pins) |
@@ -418,6 +451,14 @@ The TUI starts entirely from disk — the manifest and the last `checkupdate` re
 Search and update checks run without freezing the list. Search hits are displayed in the details panel; installed hits are marked, and pressing a digit opens the normal install input with that crate name, still editable so `--locked` can be added.
 
 The saved update report is presentation only. `U` always invokes a real `update --all` and lets that command compute a fresh plan, even if the TUI currently shows zero cached updates.
+
+The Updates tab shows what `update --all` will act on, so a pinned crate
+with a newer version is not listed there — `update --all` would skip it,
+and a count that promises updates it will not perform is a count that
+lies. The held-back update is not hidden: it lives in the Pinned tab,
+whose count sits in the header at all times, and the footer says how many
+pinned crates are behind. The same split shapes the `r` result line:
+`checked: 1 update(s) available; 1 pinned held back`.
 
 Operations that need Cargo output or a `sudo` password (`install`, `update`, `remove`) temporarily hand the real terminal back to the normal CLI. Cargo diagnostics, the update confirmation and password prompt therefore behave exactly as they do outside the TUI; the interface returns afterwards.
 
@@ -495,6 +536,18 @@ It does **not** sandbox Cargo. Installing a crate means trusting code that Cargo
 
 Crates are built first, as the invoking user, in an isolated staging root. Only placement into a protected `/usr/local` destination may trigger `sudo`.
 
+When placement will need `sudo`, credentials are validated up front —
+`sudo -n -v` checks the credential timestamp silently, and only when sudo
+would prompt does `cargo-lbin` announce why and run `sudo -v` on the
+terminal — so the initial password prompt comes before a multi-minute
+build rather than ambushing an unattended terminal after it. sudo may
+still ask again if its credential timestamp expires in the meantime; that
+is sudo's policy to enforce, not `cargo-lbin`'s to work around.
+`cargo-lbin` never reads, buffers or forwards the password itself: the
+prompt, echo, retries, PAM and the credential cache are `sudo`'s business
+alone. This is a design rule, not an implementation detail — a password
+field will not be added to the TUI.
+
 Running the whole tool as root is rejected:
 
 ```bash
@@ -570,7 +623,13 @@ After placement, `cargo-lbin` runs `restorecon` on installed binaries when it is
 
 ## Requirements
 
-`cargo-lbin` currently targets Linux.
+`cargo-lbin` currently targets Linux, and assumes an FHS-style hierarchy —
+in particular a mutable `/usr/local` alongside distribution-owned
+`/usr/bin`. Distributions that do not follow the FHS (NixOS being the
+canonical example: an immutable store, no populated `/usr/local`, nothing
+that would put one on `PATH`) are unsupported; a custom `--prefix` may
+happen to work there, but working by accident is not the same as being
+supported.
 
 - Rust/Cargo **1.91 or newer** to build the tool.
 - A working Cargo setup.
