@@ -12,6 +12,33 @@ use super::{App, Filter, InputPurpose, MessageKind, RowStatus};
 use crate::report::describe_age;
 
 pub fn draw(frame: &mut Frame, app: &App) {
+    // The build gauge gets its own framed, transient panel, laid out
+    // only while a build runs: on success the rows return to the list,
+    // on failure the sticky report panel takes over — and the footer
+    // stays free for messages, which the old arrangement hid behind the
+    // gauge for the whole build.
+    if let Some(gauge) = app.build_progress() {
+        let [header, list, details, build, footer] = Layout::new(
+            Direction::Vertical,
+            [
+                Constraint::Length(3),
+                Constraint::Min(5),
+                Constraint::Length(8),
+                Constraint::Length(3),
+                Constraint::Length(3),
+            ],
+        )
+        .areas(frame.area());
+        draw_tabs(frame, app, header);
+        draw_list(frame, app, list);
+        draw_details(frame, app, details);
+        draw_gauge(frame, &gauge, build);
+        draw_footer(frame, app, footer);
+        if app.show_help {
+            draw_help(frame, frame.area());
+        }
+        return;
+    }
     let [header, list, details, footer] = Layout::new(
         Direction::Vertical,
         [
@@ -32,6 +59,25 @@ pub fn draw(frame: &mut Frame, app: &App) {
         let area = frame.area();
         draw_help(frame, area);
     }
+}
+
+/// A framed, labeled box — the tty's verdict over the frameless line
+/// that shipped first: on a real terminal one yellow row blended into
+/// the footer, and a build deserves to be unmissable while it runs.
+/// Deliberately a status line inside, never a progress bar: cargo
+/// knows what it has started, not what remains, so a count of started
+/// units is the truth and any percentage would be an invention.
+fn draw_gauge(frame: &mut Frame, gauge: &str, area: Rect) {
+    let block = Block::default().borders(Borders::ALL).title(" Build ");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            format!(" {gauge}"),
+            Style::default().fg(Color::Yellow),
+        )),
+        inner,
+    );
 }
 
 fn draw_tabs(frame: &mut Frame, app: &App, area: Rect) {
@@ -342,17 +388,15 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
             cursor_x.min(line_area.right().saturating_sub(1)),
             line_area.y,
         ));
-    } else if let Some(gauge) = app.build_progress() {
-        // The build gauge: a spinner so the line is visibly alive between
-        // units, a unit count instead of a guessed percentage.
-        frame.render_widget(
-            Paragraph::new(Span::styled(
-                format!(" {gauge}"),
-                Style::default().fg(Color::Yellow),
-            )),
-            line_area,
-        );
-    } else if let Some(label) = app.busy() {
+    } else if app.build_progress().is_none()
+        && let Some(label) = app.busy()
+    {
+        // The Build panel owns build status; a footer that also said
+        // "building foo…" would say the same thing twice. Skipping the
+        // generic label here is also what lets the message branch below
+        // fire during a build — "build is running; Ctrl-C abandons it"
+        // must show exactly while the gauge is up, and before this skip
+        // the busy label sat in front of it for the whole build.
         let line = Span::styled(format!(" {label}"), Style::default().fg(Color::Cyan));
         frame.render_widget(Paragraph::new(line), line_area);
     } else if let Some(message) = &app.message {
