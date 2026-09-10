@@ -252,6 +252,10 @@ enum Job {
         /// Warnings; shown past a success, dropped on failure — a
         /// rollback removes the binaries they described.
         warnings: Vec<String>,
+        /// When the worker was spawned. Lock waiting counts on purpose:
+        /// the clock answers "how long has this operation been running",
+        /// not "how long has cargo been compiling".
+        started: std::time::Instant,
         /// Set by `poll_job` when the worker asked for revalidation;
         /// answered by the run loop, which owns the terminal.
         needs_auth: bool,
@@ -474,23 +478,27 @@ impl App {
             units_started,
             current,
             status_note,
+            started,
             ..
         }) = &self.job
         else {
             return None;
         };
         let frame = FRAMES[self.ticks % FRAMES.len()];
+        let elapsed = format_elapsed(started.elapsed());
         // A pipeline notice is the live truth of the moment — "waiting
         // for the state lock…" beats a gauge frozen at zero units, which
-        // is exactly the impression the notice exists to prevent.
+        // is exactly the impression the notice exists to prevent. The
+        // clock runs through it: waiting is part of the operation.
         if let Some(note) = status_note {
-            return Some(format!("{frame} {name}: {note}"));
+            return Some(format!("{frame} {name}: {note} · elapsed {elapsed}"));
         }
         let unit_word = if *units_started == 1 { "unit" } else { "units" };
         let mut line = format!("{frame} building {name} · {units_started} {unit_word}");
         if let Some(current) = current {
             let _ = write!(line, " · compiling {current}");
         }
+        let _ = write!(line, " · elapsed {elapsed}");
         Some(line)
     }
 
@@ -715,6 +723,7 @@ impl App {
             tail: VecDeque::new(),
             status_note: None,
             warnings: Vec::new(),
+            started: std::time::Instant::now(),
             needs_auth: false,
         });
         Ok(())
@@ -1191,6 +1200,7 @@ impl App {
                 mut tail,
                 mut status_note,
                 mut warnings,
+                started,
                 mut needs_auth,
             } => {
                 // Drain everything queued since the last frame: a fast
@@ -1256,6 +1266,7 @@ impl App {
                             tail,
                             status_note,
                             warnings,
+                            started,
                             needs_auth,
                         });
                     }
@@ -1385,6 +1396,19 @@ fn action_label(action: &PendingAction) -> String {
             pinned: false,
         } => format!("unpin {name}"),
         PendingAction::Downgrade(name) => format!("downgrade {name}"),
+    }
+}
+
+/// mm:ss, rolling to h:mm:ss past an hour — a Rust build can outlive
+/// both formats' assumptions, but never silently: the widest field
+/// grows instead of wrapping.
+fn format_elapsed(d: std::time::Duration) -> String {
+    let total = d.as_secs();
+    let (h, m, s) = (total / 3600, (total % 3600) / 60, total % 60);
+    if h > 0 {
+        format!("{h}:{m:02}:{s:02}")
+    } else {
+        format!("{m:02}:{s:02}")
     }
 }
 
@@ -1631,6 +1655,7 @@ mod tests {
             tail: VecDeque::new(),
             status_note: None,
             warnings: Vec::new(),
+            started: std::time::Instant::now(),
             needs_auth: false,
         });
 
@@ -1720,5 +1745,15 @@ mod tests {
         assert_eq!(one.also, " [also in /usr/local @0.9.0]");
         let two = rows.iter().find(|r| r.name == "two").unwrap();
         assert!(two.also.is_empty(), "installed nowhere else, no suffix");
+    }
+
+    #[test]
+    fn elapsed_formats_like_a_clock() {
+        use std::time::Duration;
+        assert_eq!(format_elapsed(Duration::from_secs(0)), "00:00");
+        assert_eq!(format_elapsed(Duration::from_secs(97)), "01:37");
+        assert_eq!(format_elapsed(Duration::from_secs(59 * 60 + 59)), "59:59");
+        assert_eq!(format_elapsed(Duration::from_secs(3600)), "1:00:00");
+        assert_eq!(format_elapsed(Duration::from_secs(3600 + 65)), "1:01:05");
     }
 }
