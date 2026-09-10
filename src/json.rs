@@ -131,6 +131,38 @@ impl ListCrate {
     }
 }
 
+/// `pinned [--check] --json`: the pinned subset of the manifest, each
+/// entry in exactly the `list --json` per-crate shape — a consumer that
+/// parses one parses the other. `pinned` is carried even though it is
+/// always `true` here: uniformity is the point, not economy.
+#[derive(Serialize)]
+pub struct PinnedOutput {
+    pub schema: u32,
+    pub prefix: PathBuf,
+    /// Unix seconds of the check the statuses come from — the recorded
+    /// one by default, the moment of the query under `--check`; `null`
+    /// if no check is recorded.
+    pub checked_at: Option<u64>,
+    pub crates: Vec<ListCrate>,
+}
+
+impl PinnedOutput {
+    pub fn build(prefix: PathBuf, manifest: &Manifest, report: Option<&Report>) -> Self {
+        let crates = manifest
+            .crates
+            .iter()
+            .filter(|(_, entry)| entry.pinned)
+            .map(|(name, entry)| ListCrate::annotated(name, entry, report))
+            .collect();
+        Self {
+            schema: SCHEMA,
+            prefix,
+            checked_at: report.map(|r| r.checked_at),
+            crates,
+        }
+    }
+}
+
 impl CheckOutput {
     pub fn from_report(report: &Report) -> Self {
         Self {
@@ -315,6 +347,57 @@ mod tests {
   ]
 }"#;
         assert_eq!(json, expected);
+    }
+
+    #[test]
+    fn pinned_output_golden() {
+        let out = PinnedOutput::build(PathBuf::from("/usr/local"), &manifest(), Some(&report()));
+        let json = serde_json::to_string_pretty(&out).unwrap();
+        let expected = r#"{
+  "schema": 1,
+  "prefix": "/usr/local",
+  "checked_at": 1756761600,
+  "crates": [
+    {
+      "name": "bat",
+      "version": "0.26.0",
+      "bins": [
+        "bat"
+      ],
+      "locked": false,
+      "pinned": true,
+      "status": "outdated",
+      "latest": "0.26.1"
+    }
+  ]
+}"#;
+        assert_eq!(json, expected);
+    }
+
+    #[test]
+    fn pinned_output_is_the_pinned_subset_of_list() {
+        // The invariant a consumer may rely on: `pinned --json` is
+        // `list --json` filtered to `pinned == true`, entry for entry.
+        let list = ListOutput::build(PathBuf::from("/p"), &manifest(), Some(&report()));
+        let pinned = PinnedOutput::build(PathBuf::from("/p"), &manifest(), Some(&report()));
+        let expected: Vec<_> = list
+            .crates
+            .iter()
+            .filter(|c| c.pinned)
+            .map(|c| serde_json::to_value(c).unwrap())
+            .collect();
+        let got: Vec<_> = pinned
+            .crates
+            .iter()
+            .map(|c| serde_json::to_value(c).unwrap())
+            .collect();
+        assert_eq!(got, expected);
+        // No pins is a complete document, not a message.
+        let none = PinnedOutput::build(PathBuf::from("/p"), &Manifest::default(), None);
+        let value = serde_json::to_value(&none).unwrap();
+        assert_eq!(value["crates"], serde_json::json!([]));
+        assert_eq!(value["checked_at"], serde_json::Value::Null);
+        assert_eq!(value["schema"], SCHEMA);
     }
 
     #[test]

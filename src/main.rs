@@ -91,6 +91,21 @@ enum Cmd {
         #[arg(required = true)]
         crates: Vec<String>,
     },
+    /// List pinned crates and whether newer versions exist (read-only,
+    /// no sudo).
+    ///
+    /// Reads the last recorded `checkupdate` by default; `--check` asks
+    /// crates.io about the pinned crates instead, without touching the
+    /// recorded report. Exit codes as `checkupdate`: 0 a pinned crate is
+    /// known to have a newer version, 2 none is known to, 1 error
+    Pinned {
+        /// Query crates.io now instead of reading the recorded check
+        #[arg(long)]
+        check: bool,
+        /// Machine-readable output (schema documented in README)
+        #[arg(long)]
+        json: bool,
+    },
     /// List installed crates and their binaries
     List {
         /// Machine-readable output (schema documented in README)
@@ -185,6 +200,7 @@ fn main() -> ExitCode {
         Cmd::Remove { ref crates } => cmd_remove(&cli.prefix, crates),
         Cmd::Pin { ref crates } => cmd_set_pinned(&cli.prefix, crates, true),
         Cmd::Unpin { ref crates } => cmd_set_pinned(&cli.prefix, crates, false),
+        Cmd::Pinned { check, json } => return cmd_pinned(&cli.prefix, check, json),
         Cmd::List { json } => cmd_list(&cli.prefix, json),
         #[cfg(feature = "tui")]
         Cmd::Tui => tui::run(&cli.prefix),
@@ -671,6 +687,105 @@ fn cmd_set_pinned(prefix: &Path, crates: &[String], pinned: bool) -> Result<()> 
         }
     }
     Ok(())
+}
+
+fn cmd_pinned(prefix: &Path, check: bool, json: bool) -> ExitCode {
+    // Everything needed for the listing is resolved before writing
+    // anything to stdout, so failures cannot leave a partial listing.
+    let outcome = (|| {
+        let manifest = {
+            let _lock = StateLock::acquire(prefix, &Mode::Shared)?;
+            Manifest::load(prefix)?
+        };
+        // Statuses come from one source, never a blend: the recorded
+        // `checkupdate` report (default), or a fresh query of just the
+        // pinned crates (`--check`). The fresh result is deliberately not
+        // persisted — the recorded snapshot belongs to `checkupdate`, and
+        // a partial one covering only pins would misinform `list` about
+        // everything else.
+        let report = if check {
+            Some(Report::new(
+                prefix,
+                check_versions(manifest.crates.iter().filter(|(_, e)| e.pinned))?,
+            )?)
+        } else {
+            match cache_dir().and_then(|cache| Report::load(&cache, prefix)) {
+                Ok(report) => report,
+                Err(e) => {
+                    eprintln!("warning: {e:#}");
+                    None
+                }
+            }
+        };
+        let identity = report::identity(prefix)?;
+        Ok::<_, anyhow::Error>((manifest, report, identity))
+    })();
+    let (manifest, report, identity) = match outcome {
+        Ok(parts) => parts,
+        Err(e) => {
+            eprintln!("error: {e:#}");
+            return ExitCode::from(EXIT_ERROR);
+        }
+    };
+    // The exit code answers one question — does any pinned crate have a
+    // known newer version? A crate the report does not cover contributes
+    // nothing: absence of knowledge is not an update, and the stderr
+    // freshness line below is what points at the remedy.
+    let any_outdated = manifest
+        .crates
+        .iter()
+        .filter(|(_, entry)| entry.pinned)
+        .any(|(name, entry)| {
+            Version::parse(&entry.version)
+                .ok()
+                .and_then(|current| report.as_ref()?.status_for(name, &current))
+                .is_some_and(|status| matches!(status, Status::Outdated(_)))
+        });
+    if json {
+        let output = json::PinnedOutput::build(identity, &manifest, report.as_ref());
+        if let Err(e) = json::print(&output) {
+            eprintln!("error: {e:#}");
+            return ExitCode::from(EXIT_ERROR);
+        }
+    } else {
+        let mut any_pinned = false;
+        for (name, entry) in manifest.crates.iter().filter(|(_, e)| e.pinned) {
+            any_pinned = true;
+            let locked = if entry.locked { " [locked]" } else { "" };
+            // The same three states as `list`, silent on the third: a
+            // newer version known, known current, or not covered by the
+            // report — printing nothing rather than guessing.
+            let status = Version::parse(&entry.version)
+                .ok()
+                .and_then(|current| report.as_ref()?.status_for(name, &current))
+                .map(|status| match status {
+                    Status::Outdated(latest) => format!(" -> {latest}"),
+                    Status::UpToDate => " (up to date)".to_owned(),
+                })
+                .unwrap_or_default();
+            println!("{name} {}{locked}{status}", entry.version);
+        }
+        if !any_pinned {
+            println!("no pinned crates under {}", prefix.display());
+        }
+        // Freshness on stderr, as in `list`: it is for the reader, not a
+        // parser. Under `--check` the statuses are from this very moment
+        // and the line would only state the obvious.
+        if !check {
+            if let Some(r) = &report {
+                eprintln!("update check: {}", report::describe_age(r.age()));
+            } else {
+                eprintln!(
+                    "no update check recorded; run `cargo lbin checkupdate` or use `--check`"
+                );
+            }
+        }
+    }
+    if any_outdated {
+        ExitCode::from(EXIT_UPDATES)
+    } else {
+        ExitCode::from(EXIT_NO_UPDATES)
+    }
 }
 
 fn cmd_remove(prefix: &Path, crates: &[String]) -> Result<()> {
