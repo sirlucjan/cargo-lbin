@@ -53,6 +53,10 @@ pub struct Row {
     pub bins: Vec<String>,
     pub locked: bool,
     pub pinned: bool,
+    /// Pre-formatted ` [also in ...]` suffix from the prefixes module —
+    /// the same formatter the CLI listing uses, so the two surfaces
+    /// cannot drift; empty for a crate installed nowhere else.
+    pub also: String,
     pub status: RowStatus,
 }
 
@@ -397,7 +401,11 @@ impl App {
             let _lock = StateLock::acquire(&self.prefix, &Mode::Shared)?;
             Manifest::load(&self.prefix)?
         };
-        self.rows = rows_from(&manifest, report);
+        // Once per reload, never per frame — and lockless by design; the
+        // prefixes module explains why an annotation must never wait on
+        // a foreign lock.
+        let also = crate::prefixes::also_installed(&self.prefix);
+        self.rows = rows_from(&manifest, report, &also);
         self.report_age = report.map(Report::age);
         self.clamp_selection();
         Ok(())
@@ -1383,7 +1391,11 @@ fn action_label(action: &PendingAction) -> String {
 /// Manifest entries joined with what the report knows about each. The
 /// report is consulted per installed version, so a crate updated or
 /// installed after the check comes out `Unknown`, not stale.
-fn rows_from(manifest: &Manifest, report: Option<&Report>) -> Vec<Row> {
+fn rows_from(
+    manifest: &Manifest,
+    report: Option<&Report>,
+    also: &std::collections::BTreeMap<String, Vec<crate::prefixes::AlsoIn>>,
+) -> Vec<Row> {
     manifest
         .crates
         .iter()
@@ -1401,6 +1413,7 @@ fn rows_from(manifest: &Manifest, report: Option<&Report>) -> Vec<Row> {
                 bins: entry.bins.clone(),
                 locked: entry.locked,
                 pinned: entry.pinned,
+                also: crate::prefixes::describe_for(also, name),
                 status,
             }
         })
@@ -1497,7 +1510,7 @@ mod tests {
             ],
         )
         .unwrap();
-        let rows = rows_from(&m, Some(&report));
+        let rows = rows_from(&m, Some(&report), &std::collections::BTreeMap::new());
         let status: Vec<(&str, &RowStatus)> =
             rows.iter().map(|r| (r.name.as_str(), &r.status)).collect();
         assert_eq!(status[0], ("bat", &RowStatus::Outdated(v("0.26.1"))));
@@ -1505,7 +1518,7 @@ mod tests {
         assert_eq!(status[2], ("ripgrep", &RowStatus::UpToDate));
 
         // No report at all: everything unknown, nothing claimed.
-        let rows = rows_from(&m, None);
+        let rows = rows_from(&m, None, &std::collections::BTreeMap::new());
         assert!(rows.iter().all(|r| r.status == RowStatus::Unknown));
     }
 
@@ -1567,6 +1580,7 @@ mod tests {
             bins: vec!["x".into()],
             locked: false,
             pinned,
+            also: String::new(),
             status,
         };
         let newer = Version::new(2, 0, 0);
@@ -1686,5 +1700,25 @@ mod tests {
             );
             assert!(line.contains("shadowed"), "the words do survive");
         }
+    }
+
+    #[test]
+    fn rows_carry_the_cross_prefix_suffix() {
+        // The suffix comes pre-formatted from the shared formatter, so
+        // this pins both the plumbing and the no-drift property.
+        let mut also = std::collections::BTreeMap::new();
+        also.insert(
+            "one".to_owned(),
+            vec![crate::prefixes::AlsoIn {
+                prefix: std::path::PathBuf::from("/usr/local"),
+                version: "0.9.0".to_owned(),
+            }],
+        );
+        let m = manifest(&[("one", "1.0.0"), ("two", "2.0.0")]);
+        let rows = rows_from(&m, None, &also);
+        let one = rows.iter().find(|r| r.name == "one").unwrap();
+        assert_eq!(one.also, " [also in /usr/local @0.9.0]");
+        let two = rows.iter().find(|r| r.name == "two").unwrap();
+        assert!(two.also.is_empty(), "installed nowhere else, no suffix");
     }
 }

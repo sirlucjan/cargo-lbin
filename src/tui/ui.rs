@@ -80,6 +80,9 @@ fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
             if row.pinned {
                 name.push_str(" [pinned]");
             }
+            if !row.also.is_empty() {
+                name.push_str(&row.also);
+            }
             TableRow::new(vec![
                 Cell::from(name),
                 Cell::from(row.version.clone()),
