@@ -157,12 +157,20 @@ pub fn build_captured(
     // prefixes, the failure panel shows the lines verbatim. Captured
     // means captured; the terminal build stays untouched.
     cmd.env("CARGO_TERM_COLOR", "never");
+    // Its own process group, so a cancel can address cargo *and* every
+    // rustc and build script it is running with one negative-pid kill.
+    // Signalling cargo alone would orphan running compilations, which
+    // keep writing into the stage the caller is about to discard. The
+    // terminal build stays in the session's foreground group on
+    // purpose: there, Ctrl-C reaching everything is the terminal's job.
+    std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
     let mut child = cmd
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
         .spawn()
         .context("failed to spawn cargo")?;
+
     let stderr = child
         .stderr
         .take()
@@ -201,9 +209,20 @@ pub fn build_captured(
     if read_error.is_some() {
         // The reader abandons the pipe with cargo possibly still
         // writing; a full pipe would park cargo on write while we park
-        // on wait — a quiet mutual stall. Kill first, then reap: the
-        // build is already lost to the read failure either way.
-        let _ = child.kill();
+        // on wait — a quiet mutual stall. Kill first, then reap — and
+        // kill the whole group: the build runs in its own process group
+        // precisely so rustc and build scripts cannot outlive cargo,
+        // and a leader-only kill here would abandon them to keep
+        // writing into a stage about to be discarded. The build is
+        // already lost to the read failure either way.
+        if let Ok(pgid) = i32::try_from(child.id()) {
+            // SAFETY: kill(2) with a negative pid signals the process
+            // group; no memory is touched and an error (ESRCH: already
+            // gone) is an acceptable no-op.
+            unsafe {
+                libc::kill(-pgid, libc::SIGKILL);
+            }
+        }
     }
     let status = child.wait().context("waiting for cargo")?;
     if let Some(e) = read_error {
