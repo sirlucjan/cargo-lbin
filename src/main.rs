@@ -59,8 +59,37 @@ struct Cli {
     )]
     prefix: PathBuf,
 
+    /// Install for this user only: an alias for --prefix ~/.local
+    ///
+    /// Binaries land in ~/.local/bin (on most distributions already on
+    /// PATH), state in ~/.local/share/cargo-lbin; sudo is never used.
+    // Deliberately overrides $CARGO_LBIN_PREFIX too: an alias exists to
+    // be typed ad hoc, and ad hoc must beat ambient configuration —
+    // only an explicit --prefix conflicts, because two explicit answers
+    // to the same question deserve an error, not a precedence rule.
+    // No clap-level conflict: clap counts an env-provided value as
+    // "present", and the documented pattern — export CARGO_LBIN_PREFIX
+    // once — must not lock --user out forever. The explicit-flag
+    // conflict is enforced below via value_source instead.
+    #[arg(long, global = true)]
+    user: bool,
+
     #[command(subcommand)]
     cmd: Cmd,
+}
+
+/// The user prefix `--user` stands for. `$HOME/.local` is the one
+/// FHS-adjacent place a prefix layout maps onto untouched: bin/ is
+/// blessed by systemd's file-hierarchy(7) and on PATH almost
+/// everywhere, and share/cargo-lbin lands in the default XDG user data
+/// location (a custom `XDG_DATA_HOME` points elsewhere, and lbin's state
+/// deliberately follows the prefix, not the variable). No new layout,
+/// no special cases — the same tree, owned by the user.
+fn user_prefix() -> Result<PathBuf> {
+    #[allow(deprecated)] // un-deprecated in std, attribute kept for older toolchain docs
+    std::env::home_dir()
+        .context("--user needs a home directory, and none could be determined")
+        .map(|home| home.join(".local"))
 }
 
 #[derive(Subcommand)]
@@ -181,7 +210,27 @@ fn main() -> ExitCode {
     let args = std::env::args_os()
         .enumerate()
         .filter_map(|(i, a)| (!(i == 1 && a == *"lbin")).then_some(a));
-    let cli = Cli::parse_from(args);
+    let matches = <Cli as clap::CommandFactory>::command().get_matches_from(args);
+    let mut cli = match <Cli as clap::FromArgMatches>::from_arg_matches(&matches) {
+        Ok(cli) => cli,
+        Err(e) => e.exit(),
+    };
+    if cli.user {
+        // Two explicit answers to the same question deserve an error; an
+        // ambient one (the env variable) yields to the ad hoc flag —
+        // that is what an alias is for.
+        if matches.value_source("prefix") == Some(clap::parser::ValueSource::CommandLine) {
+            eprintln!("error: the argument '--user' cannot be used with an explicit '--prefix'");
+            return ExitCode::from(EXIT_ERROR);
+        }
+        cli.prefix = match user_prefix() {
+            Ok(prefix) => prefix,
+            Err(e) => {
+                eprintln!("error: {e:#}");
+                return ExitCode::from(EXIT_ERROR);
+            }
+        };
+    }
     // Running the whole program as root would execute cargo — build scripts
     // and proc macros included — with root privileges, undoing the one
     // security property the entire design rests on. `sudo cargo-lbin install foo`

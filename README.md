@@ -472,14 +472,24 @@ The default prefix is `/usr/local`:
 /usr/local/share/cargo-lbin/lock
 ```
 
-Select a custom prefix with `--prefix`:
+The per-user prefix has a first-class flag — `--user` is an alias for
+`--prefix ~/.local`:
 
 ```bash
-cargo lbin --prefix ~/.local install hexyl
-cargo lbin --prefix ~/.local list
+cargo lbin --user install hexyl
+cargo lbin --user list
 ```
 
-Or set it once for every invocation:
+Binaries land in `~/.local/bin` (on most distributions already on
+`PATH`), state in `~/.local/share/cargo-lbin` — the default XDG user
+data location — the same tree as `/usr/local`, owned by the user, and
+`sudo` is never used. Any other custom prefix works via `--prefix`:
+
+```bash
+cargo lbin --prefix "$HOME/tools" install hexyl
+```
+
+Or set one once for every invocation:
 
 ```bash
 export CARGO_LBIN_PREFIX="$HOME/.local"
@@ -490,8 +500,13 @@ cargo lbin list
 Prefix precedence is:
 
 ```text
---prefix > CARGO_LBIN_PREFIX > /usr/local
+--user | --prefix > CARGO_LBIN_PREFIX > /usr/local
 ```
+
+`--user` with an explicit `--prefix` is an error (two explicit answers
+to one question); `--user` over an exported `CARGO_LBIN_PREFIX` wins
+silently — an alias exists to be typed ad hoc, and ad hoc beats ambient
+configuration.
 
 Custom prefixes must be writable by the invoking user. `cargo-lbin` only permits privilege escalation for the canonical `/usr/local` prefix; it will not use `sudo` to write into an arbitrary custom path.
 
