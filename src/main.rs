@@ -317,7 +317,7 @@ impl RollbackSet {
 /// previous attempt already deleted is a no-op. Content checksums in the
 /// manifest would break the first property — if they are ever added, verify
 /// them on remove only, never as an install precondition.
-fn rollback_new_bins(policy: privileged::Escalation, placed: &[PathBuf]) {
+fn rollback_new_bins(policy: privileged::Policy, placed: &[PathBuf]) {
     if placed.is_empty() {
         return;
     }
@@ -378,6 +378,131 @@ fn check_collisions(
     Ok(())
 }
 
+/// What a captured line is, decided where it is spoken. Capture is not
+/// presentation: a frontend shows cargo's stream live, promotes notices
+/// to the live status, and keeps warnings visible past a success — and
+/// none of that is possible if every line arrives as anonymous text.
+#[cfg(feature = "tui")]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum LineKind {
+    /// cargo's own output, streamed under the gauge.
+    Cargo,
+    /// The pipeline narrating itself: "installed …", "waiting for the
+    /// state lock…". Presentation-worthy while it happens.
+    Notice,
+    /// Something the person should still see when everything else went
+    /// fine — a shadowed binary does not stop being shadowed because
+    /// the install succeeded.
+    Warning,
+}
+
+/// How a build-and-place operation talks to the person while it runs.
+pub(crate) enum Frontend<'a> {
+    /// The CLI owns the terminal: cargo output is inherited verbatim,
+    /// notes go to stdout, warnings to stderr, and sudo prompts where it
+    /// must.
+    Terminal,
+    /// A screen-owning frontend (the TUI): every line — cargo's and the
+    /// pipeline's own — is forwarded instead of printed, classified at
+    /// the source: the pipeline knows whether it speaks cargo's words, a
+    /// note of its own, or a warning, and a frontend deciding what must
+    /// survive a successful install cannot reconstruct that from text.
+    /// Placement waits on a checkpoint confirming sudo credentials are
+    /// still fresh, because a hidden password prompt would hang an
+    /// alternate screen rather than show on it.
+    #[cfg(feature = "tui")]
+    // Constructed by the TUI build job; the allow is temporary
+    // scaffolding for this series and is removed by the commit that
+    // lands the consumer.
+    #[allow(dead_code)]
+    Captured {
+        on_line: &'a mut dyn FnMut(LineKind, &str),
+        before_placement: &'a mut dyn FnMut() -> Result<()>,
+    },
+    /// Keeps the lifetime honest when the tui feature is off.
+    #[cfg(not(feature = "tui"))]
+    #[allow(dead_code)]
+    Never(std::marker::PhantomData<&'a ()>),
+}
+
+impl Frontend<'_> {
+    /// The build itself: terminal-inherited or captured, one call site.
+    #[cfg_attr(not(feature = "tui"), allow(unused_variables))]
+    fn build(
+        &mut self,
+        name: &str,
+        version: Option<&Version>,
+        locked: bool,
+        stage_dir: &Path,
+        cache: &Path,
+    ) -> Result<stage::Built> {
+        match self {
+            Frontend::Terminal => stage::build(name, version, locked, stage_dir),
+            #[cfg(feature = "tui")]
+            Frontend::Captured { on_line, .. } => stage::build_captured(
+                name,
+                version,
+                locked,
+                stage_dir,
+                &cache.join("logs"),
+                &mut |l| on_line(LineKind::Cargo, l),
+            ),
+            #[cfg(not(feature = "tui"))]
+            Frontend::Never(_) => unreachable!(),
+        }
+    }
+
+    /// Pipeline notes a person should read — "installed …", "removed
+    /// obsolete …". stdout in the terminal, forwarded when captured.
+    fn note(&mut self, s: &str) {
+        match self {
+            Frontend::Terminal => println!("{s}"),
+            #[cfg(feature = "tui")]
+            Frontend::Captured { on_line, .. } => on_line(LineKind::Notice, s),
+            #[cfg(not(feature = "tui"))]
+            Frontend::Never(_) => unreachable!(),
+        }
+    }
+
+    /// Warnings. stderr in the terminal; captured with their kind — a
+    /// warning that melts into anonymous text is a warning lost. One
+    /// callback still, one classification.
+    fn warning(&mut self, s: &str) {
+        match self {
+            Frontend::Terminal => eprintln!("{s}"),
+            #[cfg(feature = "tui")]
+            Frontend::Captured { on_line, .. } => on_line(LineKind::Warning, s),
+            #[cfg(not(feature = "tui"))]
+            Frontend::Never(_) => unreachable!(),
+        }
+    }
+
+    /// Whether the pipeline's own preauthorize should run. The terminal
+    /// prompts fine; a captured frontend validated credentials before
+    /// handing over and re-checks at the placement checkpoint, so a
+    /// prompt from inside the pipeline would be exactly the hidden one
+    /// this type exists to prevent.
+    fn wants_preauthorize(&self) -> bool {
+        matches!(self, Frontend::Terminal)
+    }
+
+    /// The placement checkpoint: a no-op on the terminal, the frontend's
+    /// re-validation hook when captured — a build can outlive sudo's
+    /// credential timestamp. Called only when placement will escalate;
+    /// a user-writable prefix never reaches it.
+    fn before_placement(&mut self) -> Result<()> {
+        match self {
+            Frontend::Terminal => Ok(()),
+            #[cfg(feature = "tui")]
+            Frontend::Captured {
+                before_placement, ..
+            } => before_placement(),
+            #[cfg(not(feature = "tui"))]
+            Frontend::Never(_) => unreachable!(),
+        }
+    }
+}
+
 /// Build one crate, verify ownership of the destinations, place binaries,
 /// clean up binaries the previous version provided but the new one does not,
 /// and commit the manifest — all before the next crate is touched, so a
@@ -398,22 +523,37 @@ fn install_and_commit(
     name: &str,
     version: Option<&Version>,
     locked: bool,
+    frontend: &mut Frontend<'_>,
 ) -> Result<()> {
     // Revalidate even though CLI input was already checked: on the update
     // path `name` comes from the manifest, and a hand-edited manifest must
     // not be able to steer the remove_dir_all below via a path-like name.
     validate_name(name)?;
-    let policy = privileged::Escalation::for_prefix(prefix);
+    // A captured frontend forbids prompting outright: `-v` beforehand is
+    // a convenience, never a proof, so the privileged calls themselves
+    // run `sudo -n` — a password wanted there becomes a loud error in
+    // the failure panel instead of a prompt hung invisibly beneath the
+    // alternate screen.
+    let policy = match frontend {
+        Frontend::Terminal => privileged::Policy::for_prefix(prefix),
+        #[cfg(feature = "tui")]
+        Frontend::Captured { .. } => {
+            privileged::Policy::for_prefix(prefix).screen_owned()
+        }
+        #[cfg(not(feature = "tui"))]
+        Frontend::Never(_) => unreachable!(),
+    };
     // UX-only early form of the policy check: fail before a multi-minute
     // build, not after. Enforcement proper lives at every privileged call
-    // site via `Escalation`; this merely surfaces the same refusal sooner.
+    // site via the sudo axis of `Policy`; this merely surfaces the same refusal sooner.
     // The same reasoning moves the password prompt here: when placement
     // will need sudo, validate credentials now, so the initial prompt
     // comes before the build instead of ambushing an unattended terminal
     // after it (sudo may still re-prompt if its timestamp expires).
-    let bin_dir = prefix.join("bin");
-    let escalate = policy.probe_destination(&bin_dir)?;
-    privileged::preauthorize(&bin_dir, escalate)?;
+    let initial_escalate = install_needs_privilege(policy, prefix)?;
+    if frontend.wants_preauthorize() {
+        privileged::preauthorize(prefix, initial_escalate)?;
+    }
     // Per-PID stage: the state lock serializes instances per *prefix*, so
     // two cargo-lbin runs against different prefixes may legitimately build the
     // same crate at the same time — and one wiping the other's stage
@@ -428,7 +568,7 @@ fn install_and_commit(
         fs::remove_dir_all(&stage_dir)
             .with_context(|| format!("clearing stale stage {}", stage_dir.display()))?;
     }
-    let built = stage::build(name, version, locked, &stage_dir)?;
+    let built = frontend.build(name, version, locked, &stage_dir, cache)?;
     check_collisions(manifest, name, &built.bins, &prefix.join("bin"))?;
     // Only for names this crate did not provide before: on a first
     // install that is every binary; on an update it is the ones the new
@@ -446,7 +586,9 @@ fn install_and_commit(
         })
         .cloned()
         .collect();
-    warn_shadows(prefix, &new_bins);
+    for w in shadow_warnings(prefix, &new_bins) {
+        frontend.warning(&w);
+    }
 
     // Snapshot before `place_and_commit` inserts the new manifest entry;
     // see `RollbackSet::snapshot` for why the order is load-bearing.
@@ -455,6 +597,21 @@ fn install_and_commit(
     // next `update --all` would undo the choice. Without one, a pin
     // already present is carried over (see below).
     let pin = version.is_some();
+    // The checkpoint sits between the last unprivileged step and the
+    // first privileged one: everything before it needed no sudo, and a
+    // build can outlive sudo's credential timestamp. At a user-writable
+    // prefix nothing ahead will run sudo, so there is nothing to
+    // revalidate — and a frontend must not be made to poke sudo on a
+    // system that may not even have it. Re-probed here rather than
+    // reused from before the build: minutes have passed, the privileged
+    // call sites re-check writability themselves, and a stale answer
+    // could skip the checkpoint right before sudo -n discovers a new
+    // need — failing the install with no chance to reauth. "The
+    // checkpoint precedes the first privileged write" is a claim about
+    // now, not about the pre-build world.
+    if install_needs_privilege(policy, prefix)? {
+        frontend.before_placement()?;
+    }
     if let Err(err) = place_and_commit(
         prefix,
         policy,
@@ -464,6 +621,7 @@ fn install_and_commit(
         locked,
         pin,
         &mut rollback,
+        frontend,
     ) {
         rollback_new_bins(policy, &rollback.placed);
         return Err(err);
@@ -490,13 +648,14 @@ fn install_and_commit(
 #[allow(clippy::too_many_arguments)]
 fn place_and_commit(
     prefix: &Path,
-    policy: privileged::Escalation,
+    policy: privileged::Policy,
     manifest: &mut Manifest,
     name: &str,
     built: stage::Built,
     locked: bool,
     pin: bool,
     rollback: &mut RollbackSet,
+    frontend: &mut Frontend<'_>,
 ) -> Result<()> {
     let bin_dir = prefix.join("bin");
     // Open and verify every staged source as the user before any privileged
@@ -523,7 +682,10 @@ fn place_and_commit(
             let paths: Vec<PathBuf> = obsolete.iter().map(|b| bin_dir.join(b)).collect();
             let refs: Vec<&Path> = paths.iter().map(PathBuf::as_path).collect();
             privileged::remove_files(policy, &refs)?;
-            println!("removed obsolete binaries: {}", obsolete.join(", "));
+            frontend.note(&format!(
+                "removed obsolete binaries: {}",
+                obsolete.join(", ")
+            ));
         }
     }
 
@@ -540,6 +702,7 @@ fn place_and_commit(
     commit_entry(
         manifest,
         prefix,
+        policy,
         name,
         Entry {
             version: built.version.to_string(),
@@ -556,15 +719,15 @@ fn place_and_commit(
     } else {
         String::new()
     };
-    println!(
+    frontend.note(&format!(
         "installed {name} {} -> {} ({bins_list}){pin_note}",
         built.version,
         bin_dir.display(),
-    );
+    ));
     Ok(())
 }
 
-/// One stderr line per binary that a `PATH` entry outside the prefix
+/// One warning line per binary that a `PATH` entry outside the prefix
 /// already provides — usually a distribution package — naming the file,
 /// its owner if the package manager will say, and which of the two
 /// directories comes first in `PATH`. A warning only; see `shadow` for why it is not a
@@ -572,28 +735,28 @@ fn place_and_commit(
 /// that appears *after* ours took the name is a collision that arose
 /// outside cargo-lbin, and repeating the warning on every update would
 /// be the price of catching it.
-fn warn_shadows(prefix: &Path, bins: &[String]) {
+fn shadow_warnings(prefix: &Path, bins: &[String]) -> Vec<String> {
     if bins.is_empty() {
-        return;
+        return Vec::new();
     }
     let Some(path_var) = std::env::var_os("PATH") else {
-        return;
+        return Vec::new();
     };
     // The scan needs the working directory only to anchor relative
     // `PATH` entries and a relative prefix; if it cannot be read, those
     // entries cannot be judged, and a warning that might be wrong is
     // worse than none.
     let Ok(cwd) = std::env::current_dir() else {
-        return;
+        return Vec::new();
     };
     let prefix_bin = prefix.join("bin");
-    for s in shadow::find_shadows(&path_var, &prefix_bin, bins, &cwd, shadow::is_executable) {
-        let owner = shadow::owner_of(&s.existing);
-        eprintln!(
-            "warning: {}",
-            shadow::describe(&s, &prefix_bin, owner.as_deref())
-        );
-    }
+    shadow::find_shadows(&path_var, &prefix_bin, bins, &cwd, shadow::is_executable)
+        .iter()
+        .map(|s| {
+            let owner = shadow::owner_of(&s.existing);
+            format!("warning: {}", shadow::describe(s, &prefix_bin, owner.as_deref()))
+        })
+        .collect()
 }
 
 /// Insert `entry` and persist the manifest as one unit: on a failed store the
@@ -604,9 +767,31 @@ fn warn_shadows(prefix: &Path, bins: &[String]) {
 /// it, a store failure for crate A would leave A's new entry in memory, and
 /// the next successful commit (for crate B) would persist A's entry for
 /// binaries that were rolled back or never fully placed.
-fn commit_entry(manifest: &mut Manifest, prefix: &Path, name: &str, entry: Entry) -> Result<()> {
+/// Will an install into `prefix` need privileged writes? The union over
+/// everything the pipeline touches: binaries under bin, then the
+/// manifest under the state directory — either alone can be the one
+/// that needs sudo (mixed ownership: a user-writable bin next to a
+/// root-owned share). One answer for the TUI preflight and the
+/// pipeline's own checkpoint gating, so the two cannot drift; a reauth
+/// decision keyed to bin alone would skip exactly the case the state
+/// write is about to hit. A missing state directory probes as writable
+/// where the prefix allows creating it — `dir_writable` creates parents
+/// as the user first — so a fresh custom prefix answers false here and
+/// the lock preparation covers its own privileged case separately.
+fn install_needs_privilege(policy: privileged::Policy, prefix: &Path) -> Result<bool> {
+    Ok(policy.probe_destination(&prefix.join("bin"))?
+        || policy.probe_destination(&prefix.join("share/cargo-lbin"))?)
+}
+
+fn commit_entry(
+    manifest: &mut Manifest,
+    prefix: &Path,
+    policy: privileged::Policy,
+    name: &str,
+    entry: Entry,
+) -> Result<()> {
     let previous = manifest.crates.insert(name.to_owned(), entry);
-    if let Err(err) = manifest.store(prefix) {
+    if let Err(err) = manifest.store_with_policy(prefix, policy) {
         if let Some(old) = previous {
             manifest.crates.insert(name.to_owned(), old);
         } else {
@@ -643,6 +828,7 @@ fn cmd_install(prefix: &Path, crates: &[String], locked: bool) -> Result<()> {
             &spec.name,
             spec.version.as_ref(),
             locked,
+            &mut Frontend::Terminal,
         )?;
     }
     Ok(())
@@ -802,7 +988,7 @@ fn cmd_pinned(prefix: &Path, check: bool, json: bool) -> ExitCode {
 
 fn cmd_remove(prefix: &Path, crates: &[String]) -> Result<()> {
     let _lock = StateLock::acquire(prefix, &Mode::Exclusive)?;
-    let policy = privileged::Escalation::for_prefix(prefix);
+    let policy = privileged::Policy::for_prefix(prefix);
     let mut manifest = Manifest::load(prefix)?;
     let bin_dir = prefix.join("bin");
     let mut removed_any = false;
@@ -1217,7 +1403,15 @@ fn cmd_downgrade(prefix: &Path, name: &str) -> Result<()> {
     println!("downgrading {name} {current} -> {version}");
     // The chosen version is installed and pinned by the same path as
     // `install NAME@VERSION`.
-    install_and_commit(prefix, &cache, &mut manifest, name, Some(version), locked)
+    install_and_commit(
+        prefix,
+        &cache,
+        &mut manifest,
+        name,
+        Some(version),
+        locked,
+        &mut Frontend::Terminal,
+    )
 }
 
 fn cmd_checkupdate(prefix: &Path, json: bool) -> ExitCode {
@@ -1398,7 +1592,15 @@ fn apply_updates(prefix: &Path, cache: &Path, outdated: &[Checked]) -> Result<()
                 // The stage may end up building something newer than
                 // `latest` if a release lands mid-update; the manifest
                 // records what was built.
-                match install_and_commit(prefix, cache, &mut manifest, &o.name, None, locked) {
+                match install_and_commit(
+                    prefix,
+                    cache,
+                    &mut manifest,
+                    &o.name,
+                    None,
+                    locked,
+                    &mut Frontend::Terminal,
+                ) {
                     Ok(()) => updated += 1,
                     Err(err) => {
                         eprintln!("error: updating `{}` failed: {err:#}", o.name);
@@ -1672,11 +1874,23 @@ mod tests {
         };
         // Update of an existing crate: the old entry must come back.
         let mut m = manifest_with(&["foo"]);
-        assert!(commit_entry(&mut m, &prefix, "foo", entry("2.0.0")).is_err());
+        assert!(commit_entry(
+            &mut m,
+            &prefix,
+            privileged::Policy::for_prefix(&prefix),
+            "foo",
+            entry("2.0.0"),
+        ).is_err());
         assert_eq!(m.crates["foo"].version, "1.0.0");
         // Fresh install: the name must disappear again.
         let mut m = Manifest::default();
-        assert!(commit_entry(&mut m, &prefix, "foo", entry("2.0.0")).is_err());
+        assert!(commit_entry(
+            &mut m,
+            &prefix,
+            privileged::Policy::for_prefix(&prefix),
+            "foo",
+            entry("2.0.0"),
+        ).is_err());
         assert_eq!(m.crates.keys().collect::<Vec<_>>(), Vec::<&String>::new());
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -1768,5 +1982,85 @@ mod tests {
         // Nonexistent destination: fine.
         assert!(check_collisions(&manifest, "newcrate", &["fresh".to_owned()], &dir).is_ok());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "tui")]
+    #[test]
+    fn captured_frontend_runs_the_whole_pipeline() {
+        use std::os::unix::fs::PermissionsExt;
+
+
+        let root = std::env::temp_dir().join("cargo-lbin-test-captured-pipeline");
+        let _ = fs::remove_dir_all(&root);
+        let fake_bin = root.join("fakebin");
+        let prefix = root.join("prefix");
+        fs::create_dir_all(&fake_bin).unwrap();
+        fs::create_dir_all(prefix.join("bin")).unwrap();
+        fs::create_dir_all(prefix.join("share/cargo-lbin")).unwrap();
+
+        // A fake cargo that stages one binary; the stage root is the
+        // argument after --root ($4).
+        let script = fake_bin.join("cargo");
+        fs::write(
+            &script,
+            "#!/bin/sh\n\
+             echo '   Compiling okcrate v0.1.0' >&2\n\
+             mkdir -p \"$4/bin\"\n\
+             printf '#!/bin/sh\\ntrue\\n' > \"$4/bin/okcrate\"\n\
+             chmod 755 \"$4/bin/okcrate\"\n\
+             printf '%s' '{\"installs\":{\"okcrate 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)\":{\"bins\":[\"okcrate\"]}}}' > \"$4/.crates2.json\"\n\
+             exit 0\n",
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        // The same RAII guard as the stage tests: the fake is cleared on
+        // drop, panics included, so this test cannot leave it behind to
+        // answer an unrelated build elsewhere in the run.
+        let _fake = crate::stage::FakeCargo::install(&script);
+
+        let cache = root.join("cache");
+        let mut manifest = Manifest::default();
+        let mut lines: Vec<(LineKind, String)> = Vec::new();
+        let mut checkpoints = 0usize;
+        let result = install_and_commit(
+            &prefix,
+            &cache,
+            &mut manifest,
+            "okcrate",
+            None,
+            false,
+            &mut Frontend::Captured {
+                on_line: &mut |k, l| lines.push((k, l.to_owned())),
+                before_placement: &mut || {
+                    checkpoints += 1;
+                    Ok(())
+                },
+            },
+        );
+        result.unwrap();
+
+        assert_eq!(
+            checkpoints, 0,
+            "a user-writable prefix never reaches the checkpoint — the \
+             frontend must not be made to poke sudo when nothing will \
+             escalate"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|(k, l)| *k == LineKind::Cargo && l.contains("Compiling okcrate")),
+            "cargo output reaches the frontend as cargo's: {lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|(k, l)| *k == LineKind::Notice
+                    && l.starts_with("installed okcrate 0.1.0")),
+            "the pipeline note arrives classified, not as anonymous text: {lines:?}"
+        );
+        assert!(prefix.join("bin/okcrate").is_file(), "binary placed");
+        let stored = Manifest::load(&prefix).unwrap();
+        assert!(stored.crates.contains_key("okcrate"), "manifest committed");
+        let _ = fs::remove_dir_all(&root);
     }
 }

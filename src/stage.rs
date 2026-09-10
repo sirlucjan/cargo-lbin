@@ -395,6 +395,7 @@ fn staged_info(name: &str, stage: &Path) -> Result<Built> {
 mod tests {
     use super::*;
 
+
     #[test]
     fn staged_info_parses_crates2() {
         let dir = std::env::temp_dir().join("cargo-lbin-test-stage");

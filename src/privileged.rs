@@ -64,21 +64,65 @@ const CANONICAL_PREFIX: &str = "/usr/local";
 /// re-derives (and could re-derive differently if a user-controlled prefix
 /// component changes between checks). The invariant is auditable at a
 /// glance: `/usr/local` may escalate, everything else never does.
+/// May this operation use sudo at all? One axis of `Policy`.
 #[derive(Clone, Copy)]
-pub enum Escalation {
-    /// sudo permitted where the destination is not user-writable.
+pub enum Sudo {
+    /// Permitted where the destination is not user-writable.
     Allowed,
-    /// sudo never used; a non-writable destination is a hard error.
+    /// Never used; a non-writable destination is a hard error.
     Forbidden,
 }
 
-impl Escalation {
-    /// The policy for a prefix. Only the canonical prefix may escalate.
+/// Who owns the terminal while subprocesses run? The other axis — and
+/// deliberately independent of `Sudo`: an unprivileged `/usr/bin/mv`
+/// failing under a TUI corrupts the screen exactly as thoroughly as a
+/// privileged one, and a prefix that forbids sudo entirely can still be
+/// driven from a frontend that owns the screen.
+#[derive(Clone, Copy)]
+pub enum Screen {
+    /// The caller's terminal: children inherit stdio, sudo may prompt.
+    Inherited,
+    /// A frontend owns the screen: every child is captured and its words
+    /// travel in errors instead of landing beneath the UI, and sudo runs
+    /// `-n` — a prompt would hang invisibly, so needing a password is a
+    /// loud diagnosis instead of a question. `-v` beforehand is a
+    /// convenience, never a proof (`timestamp_timeout=0`, per-command
+    /// policy), and this is what turns a wanted password into an error.
+    Owned,
+}
+
+/// What a privileged call site is handed: both decisions, made once at
+/// the operation's edge and threaded through, so no call site re-derives
+/// either — and neither axis can silently erase the other.
+#[derive(Clone, Copy)]
+pub struct Policy {
+    pub sudo: Sudo,
+    pub screen: Screen,
+}
+
+impl Policy {
+    /// The policy for a prefix, on the caller's own terminal. Only the
+    /// canonical prefix may escalate.
     pub fn for_prefix(prefix: &Path) -> Self {
-        if prefix == Path::new(CANONICAL_PREFIX) {
-            Self::Allowed
+        let sudo = if prefix == Path::new(CANONICAL_PREFIX) {
+            Sudo::Allowed
         } else {
-            Self::Forbidden
+            Sudo::Forbidden
+        };
+        Self {
+            sudo,
+            screen: Screen::Inherited,
+        }
+    }
+
+    /// The same sudo decision, under a frontend that owns the screen.
+    /// Only a captured frontend calls this, so a CLI-only build never
+    /// does.
+    #[cfg_attr(not(feature = "tui"), allow(dead_code))]
+    pub fn screen_owned(self) -> Self {
+        Self {
+            screen: Screen::Owned,
+            ..self
         }
     }
 
@@ -95,10 +139,10 @@ impl Escalation {
     /// at every call site, not just at a one-time pre-check.
     fn escalate_for(self, dir: &Path) -> Result<bool> {
         let needs = needs_privilege(dir);
-        match (self, needs) {
+        match (self.sudo, needs) {
             (_, false) => Ok(false),
-            (Self::Allowed, true) => Ok(true),
-            (Self::Forbidden, true) => bail!(
+            (Sudo::Allowed, true) => Ok(true),
+            (Sudo::Forbidden, true) => bail!(
                 "refusing to write to {} with elevated privileges: only {CANONICAL_PREFIX} \
                  is supported as a privileged prefix (its parents are root-owned and cannot \
                  be swapped mid-operation). Use a writable --prefix such as ~/.local instead.",
@@ -159,8 +203,9 @@ pub fn needs_privilege(dir: &Path) -> bool {
 /// (a long build, `timestamp_timeout=0`, per-TTY policy); that is sudo's
 /// call to make, and deliberately not worked around here.
 ///
-/// `escalate` is the probe result for the destination: when placement will
-/// not use sudo, nothing here runs at all. Otherwise `sudo -n -v` asks
+/// `escalate` is the caller's union over every privileged write ahead
+/// (binaries, state, lock): when none will use sudo, nothing here runs
+/// at all. Otherwise `sudo -n -v` asks
 /// noninteractively whether the credential timestamp is still fresh —
 /// `-v` because the question is the timestamp itself, not authorization
 /// for any particular command; if it is fresh, there is nothing to say
@@ -174,7 +219,7 @@ pub fn needs_privilege(dir: &Path) -> bool {
 /// command-specific sudoers policy can still treat the later privileged
 /// calls differently than `-v`. Those calls authorize on their own
 /// terms either way; this merely times the common case's prompt well.
-pub fn preauthorize(dir: &Path, escalate: bool) -> Result<()> {
+pub fn preauthorize(prefix: &Path, escalate: bool) -> Result<()> {
     if !escalate {
         return Ok(());
     }
@@ -190,9 +235,12 @@ pub fn preauthorize(dir: &Path, escalate: bool) -> Result<()> {
     if fresh {
         return Ok(());
     }
+    // Named by prefix, not by bin: the privileged writes may be the
+    // binaries, the state directory, or the lock file — "into .../bin"
+    // would state a false reason whenever it is one of the latter two.
     eprintln!(
-        "administrative privileges are required to install into {}",
-        dir.display()
+        "administrative privileges are required to install under {}",
+        prefix.display()
     );
     let status = Command::new(SUDO)
         .arg("-v")
@@ -204,10 +252,10 @@ pub fn preauthorize(dir: &Path, escalate: bool) -> Result<()> {
     Ok(())
 }
 
-/// Escalation decision for a set of existing paths under a policy: sudo if
+/// Sudo decision for a set of existing paths under a policy: escalate if
 /// any parent directory is not writable and escalation is allowed; a
 /// non-writable parent under `Forbidden` is an error, not a silent escalate.
-fn escalate_for_paths(policy: Escalation, paths: &[&Path]) -> Result<bool> {
+fn escalate_for_paths(policy: Policy, paths: &[&Path]) -> Result<bool> {
     let mut escalate = false;
     for parent in paths.iter().filter_map(|p| p.parent()) {
         escalate |= policy.escalate_for(parent)?;
@@ -215,9 +263,15 @@ fn escalate_for_paths(policy: Escalation, paths: &[&Path]) -> Result<bool> {
     Ok(escalate)
 }
 
-/// Run `program args...` by absolute path, prepending `/usr/bin/sudo` when
-/// `escalate` is true.
-fn run(escalate: bool, program: &str, args: &[&OsStr]) -> Result<()> {
+/// Run `program args...` by absolute path, prepending `/usr/bin/sudo`
+/// when escalation is decided. On an inherited terminal the child gets
+/// stdio and sudo may prompt. Under an owned screen every child —
+/// privileged or not — is captured, with its output folded into the
+/// error on failure: an unprivileged `mv` complaining directly onto a
+/// ratatui frame corrupts it exactly as thoroughly as sudo would, and
+/// sudo additionally runs `-n` so a wanted password is a diagnosis, not
+/// an invisible prompt.
+fn run(policy: Policy, escalate: bool, program: &str, args: &[&OsStr]) -> Result<()> {
     let spawned = if escalate {
         format!("{SUDO} {program}")
     } else {
@@ -225,12 +279,31 @@ fn run(escalate: bool, program: &str, args: &[&OsStr]) -> Result<()> {
     };
     let mut cmd = if escalate {
         let mut c = Command::new(SUDO);
+        if matches!(policy.screen, Screen::Owned) {
+            c.arg("-n");
+        }
         c.arg(program);
         c
     } else {
         Command::new(program)
     };
     cmd.args(args);
+    if matches!(policy.screen, Screen::Owned) {
+        let output = cmd
+            .output()
+            .with_context(|| format!("failed to spawn {spawned}"))?;
+        if !output.status.success() {
+            // The same rule as every external string headed for a Span:
+            // this text ends in a BuildReport.
+            let words = crate::text::sanitize(&String::from_utf8_lossy(&output.stderr));
+            let words = words.trim();
+            if words.is_empty() {
+                bail!("{spawned} exited with {}", output.status);
+            }
+            bail!("{spawned} exited with {}: {words}", output.status);
+        }
+        return Ok(());
+    }
     let status = cmd
         .status()
         .with_context(|| format!("failed to spawn {spawned}"))?;
@@ -371,13 +444,14 @@ impl SealedSource {
 /// Shared placement: hand privileged `install` a `/proc` fd path. One
 /// invocation per file: with a `/proc` fd path, `install -t` would name the
 /// destination after the fd number, so the destination is always explicit.
-fn install_from_proc(policy: Escalation, proc_path: &Path, dest: &Path, mode: &str) -> Result<()> {
+fn install_from_proc(policy: Policy, proc_path: &Path, dest: &Path, mode: &str) -> Result<()> {
     let parent = dest
         .parent()
         .context("destination has no parent directory")?;
     let escalate = policy.escalate_for(parent)?;
     let mode_flag = format!("-Dm{mode}");
     run(
+        policy,
         escalate,
         INSTALL,
         &[mode_flag.as_ref(), proc_path.as_os_str(), dest.as_os_str()],
@@ -392,7 +466,7 @@ fn install_from_proc(policy: Escalation, proc_path: &Path, dest: &Path, mode: &s
 /// one for which `policy` permits escalation), so the temp cannot be
 /// tampered with.
 pub fn install_verified(
-    policy: Escalation,
+    policy: Policy,
     src: &VerifiedSource,
     dest: &Path,
     mode: &str,
@@ -406,7 +480,7 @@ pub fn install_verified(
 /// `place_and_commit`'s rollback leans on this atomicity: a failed
 /// placement leaves the destination untouched, so the set of successfully
 /// placed new names equals the set of new names present on disk.
-fn install_atomic(policy: Escalation, proc_path: &Path, dest: &Path, mode: &str) -> Result<()> {
+fn install_atomic(policy: Policy, proc_path: &Path, dest: &Path, mode: &str) -> Result<()> {
     let parent = dest
         .parent()
         .context("destination has no parent directory")?;
@@ -418,6 +492,7 @@ fn install_atomic(policy: Escalation, proc_path: &Path, dest: &Path, mode: &str)
     install_from_proc(policy, proc_path, &tmp, mode)?;
     let escalate = policy.escalate_for(parent)?;
     let moved = run(
+        policy,
         escalate,
         MV,
         &[
@@ -429,6 +504,7 @@ fn install_atomic(policy: Escalation, proc_path: &Path, dest: &Path, mode: &str)
     );
     if moved.is_err() {
         let _ = run(
+            policy,
             escalate,
             RM,
             &["-f".as_ref(), "--".as_ref(), tmp.as_os_str()],
@@ -445,7 +521,7 @@ fn install_atomic(policy: Escalation, proc_path: &Path, dest: &Path, mode: &str)
 /// and `mv -fT`s it into place, a same-filesystem `rename(2)`: crash before
 /// the rename leaves the old manifest whole, crash after leaves the new one.
 pub fn install_sealed(
-    policy: Escalation,
+    policy: Policy,
     src: &SealedSource,
     dest: &Path,
     mode: &str,
@@ -454,14 +530,14 @@ pub fn install_sealed(
 }
 
 /// Remove files, escalated if any of their directories require it.
-pub fn remove_files(policy: Escalation, paths: &[&Path]) -> Result<()> {
+pub fn remove_files(policy: Policy, paths: &[&Path]) -> Result<()> {
     if paths.is_empty() {
         return Ok(());
     }
     let escalate = escalate_for_paths(policy, paths)?;
     let mut args: Vec<&OsStr> = vec!["-f".as_ref(), "--".as_ref()];
     args.extend(paths.iter().map(|p| p.as_os_str()));
-    run(escalate, RM, &args)
+    run(policy, escalate, RM, &args)
 }
 
 /// Create the state lock file, escalating if needed. Deliberately
@@ -470,24 +546,24 @@ pub fn remove_files(policy: Escalation, paths: &[&Path]) -> Result<()> {
 /// That matters — `install` unlinks and recreates, so a process holding a
 /// flock on the old inode and one locking the new file would both "hold
 /// the lock" while excluding nobody.
-pub fn ensure_lock_file(policy: Escalation, path: &Path) -> Result<()> {
+pub fn ensure_lock_file(policy: Policy, path: &Path) -> Result<()> {
     let parent = path.parent().context("lock path has no parent directory")?;
     let escalate = policy.escalate_for(parent)?;
-    run(escalate, MKDIR, &["-p".as_ref(), parent.as_os_str()])?;
-    run(escalate, TOUCH, &[path.as_os_str()])?;
+    run(policy, escalate, MKDIR, &["-p".as_ref(), parent.as_os_str()])?;
+    run(policy, escalate, TOUCH, &[path.as_os_str()])?;
     // Explicit modes: mkdir/touch inherit the caller's umask, and a user
     // with umask 077 would otherwise mint a 0700 state dir and 0600 lock
     // that every other user's `cargo-lbin list` cannot even open. chmod on an
     // existing file preserves the inode, so flock correctness is intact.
-    run(escalate, CHMOD, &["0755".as_ref(), parent.as_os_str()])?;
-    run(escalate, CHMOD, &["0644".as_ref(), path.as_os_str()])?;
+    run(policy, escalate, CHMOD, &["0755".as_ref(), parent.as_os_str()])?;
+    run(policy, escalate, CHMOD, &["0644".as_ref(), path.as_os_str()])?;
     Ok(())
 }
 
 /// Best-effort `SELinux` relabel (matters on Fedora, absent and harmless on
 /// Arch). Failures are deliberately ignored: on most systems restorecon
 /// either does not exist or is a no-op for `bin_t`.
-pub fn restorecon(policy: Escalation, paths: &[&Path]) {
+pub fn restorecon(policy: Policy, paths: &[&Path]) {
     let Some(program) = RESTORECON_CANDIDATES
         .iter()
         .find(|c| Path::new(c).is_file())
@@ -504,7 +580,7 @@ pub fn restorecon(policy: Escalation, paths: &[&Path]) {
     };
     let mut args: Vec<&OsStr> = Vec::with_capacity(paths.len());
     args.extend(paths.iter().map(|p| p.as_os_str()));
-    let _ = run(escalate, program, &args);
+    let _ = run(policy, escalate, program, &args);
 }
 
 #[cfg(test)]
@@ -575,14 +651,14 @@ mod tests {
         let writable = std::env::temp_dir().join("cargo-lbin-test-esc-ok");
         let _ = fs::remove_dir_all(&writable);
         fs::create_dir_all(&writable).unwrap();
-        assert!(!Escalation::Forbidden.escalate_for(&writable).unwrap());
-        assert!(!Escalation::Allowed.escalate_for(&writable).unwrap());
+        assert!(!Policy { sudo: Sudo::Forbidden, screen: Screen::Inherited }.escalate_for(&writable).unwrap());
+        assert!(!Policy { sudo: Sudo::Allowed, screen: Screen::Inherited }.escalate_for(&writable).unwrap());
 
         // Non-writable dir: Allowed escalates, Forbidden errors.
         let hostile = Path::new("/proc/cargo-lbin-nonexistent-esc/dir");
         if needs_privilege(hostile) {
-            assert!(Escalation::Allowed.escalate_for(hostile).unwrap());
-            let err = Escalation::Forbidden
+            assert!(Policy { sudo: Sudo::Allowed, screen: Screen::Inherited }.escalate_for(hostile).unwrap());
+            let err = Policy { sudo: Sudo::Forbidden, screen: Screen::Inherited }
                 .escalate_for(hostile)
                 .unwrap_err()
                 .to_string();
@@ -591,12 +667,12 @@ mod tests {
 
         // Policy derivation.
         assert!(matches!(
-            Escalation::for_prefix(Path::new(CANONICAL_PREFIX)),
-            Escalation::Allowed
+            Policy::for_prefix(Path::new(CANONICAL_PREFIX)),
+            Policy { sudo: Sudo::Allowed, screen: Screen::Inherited }
         ));
         assert!(matches!(
-            Escalation::for_prefix(Path::new("/tmp/whatever")),
-            Escalation::Forbidden
+            Policy::for_prefix(Path::new("/tmp/whatever")),
+            Policy { sudo: Sudo::Forbidden, screen: Screen::Inherited }
         ));
         let _ = fs::remove_dir_all(&writable);
     }
@@ -608,7 +684,7 @@ mod tests {
         // error, before any sudo is spawned.
         let hostile = Path::new("/proc/cargo-lbin-nonexistent-lock/share/cargo-lbin/lock");
         if needs_privilege(hostile.parent().unwrap()) {
-            let err = ensure_lock_file(Escalation::Forbidden, hostile)
+            let err = ensure_lock_file(Policy { sudo: Sudo::Forbidden, screen: Screen::Inherited }, hostile)
                 .unwrap_err()
                 .to_string();
             assert!(err.contains("only /usr/local"), "{err}");
@@ -630,7 +706,7 @@ mod tests {
         fs::write(&lock, b"").unwrap();
         fs::set_permissions(&lock, fs::Permissions::from_mode(0o600)).unwrap();
 
-        ensure_lock_file(Escalation::Allowed, &lock).unwrap();
+        ensure_lock_file(Policy { sudo: Sudo::Allowed, screen: Screen::Inherited }, &lock).unwrap();
 
         let dir_mode = fs::metadata(&state).unwrap().permissions().mode() & 0o777;
         let lock_mode = fs::metadata(&lock).unwrap().permissions().mode() & 0o777;

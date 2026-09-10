@@ -90,6 +90,18 @@ impl Manifest {
     /// Placement is atomic (`install_atomic`): a crash mid-write leaves the
     /// old manifest whole, never half of the new one.
     pub fn store(&self, prefix: &Path) -> Result<()> {
+        // CLI form: the caller's own terminal, so re-deriving the policy
+        // here is harmless. A captured pipeline must not use this — see
+        // store_with_policy.
+        self.store_with_policy(prefix, privileged::Policy::for_prefix(prefix))
+    }
+
+    /// `store` with the caller's policy, threaded rather than re-derived:
+    /// the manifest commit is the pipeline's last privileged write, and a
+    /// store that quietly reset the Screen axis here would hand the very
+    /// end of a captured run back to interactive sudo and an inherited
+    /// stderr — the one side entrance left after all the others closed.
+    pub fn store_with_policy(&self, prefix: &Path, policy: privileged::Policy) -> Result<()> {
         // Symmetry with load(): cargo-lbin never knowingly writes state it would
         // later refuse to read back. Upstream checks should make this
         // unreachable; it exists as the last line of defense.
@@ -98,7 +110,6 @@ impl Manifest {
         let mut raw = serde_json::to_string_pretty(self)?;
         raw.push('\n');
         let sealed = privileged::SealedSource::from_bytes(raw.as_bytes())?;
-        let policy = privileged::Escalation::for_prefix(prefix);
         privileged::install_sealed(policy, &sealed, &Self::path(prefix), "644")?;
         Ok(())
     }
