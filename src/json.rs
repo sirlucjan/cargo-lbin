@@ -305,7 +305,12 @@ mod tests {
     /// field changes (see the module doc).
     #[test]
     fn list_output_golden() {
-        let out = ListOutput::build(PathBuf::from("/usr/local"), &manifest(), Some(&report()), &std::collections::BTreeMap::new());
+        let out = ListOutput::build(
+            PathBuf::from("/usr/local"),
+            &manifest(),
+            Some(&report()),
+            &std::collections::BTreeMap::new(),
+        );
         let json = serde_json::to_string_pretty(&out).unwrap();
         let expected = r#"{
   "schema": 1,
@@ -352,7 +357,12 @@ mod tests {
 
     #[test]
     fn list_output_without_report_is_all_unknown() {
-        let out = ListOutput::build(PathBuf::from("/p"), &manifest(), None, &std::collections::BTreeMap::new());
+        let out = ListOutput::build(
+            PathBuf::from("/p"),
+            &manifest(),
+            None,
+            &std::collections::BTreeMap::new(),
+        );
         let value = serde_json::to_value(&out).unwrap();
         assert_eq!(value["checked_at"], serde_json::Value::Null);
         for c in value["crates"].as_array().unwrap() {
@@ -360,7 +370,12 @@ mod tests {
             assert_eq!(c["latest"], serde_json::Value::Null);
         }
         // An empty prefix is still a complete document, not a message.
-        let out = ListOutput::build(PathBuf::from("/p"), &Manifest::default(), None, &std::collections::BTreeMap::new());
+        let out = ListOutput::build(
+            PathBuf::from("/p"),
+            &Manifest::default(),
+            None,
+            &std::collections::BTreeMap::new(),
+        );
         let value = serde_json::to_value(&out).unwrap();
         assert_eq!(value["crates"], serde_json::json!([]));
         assert_eq!(value["schema"], SCHEMA);
@@ -400,7 +415,12 @@ mod tests {
 
     #[test]
     fn pinned_output_golden() {
-        let out = PinnedOutput::build(PathBuf::from("/usr/local"), &manifest(), Some(&report()), &std::collections::BTreeMap::new());
+        let out = PinnedOutput::build(
+            PathBuf::from("/usr/local"),
+            &manifest(),
+            Some(&report()),
+            &std::collections::BTreeMap::new(),
+        );
         let json = serde_json::to_string_pretty(&out).unwrap();
         let expected = r#"{
   "schema": 1,
@@ -453,7 +473,12 @@ mod tests {
             .collect();
         assert_eq!(got, expected);
         // No pins is a complete document, not a message.
-        let none = PinnedOutput::build(PathBuf::from("/p"), &Manifest::default(), None, &std::collections::BTreeMap::new());
+        let none = PinnedOutput::build(
+            PathBuf::from("/p"),
+            &Manifest::default(),
+            None,
+            &std::collections::BTreeMap::new(),
+        );
         let value = serde_json::to_value(&none).unwrap();
         assert_eq!(value["crates"], serde_json::json!([]));
         assert_eq!(value["checked_at"], serde_json::Value::Null);
@@ -483,7 +508,10 @@ mod tests {
             &std::collections::BTreeMap::new(),
         );
         let text = serde_json::to_string(&empty).unwrap();
-        assert!(!text.contains("also_in"), "absent, not an empty array: {text}");
+        assert!(
+            !text.contains("also_in"),
+            "absent, not an empty array: {text}"
+        );
 
         let mut also = std::collections::BTreeMap::new();
         also.insert(

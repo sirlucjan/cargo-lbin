@@ -1120,12 +1120,8 @@ fn cmd_list(prefix: &Path, json: bool) -> Result<()> {
     if json {
         // A document either way: an empty prefix is `"crates": []`, not a
         // sentence a script would have to recognize.
-        let output = json::ListOutput::build(
-            report::identity(prefix)?,
-            &manifest,
-            report.as_ref(),
-            &also,
-        );
+        let output =
+            json::ListOutput::build(report::identity(prefix)?, &manifest, report.as_ref(), &also);
         return json::print(&output);
     }
     if manifest.crates.is_empty() {

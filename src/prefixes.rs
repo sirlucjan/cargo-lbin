@@ -126,7 +126,10 @@ mod tests {
         // function.
         let map = also_installed_from([there.clone()]);
         assert!(map.contains_key("elsewhere"));
-        assert!(!map.contains_key("local-only"), "the current prefix is not 'also'");
+        assert!(
+            !map.contains_key("local-only"),
+            "the current prefix is not 'also'"
+        );
         let s = describe_for(&map, "elsewhere");
         assert!(s.contains("[also in") && s.contains("@2.3.4"), "{s}");
         assert_eq!(describe_for(&map, "local-only"), "");
