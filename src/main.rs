@@ -401,7 +401,13 @@ fn install_and_commit(
     // UX-only early form of the policy check: fail before a multi-minute
     // build, not after. Enforcement proper lives at every privileged call
     // site via `Escalation`; this merely surfaces the same refusal sooner.
-    let _ = policy.probe_destination(&prefix.join("bin"))?;
+    // The same reasoning moves the password prompt here: when placement
+    // will need sudo, validate credentials now, so the initial prompt
+    // comes before the build instead of ambushing an unattended terminal
+    // after it (sudo may still re-prompt if its timestamp expires).
+    let bin_dir = prefix.join("bin");
+    let escalate = policy.probe_destination(&bin_dir)?;
+    privileged::preauthorize(&bin_dir, escalate)?;
     // Per-PID stage: the state lock serializes instances per *prefix*, so
     // two cargo-lbin runs against different prefixes may legitimately build the
     // same crate at the same time — and one wiping the other's stage

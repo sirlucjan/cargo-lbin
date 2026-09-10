@@ -33,7 +33,7 @@ use std::fs::{self, File, OpenOptions};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 const SUDO: &str = "/usr/bin/sudo";
 const INSTALL: &str = "/usr/bin/install";
@@ -150,6 +150,58 @@ fn dir_writable(dir: &Path) -> bool {
 /// Does writing into `dir` require sudo?
 pub fn needs_privilege(dir: &Path) -> bool {
     !dir_writable(dir)
+}
+
+/// Validate sudo credentials *before* a long operation, so the initial
+/// password prompt lands at a predictable moment — not somewhere after a
+/// multi-minute build, when the user has long looked away. sudo may still
+/// ask again later if its credential timestamp expires in the meantime
+/// (a long build, `timestamp_timeout=0`, per-TTY policy); that is sudo's
+/// call to make, and deliberately not worked around here.
+///
+/// `escalate` is the probe result for the destination: when placement will
+/// not use sudo, nothing here runs at all. Otherwise `sudo -n -v` asks
+/// noninteractively whether the credential timestamp is still fresh —
+/// `-v` because the question is the timestamp itself, not authorization
+/// for any particular command; if it is fresh, there is nothing to say
+/// and no prompt to show. Only when sudo would prompt is the reason
+/// announced, and `sudo -v` then owns the prompt on the inherited
+/// terminal — echo, retries, PAM and the timestamp are sudo's business.
+/// cargo-lbin never reads, buffers or forwards the password; that is a
+/// design rule, not an implementation detail.
+///
+/// Preauthorization is a UX convenience, not proof of authorization: a
+/// command-specific sudoers policy can still treat the later privileged
+/// calls differently than `-v`. Those calls authorize on their own
+/// terms either way; this merely times the common case's prompt well.
+pub fn preauthorize(dir: &Path, escalate: bool) -> Result<()> {
+    if !escalate {
+        return Ok(());
+    }
+    let fresh = Command::new(SUDO)
+        .arg("-n")
+        .arg("-v")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .with_context(|| format!("failed to spawn {SUDO}"))?
+        .success();
+    if fresh {
+        return Ok(());
+    }
+    eprintln!(
+        "administrative privileges are required to install into {}",
+        dir.display()
+    );
+    let status = Command::new(SUDO)
+        .arg("-v")
+        .status()
+        .with_context(|| format!("failed to spawn {SUDO}"))?;
+    if !status.success() {
+        bail!("sudo authentication failed");
+    }
+    Ok(())
 }
 
 /// Escalation decision for a set of existing paths under a policy: sudo if
