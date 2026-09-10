@@ -87,39 +87,46 @@ impl ListOutput {
         let crates = manifest
             .crates
             .iter()
-            .map(|(name, entry)| {
-                // `latest` is what the check found, taken from the record
-                // itself — not `current` echoed back for an up-to-date
-                // crate, which would be wrong whenever the installed
-                // version has been yanked since and the newest live one
-                // is older.
-                let (status, latest) = Version::parse(&entry.version)
-                    .ok()
-                    .and_then(|current| report?.checked_for(name, &current))
-                    .map_or((ListStatus::Unknown, None), |c| {
-                        let status = if c.is_outdated() {
-                            ListStatus::Outdated
-                        } else {
-                            ListStatus::UpToDate
-                        };
-                        (status, Some(c.latest.clone()))
-                    });
-                ListCrate {
-                    name: name.clone(),
-                    version: entry.version.clone(),
-                    bins: entry.bins.clone(),
-                    locked: entry.locked,
-                    pinned: entry.pinned,
-                    status,
-                    latest,
-                }
-            })
+            .map(|(name, entry)| ListCrate::annotated(name, entry, report))
             .collect();
         Self {
             schema: SCHEMA,
             prefix,
             checked_at: report.map(|r| r.checked_at),
             crates,
+        }
+    }
+}
+
+impl ListCrate {
+    /// One manifest entry annotated from a report — the single mapping
+    /// shared by JSON views of manifest state, so no two views can
+    /// drift in how they read the same record.
+    fn annotated(name: &str, entry: &crate::manifest::Entry, report: Option<&Report>) -> Self {
+        // `latest` is what the check found, taken from the record
+        // itself — not `current` echoed back for an up-to-date
+        // crate, which would be wrong whenever the installed
+        // version has been yanked since and the newest live one
+        // is older.
+        let (status, latest) = Version::parse(&entry.version)
+            .ok()
+            .and_then(|current| report?.checked_for(name, &current))
+            .map_or((ListStatus::Unknown, None), |c| {
+                let status = if c.is_outdated() {
+                    ListStatus::Outdated
+                } else {
+                    ListStatus::UpToDate
+                };
+                (status, Some(c.latest.clone()))
+            });
+        Self {
+            name: name.to_owned(),
+            version: entry.version.clone(),
+            bins: entry.bins.clone(),
+            locked: entry.locked,
+            pinned: entry.pinned,
+            status,
+            latest,
         }
     }
 }
