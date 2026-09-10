@@ -209,7 +209,10 @@ mod tests {
         let held = StateLock::acquire_with(
             &prefix,
             &Mode::Exclusive,
-            privileged::Policy { sudo: privileged::Sudo::Forbidden, screen: privileged::Screen::Inherited },
+            privileged::Policy {
+                sudo: privileged::Sudo::Forbidden,
+                screen: privileged::Screen::Inherited,
+            },
             &mut { quiet },
         )
         .unwrap();
@@ -218,7 +221,10 @@ mod tests {
         let advisory = StateLock::try_acquire_with(
             &prefix,
             &Mode::Shared,
-            privileged::Policy { sudo: privileged::Sudo::Forbidden, screen: privileged::Screen::Inherited },
+            privileged::Policy {
+                sudo: privileged::Sudo::Forbidden,
+                screen: privileged::Screen::Inherited,
+            },
             &mut { quiet },
         )
         .unwrap();
@@ -227,7 +233,10 @@ mod tests {
         let advisory = StateLock::try_acquire_with(
             &prefix,
             &Mode::Shared,
-            privileged::Policy { sudo: privileged::Sudo::Forbidden, screen: privileged::Screen::Inherited },
+            privileged::Policy {
+                sudo: privileged::Sudo::Forbidden,
+                screen: privileged::Screen::Inherited,
+            },
             &mut { quiet },
         )
         .unwrap();

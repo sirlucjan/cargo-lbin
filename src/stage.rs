@@ -42,8 +42,7 @@ struct InstallInfo {
 /// test threads read it concurrently, which is exactly the unsafety
 /// `std::env::set_var` was made unsafe to spotlight.
 #[cfg(all(test, feature = "tui"))]
-static CARGO_PROGRAM: std::sync::RwLock<Option<PathBuf>> =
-    std::sync::RwLock::new(None);
+static CARGO_PROGRAM: std::sync::RwLock<Option<PathBuf>> = std::sync::RwLock::new(None);
 
 /// Serializes tests that install a fake cargo, so one test's fake never
 /// answers another test's spawn.
@@ -150,7 +149,6 @@ pub fn build_captured(
     log_dir: &Path,
     on_line: &mut dyn FnMut(&str),
 ) -> Result<Built> {
-
     fs::create_dir_all(stage).with_context(|| format!("creating {}", stage.display()))?;
     let mut cmd = command(name, version, locked, stage);
     // A pipe usually makes cargo drop colors on its own, but `term.color
@@ -391,7 +389,6 @@ fn staged_info(name: &str, stage: &Path) -> Result<Built> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
 
     #[test]
     fn staged_info_parses_crates2() {

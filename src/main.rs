@@ -530,9 +530,7 @@ fn install_and_commit(
     let policy = match frontend {
         Frontend::Terminal => privileged::Policy::for_prefix(prefix),
         #[cfg(feature = "tui")]
-        Frontend::Captured { .. } => {
-            privileged::Policy::for_prefix(prefix).screen_owned()
-        }
+        Frontend::Captured { .. } => privileged::Policy::for_prefix(prefix).screen_owned(),
         #[cfg(not(feature = "tui"))]
         Frontend::Never(_) => unreachable!(),
     };
@@ -747,7 +745,10 @@ fn shadow_warnings(prefix: &Path, bins: &[String]) -> Vec<String> {
         .iter()
         .map(|s| {
             let owner = shadow::owner_of(&s.existing);
-            format!("warning: {}", shadow::describe(s, &prefix_bin, owner.as_deref()))
+            format!(
+                "warning: {}",
+                shadow::describe(s, &prefix_bin, owner.as_deref())
+            )
         })
         .collect()
 }
@@ -1909,23 +1910,29 @@ mod tests {
         };
         // Update of an existing crate: the old entry must come back.
         let mut m = manifest_with(&["foo"]);
-        assert!(commit_entry(
-            &mut m,
-            &prefix,
-            privileged::Policy::for_prefix(&prefix),
-            "foo",
-            entry("2.0.0"),
-        ).is_err());
+        assert!(
+            commit_entry(
+                &mut m,
+                &prefix,
+                privileged::Policy::for_prefix(&prefix),
+                "foo",
+                entry("2.0.0"),
+            )
+            .is_err()
+        );
         assert_eq!(m.crates["foo"].version, "1.0.0");
         // Fresh install: the name must disappear again.
         let mut m = Manifest::default();
-        assert!(commit_entry(
-            &mut m,
-            &prefix,
-            privileged::Policy::for_prefix(&prefix),
-            "foo",
-            entry("2.0.0"),
-        ).is_err());
+        assert!(
+            commit_entry(
+                &mut m,
+                &prefix,
+                privileged::Policy::for_prefix(&prefix),
+                "foo",
+                entry("2.0.0"),
+            )
+            .is_err()
+        );
         assert_eq!(m.crates.keys().collect::<Vec<_>>(), Vec::<&String>::new());
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -2024,7 +2031,6 @@ mod tests {
     fn captured_frontend_runs_the_whole_pipeline() {
         use std::os::unix::fs::PermissionsExt;
 
-
         let root = std::env::temp_dir().join("cargo-lbin-test-captured-pipeline");
         let _ = fs::remove_dir_all(&root);
         let fake_bin = root.join("fakebin");
@@ -2089,8 +2095,7 @@ mod tests {
         assert!(
             lines
                 .iter()
-                .any(|(k, l)| *k == LineKind::Notice
-                    && l.starts_with("installed okcrate 0.1.0")),
+                .any(|(k, l)| *k == LineKind::Notice && l.starts_with("installed okcrate 0.1.0")),
             "the pipeline note arrives classified, not as anonymous text: {lines:?}"
         );
         assert!(prefix.join("bin/okcrate").is_file(), "binary placed");

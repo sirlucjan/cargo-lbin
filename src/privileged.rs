@@ -528,12 +528,7 @@ fn install_atomic(policy: Policy, proc_path: &Path, dest: &Path, mode: &str) -> 
 /// manifest. `install_atomic` installs into a temp in the same directory
 /// and `mv -fT`s it into place, a same-filesystem `rename(2)`: crash before
 /// the rename leaves the old manifest whole, crash after leaves the new one.
-pub fn install_sealed(
-    policy: Policy,
-    src: &SealedSource,
-    dest: &Path,
-    mode: &str,
-) -> Result<()> {
+pub fn install_sealed(policy: Policy, src: &SealedSource, dest: &Path, mode: &str) -> Result<()> {
     install_atomic(policy, &src.proc_path(), dest, mode)
 }
 
@@ -557,14 +552,29 @@ pub fn remove_files(policy: Policy, paths: &[&Path]) -> Result<()> {
 pub fn ensure_lock_file(policy: Policy, path: &Path) -> Result<()> {
     let parent = path.parent().context("lock path has no parent directory")?;
     let escalate = policy.escalate_for(parent)?;
-    run(policy, escalate, MKDIR, &["-p".as_ref(), parent.as_os_str()])?;
+    run(
+        policy,
+        escalate,
+        MKDIR,
+        &["-p".as_ref(), parent.as_os_str()],
+    )?;
     run(policy, escalate, TOUCH, &[path.as_os_str()])?;
     // Explicit modes: mkdir/touch inherit the caller's umask, and a user
     // with umask 077 would otherwise mint a 0700 state dir and 0600 lock
     // that every other user's `cargo-lbin list` cannot even open. chmod on an
     // existing file preserves the inode, so flock correctness is intact.
-    run(policy, escalate, CHMOD, &["0755".as_ref(), parent.as_os_str()])?;
-    run(policy, escalate, CHMOD, &["0644".as_ref(), path.as_os_str()])?;
+    run(
+        policy,
+        escalate,
+        CHMOD,
+        &["0755".as_ref(), parent.as_os_str()],
+    )?;
+    run(
+        policy,
+        escalate,
+        CHMOD,
+        &["0644".as_ref(), path.as_os_str()],
+    )?;
     Ok(())
 }
 
@@ -659,28 +669,58 @@ mod tests {
         let writable = std::env::temp_dir().join("cargo-lbin-test-esc-ok");
         let _ = fs::remove_dir_all(&writable);
         fs::create_dir_all(&writable).unwrap();
-        assert!(!Policy { sudo: Sudo::Forbidden, screen: Screen::Inherited }.escalate_for(&writable).unwrap());
-        assert!(!Policy { sudo: Sudo::Allowed, screen: Screen::Inherited }.escalate_for(&writable).unwrap());
+        assert!(
+            !Policy {
+                sudo: Sudo::Forbidden,
+                screen: Screen::Inherited
+            }
+            .escalate_for(&writable)
+            .unwrap()
+        );
+        assert!(
+            !Policy {
+                sudo: Sudo::Allowed,
+                screen: Screen::Inherited
+            }
+            .escalate_for(&writable)
+            .unwrap()
+        );
 
         // Non-writable dir: Allowed escalates, Forbidden errors.
         let hostile = Path::new("/proc/cargo-lbin-nonexistent-esc/dir");
         if needs_privilege(hostile) {
-            assert!(Policy { sudo: Sudo::Allowed, screen: Screen::Inherited }.escalate_for(hostile).unwrap());
-            let err = Policy { sudo: Sudo::Forbidden, screen: Screen::Inherited }
+            assert!(
+                Policy {
+                    sudo: Sudo::Allowed,
+                    screen: Screen::Inherited
+                }
                 .escalate_for(hostile)
-                .unwrap_err()
-                .to_string();
+                .unwrap()
+            );
+            let err = Policy {
+                sudo: Sudo::Forbidden,
+                screen: Screen::Inherited,
+            }
+            .escalate_for(hostile)
+            .unwrap_err()
+            .to_string();
             assert!(err.contains("only /usr/local"), "{err}");
         }
 
         // Policy derivation.
         assert!(matches!(
             Policy::for_prefix(Path::new(CANONICAL_PREFIX)),
-            Policy { sudo: Sudo::Allowed, screen: Screen::Inherited }
+            Policy {
+                sudo: Sudo::Allowed,
+                screen: Screen::Inherited
+            }
         ));
         assert!(matches!(
             Policy::for_prefix(Path::new("/tmp/whatever")),
-            Policy { sudo: Sudo::Forbidden, screen: Screen::Inherited }
+            Policy {
+                sudo: Sudo::Forbidden,
+                screen: Screen::Inherited
+            }
         ));
         let _ = fs::remove_dir_all(&writable);
     }
@@ -692,9 +732,15 @@ mod tests {
         // error, before any sudo is spawned.
         let hostile = Path::new("/proc/cargo-lbin-nonexistent-lock/share/cargo-lbin/lock");
         if needs_privilege(hostile.parent().unwrap()) {
-            let err = ensure_lock_file(Policy { sudo: Sudo::Forbidden, screen: Screen::Inherited }, hostile)
-                .unwrap_err()
-                .to_string();
+            let err = ensure_lock_file(
+                Policy {
+                    sudo: Sudo::Forbidden,
+                    screen: Screen::Inherited,
+                },
+                hostile,
+            )
+            .unwrap_err()
+            .to_string();
             assert!(err.contains("only /usr/local"), "{err}");
         }
     }
@@ -714,7 +760,14 @@ mod tests {
         fs::write(&lock, b"").unwrap();
         fs::set_permissions(&lock, fs::Permissions::from_mode(0o600)).unwrap();
 
-        ensure_lock_file(Policy { sudo: Sudo::Allowed, screen: Screen::Inherited }, &lock).unwrap();
+        ensure_lock_file(
+            Policy {
+                sudo: Sudo::Allowed,
+                screen: Screen::Inherited,
+            },
+            &lock,
+        )
+        .unwrap();
 
         let dir_mode = fs::metadata(&state).unwrap().permissions().mode() & 0o777;
         let lock_mode = fs::metadata(&lock).unwrap().permissions().mode() & 0o777;

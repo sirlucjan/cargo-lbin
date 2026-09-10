@@ -130,7 +130,6 @@ fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_stateful_widget(table, area, &mut state);
 }
 
-
 /// The sticky report panel: a failure's tail and log path, or a
 /// success's warnings. Split from `draw_details` for exactly the reason
 /// clippy suggests — it is its own panel with its own rules.
@@ -160,7 +159,8 @@ fn draw_report(frame: &mut Frame, report: &crate::tui::BuildReport, area: Rect) 
             .block(block)
             .wrap(Wrap { trim: false }),
         area,
-    );}
+    );
+}
 
 fn draw_details(frame: &mut Frame, app: &App, area: Rect) {
     // A build's report owns the panel until dismissed: a failure's tail

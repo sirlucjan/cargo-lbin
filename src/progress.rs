@@ -86,7 +86,10 @@ mod tests {
 
     #[test]
     fn phases_and_errors_classify() {
-        assert_eq!(parse_line("  Downloading crates ..."), BuildEvent::Downloading);
+        assert_eq!(
+            parse_line("  Downloading crates ..."),
+            BuildEvent::Downloading
+        );
         assert_eq!(
             parse_line("   Downloaded serde v1.0.219"),
             BuildEvent::Downloading
@@ -99,7 +102,10 @@ mod tests {
             parse_line("error[E0308]: mismatched types"),
             BuildEvent::Error
         );
-        assert_eq!(parse_line("error: could not compile `foo`"), BuildEvent::Error);
+        assert_eq!(
+            parse_line("error: could not compile `foo`"),
+            BuildEvent::Error
+        );
     }
 
     #[test]

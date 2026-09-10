@@ -39,8 +39,8 @@ use semver::Version;
 use crate::api;
 use crate::lock::{Mode, StateLock};
 use crate::manifest::{Entry, Manifest};
-use crate::report::{Checked, Report, Status};
 use crate::progress;
+use crate::report::{Checked, Report, Status};
 use crate::validate::InstallSpec;
 
 /// How often the input poll wakes up to look for finished background work.
@@ -639,9 +639,8 @@ impl App {
             };
             let prefix = self.prefix.clone();
             if !fresh
-                && let Err(e) = Self::suspended(terminal, || {
-                    crate::privileged::preauthorize(&prefix, true)
-                })?
+                && let Err(e) =
+                    Self::suspended(terminal, || crate::privileged::preauthorize(&prefix, true))?
             {
                 self.error(&format!("{e:#}"));
                 return Ok(());
@@ -718,9 +717,7 @@ impl App {
     /// terminal and let the worker proceed (or fail, and say so).
     fn answer_auth(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
         let prefix = self.prefix.clone();
-        let outcome = Self::suspended(terminal, || {
-            crate::privileged::preauthorize(&prefix, true)
-        })?;
+        let outcome = Self::suspended(terminal, || crate::privileged::preauthorize(&prefix, true))?;
         let ok = match outcome {
             Ok(()) => match crate::privileged::credentials_fresh() {
                 Ok(true) => true,
@@ -865,8 +862,7 @@ impl App {
             Err(e) => {
                 // An anyhow chain carries paths too; same boundary rule.
                 let text = format!("{e:#}");
-                let mut lines: Vec<String> =
-                    text.lines().map(crate::text::sanitize).collect();
+                let mut lines: Vec<String> = text.lines().map(crate::text::sanitize).collect();
                 if lines.len() <= 1 {
                     // A placement or commit error carries no tail of its
                     // own; give the panel the build's last lines instead.
@@ -1646,8 +1642,10 @@ mod tests {
         // A warning survives a successful finish, pinned to the report.
         // (Raw here: this test injects past the worker's sanitizing
         // boundary on purpose — the boundary itself is exercised below.)
-        tx.send(BuildMsg::Warning("`foo` is shadowed by /usr/bin/foo".into()))
-            .unwrap();
+        tx.send(BuildMsg::Warning(
+            "`foo` is shadowed by /usr/bin/foo".into(),
+        ))
+        .unwrap();
         tx.send(BuildMsg::Done(Ok(()))).unwrap();
         app.poll_job().unwrap();
         assert!(app.job.is_none(), "the job is finished");
