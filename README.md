@@ -394,14 +394,21 @@ always explicit via `--to`. In the TUI, `m` on the selected crate runs
 the same operation toward the other prefix of the known pair. The plan is printed and confirmed before
 anything is built; `--yes` skips the prompt.
 
-The crate is **rebuilt** at the destination — at exactly the installed
-version, with `--locked` and the pin carried over — never copied.
+The crate is **rebuilt** at the destination — never copied. The version
+follows the pin: a pinned crate is rebuilt at exactly its pinned
+version, an unpinned one gets the latest available, because without a
+pin the version was never part of the intent — migration preserves
+policy, not necessarily version, and a fresh `install` at the
+destination would not have resurrected the source's accidental version
+either. `--locked` and the pin itself are carried over in both cases.
 Copying would be the wrong guarantee: a faithful copy faithfully
 promotes whatever the binary has become since it was installed, and
 promoting `~/.local` to `/usr/local` is exactly where that matters.
 Rebuilding re-establishes provenance through the same pipeline as
 `install`. It costs a compilation; that is the price of knowing what
-was placed.
+was placed. The printed plan says per crate which contract applies, and
+the success line reports the version the destination actually
+committed.
 
 The source entry is retired only after the destination has fully
 committed. `migrate` never waits on one prefix while holding a lock on
@@ -426,8 +433,8 @@ binaries already gone — and a plain `remove` on the source cleans up
 such a remainder.
 
 A crate already installed at the destination is refused; there is no
-`--force`. `migrate` will not choose between two versions of the same
-crate — remove the wrong side first, then migrate.
+`--force`. `migrate` will not overwrite an existing installation with
+the migrating one — remove the wrong side first, then migrate.
 
 Like `update`, a batch reports each failure and moves on, and the
 command exits non-zero whenever fewer migrations completed than were
@@ -544,18 +551,23 @@ not depend on the worker to finish the job.
 
 `m` migrates the selected crate to the other prefix of the known pair —
 `/usr/local` from `~/.local` or the reverse — after a confirmation that
-names the crate, the version and both prefixes. It is a frontend to
-[`migrate`](#migrate), not a second implementation: the exact version is
-rebuilt at the destination inside the same Build panel, `c` cancels it
+names the crate, the version, both prefixes and which contract applies:
+a pinned crate is rebuilt at exactly its pinned version, an unpinned one
+gets the latest, as [`migrate`](#migrate) defines. It is a frontend to
+`migrate`, not a second implementation: the rebuild runs at the
+destination inside the same Build panel, `c` cancels it
 through the same door (a cancel before placement is a complete no-op —
 neither prefix is touched), and once placement begins cancellation no
 longer interrupts it: the migration proceeds through the retirement
 attempt, and anything that fails past that point is reported as an
 incomplete migration, never silently. The plan is frozen when you press
-`m`: what the confirmation shows — name, version, both prefixes — is
-exactly what is revalidated and migrated, and a crate that changed in
-the meantime is refused rather than migrated at a version you never
-confirmed. An incomplete migration — the
+`m`: what the confirmation shows — name, version, pin, both prefixes —
+is exactly what is revalidated before anything is retired, and a crate
+that changed in the meantime is refused rather than migrated under a
+plan you never confirmed. The shown version is the source state that
+guard holds the migration to; what the destination receives follows the
+pin, and the success note reports the version it actually committed. An
+incomplete migration — the
 destination committed, the source not retired — is shown in a wrapping
 panel with the full explanation, because that message is the durable
 record. With a custom `--prefix` the "other side" stops being a
