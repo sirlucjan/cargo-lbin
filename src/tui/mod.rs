@@ -411,7 +411,7 @@ enum Job {
         /// by the first Accepted, one-shot. The run loop escalates to
         /// SIGKILL when it passes, because the worker cannot be trusted
         /// to reach its own sweep — a group member holding the inherited
-        /// stderr can wedge it *inside* read_until, past the poll: a
+        /// stderr can wedge it *inside* `read_until`, past the poll: a
         /// partial line with no terminating newline is enough to turn
         /// "readable" into a blocking read on a pipe nobody will close.
         cancel_deadline: Option<std::time::Instant>,
@@ -798,11 +798,7 @@ impl App {
     /// What the escalation preflight found for one prefix; both captured
     /// workflows (install, migrate) run it before spawning a worker, and
     /// each maps the outcomes to what it can offer.
-    fn preflight_escalation(
-        &mut self,
-        terminal: &mut DefaultTerminal,
-        prefix: &Path,
-    ) -> Result<Preflight> {
+    fn preflight_escalation(terminal: &mut DefaultTerminal, prefix: &Path) -> Result<Preflight> {
         let policy = crate::privileged::Policy::for_prefix(prefix);
         // The pipeline's own union (bin + state) plus the lock file —
         // the worker's first privileged touch. Mixed ownership needs the
@@ -870,7 +866,7 @@ impl App {
         // the wrong world. Cleared here, once the attempt is definitely
         // starting, so the terminal-fallback path supersedes it too.
         self.build_report = None;
-        match self.preflight_escalation(terminal, &self.prefix.clone())? {
+        match Self::preflight_escalation(terminal, &self.prefix.clone())? {
             Preflight::Ready => {}
             // Captured placement runs `sudo -n`, so a sudo that does not
             // cache credentials (timestamp_timeout=0, per-TTY quirks)
@@ -969,7 +965,7 @@ impl App {
     }
 
     /// Start an in-place migration of `name` to `dest`: the same
-    /// Job::Build, gauge, cancel door, dead-man switch and sudo
+    /// `Job::Build`, gauge, cancel door, dead-man switch and sudo
     /// roundtrip as an install — the TUI is a frontend to `migrate`,
     /// not a second migrate. The worker reports an outcome; the words
     /// are composed in `finish_build` from the job's own data.
@@ -1007,7 +1003,7 @@ impl App {
         // revalidation instead: the prompt-at-the-end timing is
         // documented, and warming its timestamp before a long build
         // would buy nothing.
-        match self.preflight_escalation(terminal, &dest)? {
+        match Self::preflight_escalation(terminal, &dest)? {
             Preflight::Ready => {}
             // No terminal handoff exists for migrate, on purpose; the
             // CLI is the interactive shape.
@@ -1402,7 +1398,12 @@ impl App {
         let mut summary = format!("migrated {moved} of {total} to {}", dest.display());
         if let Some(how) = ended_early {
             let unprocessed = queue.len();
-            summary.push_str(&format!(" ({how}; {unprocessed} not attempted)"));
+            // write!, not push_str(&format!(..)): no second allocation,
+            // and the sink is infallible.
+            let _ = std::fmt::Write::write_fmt(
+                &mut summary,
+                format_args!(" ({how}; {unprocessed} not attempted)"),
+            );
         }
         if warned.is_empty() && failed.is_empty() && noticed.is_empty() && reload_error.is_none() {
             if ended_early.is_some() {
@@ -1804,133 +1805,141 @@ impl App {
             // that candidate's own view must name us back — a custom
             // prefix with HOME unset would otherwise pass the first
             // half.
-            KeyCode::Char('m') => {
-                // Cloned out of the borrow: the fresh advisory precheck
-                // below needs `&mut self` (it reports through the
-                // footer), and the row is a reference into `self`.
-                if let Some(row) = self.selected_row().cloned() {
-                    match self.known_pair_dest() {
-                        Some(dest) => {
-                            // The agreed UX for "already on the other
-                            // side" is a plain error line, not a sticky
-                            // failure panel — decided on a *fresh*
-                            // advisory read of the destination, never on
-                            // the row's cached `[also in …]`: that
-                            // annotation is a lockless snapshot of the
-                            // last reload, so it can refuse a migration
-                            // whose destination was emptied minutes ago
-                            // (and stay wrong until the next reload).
-                            // Advisory in the other direction too: a busy
-                            // lock or a fresh install racing this read
-                            // falls through to migrate_one's
-                            // authoritative refusal, which then surfaces
-                            // as Failed — the race window, accepted for
-                            // now over a typed refusal variant.
-                            if self.destination_occupied(&dest, &row.name) {
-                                return;
-                            }
-                            // Frozen here, from the row on screen: the
-                            // plan the person confirms is byte for byte
-                            // the plan the worker revalidates.
-                            let snap = match crate::MigrationSnapshot::from_parts(
-                                &row.name,
-                                &row.version,
-                                row.bins.clone(),
-                                row.locked,
-                                row.pinned,
-                            ) {
-                                Ok(snap) => snap,
-                                Err(e) => {
-                                    self.error(&format!("{e:#}"));
-                                    return;
-                                }
-                            };
-                            let prompt = format!(
-                                "migrate {} {}: {} -> {}? the exact version is rebuilt \
-                                 there, then retired here [y/N]",
-                                row.name,
-                                row.version,
-                                self.prefix.display(),
-                                dest.display()
-                            );
-                            self.confirm = Some(Confirm::new(
-                                &prompt,
-                                OnConfirm::Migrate {
-                                    name: row.name.clone(),
-                                    version: row.version.clone(),
-                                    dest,
-                                    snap,
-                                },
-                            ));
-                        }
-                        None => self.info(
-                            "TUI migrate covers the /usr/local <-> ~/.local pair; \
-                             migrate elsewhere via the CLI: cargo lbin migrate NAME --to PREFIX",
-                        ),
+            // Both migrate keys live in their own methods: the dispatch
+            // table stays a table.
+            KeyCode::Char('m') => self.migrate_selected(),
+            KeyCode::Char('M') => self.migrate_everything(),
+            _ => {}
+        }
+    }
+
+    /// `m`: migrate the selected crate to the other prefix of the known
+    /// pair; the plan is frozen from the row on screen.
+    fn migrate_selected(&mut self) {
+        // Cloned out of the borrow: the fresh advisory precheck
+        // below needs `&mut self` (it reports through the
+        // footer), and the row is a reference into `self`.
+        if let Some(row) = self.selected_row().cloned() {
+            match self.known_pair_dest() {
+                Some(dest) => {
+                    // The agreed UX for "already on the other
+                    // side" is a plain error line, not a sticky
+                    // failure panel — decided on a *fresh*
+                    // advisory read of the destination, never on
+                    // the row's cached `[also in …]`: that
+                    // annotation is a lockless snapshot of the
+                    // last reload, so it can refuse a migration
+                    // whose destination was emptied minutes ago
+                    // (and stay wrong until the next reload).
+                    // Advisory in the other direction too: a busy
+                    // lock or a fresh install racing this read
+                    // falls through to migrate_one's
+                    // authoritative refusal, which then surfaces
+                    // as Failed — the race window, accepted for
+                    // now over a typed refusal variant.
+                    if self.destination_occupied(&dest, &row.name) {
+                        return;
                     }
-                }
-            }
-            // The whole prefix to the other side: `migrate --all` as a
-            // queue of the exact single migrations `m` runs. The plan is
-            // frozen here, one snapshot per row, complete or not at all
-            // — a plan that silently dropped an unparseable row would
-            // migrate a different set than the person confirmed.
-            KeyCode::Char('M') => {
-                let Some(dest) = self.known_pair_dest() else {
-                    self.info(
-                        "TUI migrate covers the /usr/local <-> ~/.local pair; \
-                         migrate elsewhere via the CLI: cargo lbin migrate --all --to PREFIX",
-                    );
-                    return;
-                };
-                // `--all` means all crates *now*, not all as of the last
-                // reload: a crate installed by another process since
-                // would otherwise be silently absent from the plan, and
-                // no checkpoint can reject a member the plan never had.
-                // (Small `m` is the opposite case on purpose: there the
-                // person confirms exactly the row they are looking at.)
-                // Races *after* this moment are the per-crate
-                // revalidation's job, as ever.
-                if let Err(e) = self.reload() {
-                    self.error(&format!("cannot plan the batch: {e:#}"));
-                    return;
-                }
-                if self.rows.is_empty() {
-                    self.info("nothing to migrate");
-                    return;
-                }
-                let mut plan = Vec::with_capacity(self.rows.len());
-                for row in &self.rows {
-                    match crate::MigrationSnapshot::from_parts(
+                    // Frozen here, from the row on screen: the
+                    // plan the person confirms is byte for byte
+                    // the plan the worker revalidates.
+                    let snap = match crate::MigrationSnapshot::from_parts(
                         &row.name,
                         &row.version,
                         row.bins.clone(),
                         row.locked,
                         row.pinned,
                     ) {
-                        Ok(snap) => plan.push(PendingMigrate {
-                            name: row.name.clone(),
-                            version: row.version.clone(),
-                            dest: dest.clone(),
-                            snap,
-                        }),
+                        Ok(snap) => snap,
                         Err(e) => {
                             self.error(&format!("{e:#}"));
                             return;
                         }
-                    }
+                    };
+                    let prompt = format!(
+                        "migrate {} {}: {} -> {}? the exact version is rebuilt \
+                         there, then retired here [y/N]",
+                        row.name,
+                        row.version,
+                        self.prefix.display(),
+                        dest.display()
+                    );
+                    self.confirm = Some(Confirm::new(
+                        &prompt,
+                        OnConfirm::Migrate {
+                            name: row.name.clone(),
+                            version: row.version.clone(),
+                            dest,
+                            snap,
+                        },
+                    ));
                 }
-                let prompt = format!(
-                    "migrate all {} crate(s): {} -> {}? exact versions are rebuilt \
-                     there, then retired here; c cancels the batch [y/N]",
-                    plan.len(),
-                    self.prefix.display(),
-                    dest.display()
-                );
-                self.confirm = Some(Confirm::new(&prompt, OnConfirm::MigrateAll { dest, plan }));
+                None => self.info(
+                    "TUI migrate covers the /usr/local <-> ~/.local pair; \
+                     migrate elsewhere via the CLI: cargo lbin migrate NAME --to PREFIX",
+                ),
             }
-            _ => {}
         }
+    }
+
+    /// The whole prefix to the other side: `migrate --all` as a
+    /// queue of the exact single migrations `m` runs. The plan is
+    /// frozen here, one snapshot per row, complete or not at all
+    /// — a plan that silently dropped an unparseable row would
+    /// migrate a different set than the person confirmed.
+    fn migrate_everything(&mut self) {
+        let Some(dest) = self.known_pair_dest() else {
+            self.info(
+                "TUI migrate covers the /usr/local <-> ~/.local pair; \
+                 migrate elsewhere via the CLI: cargo lbin migrate --all --to PREFIX",
+            );
+            return;
+        };
+        // `--all` means all crates *now*, not all as of the last
+        // reload: a crate installed by another process since
+        // would otherwise be silently absent from the plan, and
+        // no checkpoint can reject a member the plan never had.
+        // (Small `m` is the opposite case on purpose: there the
+        // person confirms exactly the row they are looking at.)
+        // Races *after* this moment are the per-crate
+        // revalidation's job, as ever.
+        if let Err(e) = self.reload() {
+            self.error(&format!("cannot plan the batch: {e:#}"));
+            return;
+        }
+        if self.rows.is_empty() {
+            self.info("nothing to migrate");
+            return;
+        }
+        let mut plan = Vec::with_capacity(self.rows.len());
+        for row in &self.rows {
+            match crate::MigrationSnapshot::from_parts(
+                &row.name,
+                &row.version,
+                row.bins.clone(),
+                row.locked,
+                row.pinned,
+            ) {
+                Ok(snap) => plan.push(PendingMigrate {
+                    name: row.name.clone(),
+                    version: row.version.clone(),
+                    dest: dest.clone(),
+                    snap,
+                }),
+                Err(e) => {
+                    self.error(&format!("{e:#}"));
+                    return;
+                }
+            }
+        }
+        let prompt = format!(
+            "migrate all {} crate(s): {} -> {}? exact versions are rebuilt \
+             there, then retired here; c cancels the batch [y/N]",
+            plan.len(),
+            self.prefix.display(),
+            dest.display()
+        );
+        self.confirm = Some(Confirm::new(&prompt, OnConfirm::MigrateAll { dest, plan }));
     }
 
     fn on_key_confirm(&mut self, key: KeyEvent) {
@@ -2627,7 +2636,11 @@ mod tests {
             cancel_deadline, ..
         }) = &mut app.job
         {
-            *cancel_deadline = Some(std::time::Instant::now() - Duration::from_millis(1));
+            *cancel_deadline = std::time::Instant::now().checked_sub(Duration::from_millis(1));
+            assert!(
+                cancel_deadline.is_some(),
+                "the clock is past its first millisecond"
+            );
         }
         app.escalate_overdue_cancel();
         assert!(matches!(

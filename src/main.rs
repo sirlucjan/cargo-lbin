@@ -2233,27 +2233,20 @@ pub(crate) enum MigrateOutcome {
     /// happened and the caller's message says what to do about it.
     Incomplete(String),
 }
-
-fn cmd_migrate(prefix: &Path, to: &Path, crates: &[String], all: bool, yes: bool) -> Result<()> {
-    for name in crates {
-        validate_name(name)?;
-    }
-    // `Path` equality is component-wise, so trailing-slash spellings
-    // collapse; symlinked spellings of the same place are the person's
-    // to know, the same lexical stance the prefixes module documents.
-    if prefix == to {
-        bail!(
-            "source and destination are the same prefix ({})",
-            prefix.display()
-        );
-    }
-    let cache = cache_dir()?;
-    // Phase 0: read-only snapshot under a shared source lock, released
-    // before the prompt and the builds — an unanswered "proceed?" must
-    // not block every reader and writer on the prefix (`update`'s rule,
-    // for `update`'s reason). Everything decided here is revalidated
-    // under real locks later, so state changing during the unlocked
-    // window is already handled.
+/// Phase 0 of `migrate`: the read-only plan. A snapshot under a shared
+/// source lock, released before the prompt and the builds — an
+/// unanswered "proceed?" must not block every reader and writer on the
+/// prefix (`update`'s rule, for `update`'s reason). Everything decided
+/// here is revalidated under real locks later, so state changing during
+/// the unlocked window is already handled. Returns `None` when the
+/// person aborts at the prompt.
+fn plan_migration(
+    prefix: &Path,
+    to: &Path,
+    crates: &[String],
+    all: bool,
+    yes: bool,
+) -> Result<Option<Vec<(String, MigrationSnapshot)>>> {
     let snapshot_manifest = {
         let _lock = StateLock::acquire(prefix, &Mode::Shared)?;
         Manifest::load(prefix)?
@@ -2282,8 +2275,28 @@ fn cmd_migrate(prefix: &Path, to: &Path, crates: &[String], all: bool, yes: bool
     }
     if !yes && !confirm("proceed with migration?")? {
         println!("aborted");
-        return Ok(());
+        return Ok(None);
     }
+    Ok(Some(snapshots))
+}
+
+fn cmd_migrate(prefix: &Path, to: &Path, crates: &[String], all: bool, yes: bool) -> Result<()> {
+    for name in crates {
+        validate_name(name)?;
+    }
+    // `Path` equality is component-wise, so trailing-slash spellings
+    // collapse; symlinked spellings of the same place are the person's
+    // to know, the same lexical stance the prefixes module documents.
+    if prefix == to {
+        bail!(
+            "source and destination are the same prefix ({})",
+            prefix.display()
+        );
+    }
+    let cache = cache_dir()?;
+    let Some(snapshots) = plan_migration(prefix, to, crates, all, yes)? else {
+        return Ok(());
+    };
     // Each crate is its own unit of work, `update --all`'s batch rule:
     // a failure is reported and the batch moves on — the crates are
     // independent, and undoing a finished migration would throw away
@@ -2380,6 +2393,132 @@ pub(crate) enum MigrateFrontend<'a> {
     },
 }
 
+/// Phase A wholesale: the destination's exclusive lock (through the
+/// flavor's policy and notice path), the no-force refusal, the frozen
+/// plan's checkpoint composed behind the placement door, and the
+/// rebuild itself. Everything in here may still fail as a plain error:
+/// nothing has committed until this returns.
+fn rebuild_at_destination(
+    source: &Path,
+    dest: &Path,
+    cache: &Path,
+    name: &str,
+    snap: &MigrationSnapshot,
+    frontend: &mut MigrateFrontend<'_>,
+) -> Result<()> {
+    let _dest_lock = match frontend {
+        MigrateFrontend::Terminal => StateLock::acquire(dest, &Mode::Exclusive)?,
+        #[cfg(not(feature = "tui"))]
+        MigrateFrontend::Never(_) => unreachable!(),
+        #[cfg(feature = "tui")]
+        MigrateFrontend::Captured { on_line, .. } => StateLock::acquire_with(
+            dest,
+            &Mode::Exclusive,
+            privileged::Policy::for_prefix(dest).screen_owned(),
+            &mut |l| on_line(LineKind::Notice, l),
+        )?,
+    };
+    let mut dest_manifest = Manifest::load(dest)?;
+    if let Some(existing) = dest_manifest.crates.get(name) {
+        bail!(
+            "`{name}` is already installed under {} at {}; migrate refuses to choose \
+             between {} and {} — remove one side first (no --force by design)",
+            dest.display(),
+            existing.version,
+            existing.version,
+            snap.version
+        );
+    }
+    // The early revalidation, run by the pipeline at the placement
+    // door — after the build, before the destination commits
+    // anything. Nonblocking and advisory: a busy source or a changed
+    // entry aborts while aborting is still free (the stage is the
+    // only casualty). The authoritative pass runs in phase B under
+    // the real exclusive lock; this one only exists to not commit a
+    // destination the source has already contradicted.
+    // The probe's policy follows the flavor too: under a screen the
+    // lock preparation may only run `sudo -n`. Its notices stay
+    // silent in both shapes — an advisory read that would rather
+    // say nothing, exactly as `try_acquire_with` documents.
+    let checkpoint_policy = match frontend {
+        MigrateFrontend::Terminal => privileged::Policy::for_prefix(source),
+        #[cfg(not(feature = "tui"))]
+        MigrateFrontend::Never(_) => unreachable!(),
+        #[cfg(feature = "tui")]
+        MigrateFrontend::Captured { .. } => privileged::Policy::for_prefix(source).screen_owned(),
+    };
+    let mut checkpoint = || -> Result<()> {
+        let advisory =
+            StateLock::try_acquire_with(source, &Mode::Shared, checkpoint_policy, &mut |_| {})?;
+        let Some(_lock) = advisory else {
+            bail!(
+                "source prefix {} is busy; aborting before the destination commits",
+                source.display()
+            );
+        };
+        let current = Manifest::load(source)?;
+        match current.crates.get(name) {
+            Some(entry) if snap.still_matches(entry) => Ok(()),
+            Some(_) => bail!(
+                "`{name}` changed under {} since the plan; aborting before the \
+                 destination commits",
+                source.display()
+            ),
+            None => bail!(
+                "`{name}` is no longer installed under {}; aborting before the \
+                 destination commits",
+                source.display()
+            ),
+        }
+    };
+    // `Exactly(snap.pinned)`: the pin bit travels unchanged, inside
+    // the same manifest commit as the entry itself. Under `install`'s
+    // inference an exact version would arrive pinned, and correcting
+    // that with a second store would open a window — and a failure
+    // mode — in which the destination is right and the intent is
+    // wrong, with the source still standing and a re-run refused.
+    // The same pipeline through the caller's shape: the CLI keeps
+    // Checkpointed, the TUI gets its Build panel and cancel door by
+    // composing the checkpoint behind Captured's placement CAS.
+    match frontend {
+        MigrateFrontend::Terminal => install_and_commit(
+            dest,
+            cache,
+            &mut dest_manifest,
+            name,
+            Some(&snap.version),
+            snap.locked,
+            PinPolicy::Exactly(snap.pinned),
+            &mut Frontend::Checkpointed {
+                checkpoint: &mut checkpoint,
+            },
+        )?,
+        #[cfg(not(feature = "tui"))]
+        MigrateFrontend::Never(_) => unreachable!(),
+        #[cfg(feature = "tui")]
+        MigrateFrontend::Captured {
+            on_line,
+            before_placement,
+            control,
+        } => install_and_commit(
+            dest,
+            cache,
+            &mut dest_manifest,
+            name,
+            Some(&snap.version),
+            snap.locked,
+            PinPolicy::Exactly(snap.pinned),
+            &mut Frontend::Captured {
+                on_line: &mut **on_line,
+                before_placement: &mut **before_placement,
+                control,
+                checkpoint: Some(&mut checkpoint),
+            },
+        )?,
+    }
+    Ok(())
+}
+
 /// One migration, sequential by design: destination first, source
 /// second. The precise lock property — because "never two locks" would
 /// be a lie by one probe: migrate never *waits* on one prefix while
@@ -2412,125 +2551,7 @@ fn migrate_one(
     snap: &MigrationSnapshot,
     frontend: &mut MigrateFrontend<'_>,
 ) -> Result<MigrateOutcome> {
-    // Phase A: the destination, under its exclusive lock — acquired
-    // through the flavor's own policy and notice path: a captured
-    // migration must not reach an interactive sudo or print to stderr
-    // beneath the alternate screen through the *lock*, having been so
-    // carefully denied both everywhere else (see `acquire_with`).
-    {
-        let _dest_lock = match frontend {
-            MigrateFrontend::Terminal => StateLock::acquire(dest, &Mode::Exclusive)?,
-            #[cfg(not(feature = "tui"))]
-            MigrateFrontend::Never(_) => unreachable!(),
-            #[cfg(feature = "tui")]
-            MigrateFrontend::Captured { on_line, .. } => StateLock::acquire_with(
-                dest,
-                &Mode::Exclusive,
-                privileged::Policy::for_prefix(dest).screen_owned(),
-                &mut |l| on_line(LineKind::Notice, l),
-            )?,
-        };
-        let mut dest_manifest = Manifest::load(dest)?;
-        if let Some(existing) = dest_manifest.crates.get(name) {
-            bail!(
-                "`{name}` is already installed under {} at {}; migrate refuses to choose \
-                 between {} and {} — remove one side first (no --force by design)",
-                dest.display(),
-                existing.version,
-                existing.version,
-                snap.version
-            );
-        }
-        // The early revalidation, run by the pipeline at the placement
-        // door — after the build, before the destination commits
-        // anything. Nonblocking and advisory: a busy source or a changed
-        // entry aborts while aborting is still free (the stage is the
-        // only casualty). The authoritative pass runs in phase B under
-        // the real exclusive lock; this one only exists to not commit a
-        // destination the source has already contradicted.
-        // The probe's policy follows the flavor too: under a screen the
-        // lock preparation may only run `sudo -n`. Its notices stay
-        // silent in both shapes — an advisory read that would rather
-        // say nothing, exactly as `try_acquire_with` documents.
-        let checkpoint_policy = match frontend {
-            MigrateFrontend::Terminal => privileged::Policy::for_prefix(source),
-            #[cfg(not(feature = "tui"))]
-            MigrateFrontend::Never(_) => unreachable!(),
-            #[cfg(feature = "tui")]
-            MigrateFrontend::Captured { .. } => {
-                privileged::Policy::for_prefix(source).screen_owned()
-            }
-        };
-        let mut checkpoint = || -> Result<()> {
-            let advisory =
-                StateLock::try_acquire_with(source, &Mode::Shared, checkpoint_policy, &mut |_| {})?;
-            let Some(_lock) = advisory else {
-                bail!(
-                    "source prefix {} is busy; aborting before the destination commits",
-                    source.display()
-                );
-            };
-            let current = Manifest::load(source)?;
-            match current.crates.get(name) {
-                Some(entry) if snap.still_matches(entry) => Ok(()),
-                Some(_) => bail!(
-                    "`{name}` changed under {} since the plan; aborting before the \
-                     destination commits",
-                    source.display()
-                ),
-                None => bail!(
-                    "`{name}` is no longer installed under {}; aborting before the \
-                     destination commits",
-                    source.display()
-                ),
-            }
-        };
-        // `Exactly(snap.pinned)`: the pin bit travels unchanged, inside
-        // the same manifest commit as the entry itself. Under `install`'s
-        // inference an exact version would arrive pinned, and correcting
-        // that with a second store would open a window — and a failure
-        // mode — in which the destination is right and the intent is
-        // wrong, with the source still standing and a re-run refused.
-        // The same pipeline through the caller's shape: the CLI keeps
-        // Checkpointed, the TUI gets its Build panel and cancel door by
-        // composing the checkpoint behind Captured's placement CAS.
-        match frontend {
-            MigrateFrontend::Terminal => install_and_commit(
-                dest,
-                cache,
-                &mut dest_manifest,
-                name,
-                Some(&snap.version),
-                snap.locked,
-                PinPolicy::Exactly(snap.pinned),
-                &mut Frontend::Checkpointed {
-                    checkpoint: &mut checkpoint,
-                },
-            )?,
-            #[cfg(not(feature = "tui"))]
-            MigrateFrontend::Never(_) => unreachable!(),
-            #[cfg(feature = "tui")]
-            MigrateFrontend::Captured {
-                on_line,
-                before_placement,
-                control,
-            } => install_and_commit(
-                dest,
-                cache,
-                &mut dest_manifest,
-                name,
-                Some(&snap.version),
-                snap.locked,
-                PinPolicy::Exactly(snap.pinned),
-                &mut Frontend::Captured {
-                    on_line: &mut **on_line,
-                    before_placement: &mut **before_placement,
-                    control,
-                    checkpoint: Some(&mut checkpoint),
-                },
-            )?,
-        }
-    }
+    rebuild_at_destination(source, dest, cache, name, snap, frontend)?;
 
     // Phase B: the source, under its exclusive lock — the authoritative
     // revalidation and the retirement. Nothing here is allowed to

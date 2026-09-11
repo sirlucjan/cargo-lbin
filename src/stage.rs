@@ -161,6 +161,73 @@ fn poll_readable(fd: std::os::fd::RawFd) -> std::io::Result<bool> {
     }
 }
 
+/// The captured build's read loop, EOF to EOF. EOF is the exit — and
+/// EOF is withheld for as long as *any* group member keeps the
+/// inherited stderr open. A TERM-ignoring child would otherwise wedge a
+/// cancellation in a perfect circle: the sweep waits for the reap, the
+/// reap waits for EOF, EOF waits for the stray, the stray waits for the
+/// sweep. So the blocking read is fronted by a bounded poll, and on
+/// quiet ticks the loop checks for exactly that circle: a cancel in
+/// flight with the leader already gone means the survivors' supervisor
+/// is dead, no further grace is owed, and the remainder of the group is
+/// swept with SIGKILL here — the strays die, EOF arrives, the loop ends.
+/// `try_wait` reaps the leader when it answers; `Child` caches the
+/// status, so the caller's `wait()` still returns it. A read error ends
+/// the loop and is returned; the caller owns the teardown.
+#[cfg(feature = "tui")]
+fn drain_stderr(
+    reader: &mut std::io::BufReader<std::process::ChildStderr>,
+    child: &mut std::process::Child,
+    control: &crate::BuildControl,
+    pgid: Option<i32>,
+    on_line: &mut dyn FnMut(&str),
+    lines: &mut Vec<String>,
+) -> Option<std::io::Error> {
+    let mut buf: Vec<u8> = Vec::new();
+    let mut swept = false;
+    loop {
+        if control.cancelled() && !swept && matches!(child.try_wait(), Ok(Some(_))) {
+            swept = true;
+            if let Some(pgid) = pgid {
+                // SAFETY: kill(2) with a negative pid signals the
+                // process group; ESRCH — already empty — is a no-op.
+                unsafe {
+                    libc::kill(-pgid, libc::SIGKILL);
+                }
+            }
+        }
+        // The poll asks the kernel — but `read_until` serves from the
+        // BufReader first, and one kernel read can park several lines in
+        // that buffer. Polling an already-drained pipe while buffered
+        // lines wait would hold them hostage to cargo's next write; the
+        // buffer is consulted first, and only an empty one earns a tick.
+        if reader.buffer().is_empty() {
+            match poll_readable(std::os::fd::AsRawFd::as_raw_fd(reader.get_ref())) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(e) => return Some(e),
+            }
+        }
+        buf.clear();
+        match std::io::BufRead::read_until(reader, b'\n', &mut buf) {
+            Ok(0) => return None,
+            Ok(_) => {
+                while matches!(buf.last(), Some(b'\n' | b'\r')) {
+                    buf.pop();
+                }
+                // Build scripts and linkers answer to neither cargo nor
+                // CARGO_TERM_COLOR; sanitize once, for screen and log.
+                let line = crate::text::sanitize(&String::from_utf8_lossy(&buf));
+                on_line(&line);
+                lines.push(line);
+            }
+            // EINTR: nothing read, nothing lost; simply try again.
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Some(e),
+        }
+    }
+}
+
 /// `build` for a frontend that owns the screen: cargo's stderr is piped
 /// (which makes cargo drop its own progress bar) and forwarded line by
 /// line to `on_line`; nothing reaches the terminal. Plain text is
@@ -227,68 +294,7 @@ pub fn build_captured(
     // Whatever happens on the pipe, the process is always collected.
     let mut reader = std::io::BufReader::new(stderr);
     let mut lines: Vec<String> = Vec::new();
-    let mut read_error: Option<std::io::Error> = None;
-    let mut buf: Vec<u8> = Vec::new();
-    // EOF is the loop's exit — and EOF is withheld for as long as *any*
-    // group member keeps the inherited stderr open. A TERM-ignoring
-    // child would otherwise wedge a cancellation in a perfect circle:
-    // the sweep waits for the reap, the reap waits for EOF, EOF waits
-    // for the stray, the stray waits for the sweep. So the blocking
-    // read is fronted by a bounded poll, and on quiet ticks the loop
-    // checks for exactly that circle: a cancel in flight with the
-    // leader already gone means the survivors' supervisor is dead, no
-    // further grace is owed, and the remainder of the group is
-    // SIGKILLed here — the strays die, EOF arrives, the loop ends.
-    // `try_wait` reaps the leader when it answers; `Child` caches the
-    // status, so the `wait()` below still returns it.
-    let mut swept = false;
-    loop {
-        if control.cancelled() && !swept && matches!(child.try_wait(), Ok(Some(_))) {
-            swept = true;
-            if let Some(pgid) = pgid {
-                // SAFETY: kill(2) with a negative pid signals the
-                // process group; ESRCH — already empty — is a no-op.
-                unsafe {
-                    libc::kill(-pgid, libc::SIGKILL);
-                }
-            }
-        }
-        // The poll asks the kernel — but `read_until` serves from the
-        // BufReader first, and one kernel read can park several lines in
-        // that buffer. Polling an already-drained pipe while buffered
-        // lines wait would hold them hostage to cargo's next write; the
-        // buffer is consulted first, and only an empty one earns a tick.
-        if reader.buffer().is_empty() {
-            match poll_readable(std::os::fd::AsRawFd::as_raw_fd(reader.get_ref())) {
-                Ok(true) => {}
-                Ok(false) => continue,
-                Err(e) => {
-                    read_error = Some(e);
-                    break;
-                }
-            }
-        }
-        buf.clear();
-        match std::io::BufRead::read_until(&mut reader, b'\n', &mut buf) {
-            Ok(0) => break,
-            Ok(_) => {
-                while matches!(buf.last(), Some(b'\n' | b'\r')) {
-                    buf.pop();
-                }
-                // Build scripts and linkers answer to neither cargo nor
-                // CARGO_TERM_COLOR; sanitize once, for screen and log.
-                let line = crate::text::sanitize(&String::from_utf8_lossy(&buf));
-                on_line(&line);
-                lines.push(line);
-            }
-            // EINTR: nothing read, nothing lost; simply try again.
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(e) => {
-                read_error = Some(e);
-                break;
-            }
-        }
-    }
+    let read_error = drain_stderr(&mut reader, &mut child, control, pgid, on_line, &mut lines);
     if read_error.is_some() {
         // The reader abandons the pipe with cargo possibly still
         // writing; a full pipe would park cargo on write while we park
@@ -647,7 +653,30 @@ mod tests {
             "the log holds everything the tail dropped"
         );
 
-        // The same fake succeeding: lines still stream, the stage is
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The other half of the captured contract: success streams lines
+    /// through the same parser path, and an exit-0 build that staged
+    /// nothing still fails with the log written — split from the
+    /// failure-diagnostics test above along its own seam.
+    #[cfg(feature = "tui")]
+    #[test]
+    fn captured_build_streams_success_and_verifies_the_stage() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join("cargo-lbin-test-captured-ok");
+        let _ = fs::remove_dir_all(&root);
+        let fake_bin = root.join("bin");
+        let stage = root.join("stage");
+        let logs = root.join("logs");
+        fs::create_dir_all(&fake_bin).unwrap();
+        let script = fake_bin.join("cargo");
+        fs::write(&script, "#!/bin/sh\nexit 1\n").unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        let _fake = FakeCargo::install(&script);
+
+        // The fake succeeding: lines still stream, the stage is
         // verified through the same path as the terminal build.
         fs::write(
             &script,
