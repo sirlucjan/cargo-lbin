@@ -184,6 +184,32 @@ enum Cmd {
         #[arg(value_enum)]
         shell: clap_complete::Shell,
     },
+    /// Rebuild an installed crate under another prefix, then retire it
+    /// here
+    ///
+    /// The exact installed version is rebuilt at the destination — never
+    /// copied, so provenance is re-established by the same pipeline as
+    /// `install` — carrying `--locked` and the pin. The entry here is
+    /// retired only after the destination has fully committed; a failure
+    /// in between leaves the crate installed in both prefixes — never in
+    /// neither — with the command's output naming both paths (the
+    /// listing's `[also in …]` shows it too, but only for the known pair
+    /// `/usr/local` and `~/.local`). A crate already installed at the
+    /// destination is refused — no `--force` by design.
+    Migrate {
+        /// Crates to migrate (use --all for every installed crate)
+        #[arg(required_unless_present = "all", conflicts_with = "all")]
+        crates: Vec<String>,
+        /// Migrate every crate installed under the prefix
+        #[arg(long)]
+        all: bool,
+        /// Destination prefix
+        #[arg(long, value_name = "PREFIX")]
+        to: PathBuf,
+        /// Skip the confirmation prompt
+        #[arg(long, short)]
+        yes: bool,
+    },
     /// Update installed crates to their newest crates.io versions
     // Either an explicit list of crates or `--all`, never neither: a bare
     // `update` has no obvious meaning once single-crate updates exist, and
@@ -270,6 +296,12 @@ fn main() -> ExitCode {
             all,
             yes,
         } => cmd_update(&cli.prefix, crates, all, yes),
+        Cmd::Migrate {
+            ref crates,
+            all,
+            ref to,
+            yes,
+        } => cmd_migrate(&cli.prefix, to, crates, all, yes),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -646,6 +678,15 @@ pub(crate) enum Frontend<'a> {
     /// notes go to stdout, warnings to stderr, and sudo prompts where it
     /// must.
     Terminal,
+    /// The terminal, plus a caller-supplied checkpoint at the placement
+    /// door — migrate's shape: cargo owns the terminal exactly as with
+    /// `Terminal`, and the checkpoint is migrate's early revalidation of
+    /// the source prefix, run after the build and before the destination
+    /// commits anything. Distinct from `before_placement`, which exists
+    /// for sudo: this one runs at every prefix, escalating or not.
+    Checkpointed {
+        checkpoint: &'a mut dyn FnMut() -> Result<()>,
+    },
     /// A screen-owning frontend (the TUI): every line — cargo's and the
     /// pipeline's own — is forwarded instead of printed, classified at
     /// the source: the pipeline knows whether it speaks cargo's words, a
@@ -681,7 +722,9 @@ impl Frontend<'_> {
         cache: &Path,
     ) -> Result<stage::Built> {
         match self {
-            Frontend::Terminal => stage::build(name, version, locked, stage_dir),
+            Frontend::Terminal | Frontend::Checkpointed { .. } => {
+                stage::build(name, version, locked, stage_dir)
+            }
             #[cfg(feature = "tui")]
             Frontend::Captured {
                 on_line, control, ..
@@ -716,7 +759,7 @@ impl Frontend<'_> {
     /// obsolete …". stdout in the terminal, forwarded when captured.
     fn note(&mut self, s: &str) {
         match self {
-            Frontend::Terminal => println!("{s}"),
+            Frontend::Terminal | Frontend::Checkpointed { .. } => println!("{s}"),
             #[cfg(feature = "tui")]
             Frontend::Captured { on_line, .. } => on_line(LineKind::Notice, s),
             #[cfg(not(feature = "tui"))]
@@ -729,7 +772,7 @@ impl Frontend<'_> {
     /// callback still, one classification.
     fn warning(&mut self, s: &str) {
         match self {
-            Frontend::Terminal => eprintln!("{s}"),
+            Frontend::Terminal | Frontend::Checkpointed { .. } => eprintln!("{s}"),
             #[cfg(feature = "tui")]
             Frontend::Captured { on_line, .. } => on_line(LineKind::Warning, s),
             #[cfg(not(feature = "tui"))]
@@ -743,7 +786,7 @@ impl Frontend<'_> {
     /// prompt from inside the pipeline would be exactly the hidden one
     /// this type exists to prevent.
     fn wants_preauthorize(&self) -> bool {
-        matches!(self, Frontend::Terminal)
+        matches!(self, Frontend::Terminal | Frontend::Checkpointed { .. })
     }
 
     /// The cancel door: crossed unconditionally right before the first
@@ -756,6 +799,7 @@ impl Frontend<'_> {
     fn placement_begins(&mut self) -> Result<()> {
         match self {
             Frontend::Terminal => Ok(()),
+            Frontend::Checkpointed { checkpoint } => checkpoint(),
             #[cfg(feature = "tui")]
             Frontend::Captured { control, .. } => control.begin_placement(),
             #[cfg(not(feature = "tui"))]
@@ -769,7 +813,7 @@ impl Frontend<'_> {
     /// a user-writable prefix never reaches it.
     fn before_placement(&mut self) -> Result<()> {
         match self {
-            Frontend::Terminal => Ok(()),
+            Frontend::Terminal | Frontend::Checkpointed { .. } => Ok(()),
             #[cfg(feature = "tui")]
             Frontend::Captured {
                 before_placement, ..
@@ -793,6 +837,11 @@ impl Frontend<'_> {
 /// silently skipped as "already installed", recording a flag the staged
 /// binary was never built with. A fresh stage eliminates both; nothing of
 /// value is lost, since cargo's registry and build caches live elsewhere.
+// Eight arguments, like `place_and_commit` below and for the same
+// reason: these are the parameters of one install, and a struct naming
+// the bundle would be built at every call site only to be destructured
+// here.
+#[allow(clippy::too_many_arguments)]
 fn install_and_commit(
     prefix: &Path,
     cache: &Path,
@@ -800,6 +849,7 @@ fn install_and_commit(
     name: &str,
     version: Option<&Version>,
     locked: bool,
+    pin: PinPolicy,
     frontend: &mut Frontend<'_>,
 ) -> Result<()> {
     // Revalidate even though CLI input was already checked: on the update
@@ -812,7 +862,9 @@ fn install_and_commit(
     // the failure panel instead of a prompt hung invisibly beneath the
     // alternate screen.
     let policy = match frontend {
-        Frontend::Terminal => privileged::Policy::for_prefix(prefix),
+        Frontend::Terminal | Frontend::Checkpointed { .. } => {
+            privileged::Policy::for_prefix(prefix)
+        }
         #[cfg(feature = "tui")]
         Frontend::Captured { .. } => privileged::Policy::for_prefix(prefix).screen_owned(),
         #[cfg(not(feature = "tui"))]
@@ -868,10 +920,19 @@ fn install_and_commit(
     // Snapshot before `place_and_commit` inserts the new manifest entry;
     // see `RollbackSet::snapshot` for why the order is load-bearing.
     let mut rollback = RollbackSet::snapshot(manifest, name, &built.bins);
-    // An exact version was chosen to be kept: the entry is pinned, or the
-    // next `update --all` would undo the choice. Without one, a pin
-    // already present is carried over (see below).
-    let pin = version.is_some();
+    // Resolved here, against the entry as it still is: under Infer an
+    // exact version pins (or the next `update --all` would undo the
+    // choice), and a pin already present is carried over — `install` and
+    // `update` refuse pinned crates unless a version is named, so when
+    // neither term holds the carried value can only be false too, but a
+    // pin is not something a rewrite of the entry gets to drop by
+    // omission. Under Exactly the caller has already made the promise.
+    let pinned = match pin {
+        PinPolicy::Infer => {
+            version.is_some() || manifest.crates.get(name).is_some_and(|e| e.pinned)
+        }
+        PinPolicy::Exactly(pinned) => pinned,
+    };
     // The checkpoint sits between the last unprivileged step and the
     // first privileged one: everything before it needed no sudo, and a
     // build can outlive sudo's credential timestamp. At a user-writable
@@ -915,7 +976,7 @@ fn install_and_commit(
         name,
         built,
         locked,
-        pin,
+        pinned,
         &mut rollback,
         frontend,
     ) {
@@ -949,7 +1010,7 @@ fn place_and_commit(
     name: &str,
     built: stage::Built,
     locked: bool,
-    pin: bool,
+    pinned: bool,
     rollback: &mut RollbackSet,
     frontend: &mut Frontend<'_>,
 ) -> Result<()> {
@@ -986,15 +1047,9 @@ fn place_and_commit(
     }
 
     let bins_list = built.bins.join(", ");
-    // Pinned if this install chose a version, or if the entry was
-    // pinned before. When `pin` is false the carried-over value can only
-    // be false too — `install` and `update` refuse pinned crates unless
-    // a version is named — but a pin is not something a rewrite of the
-    // entry gets to drop by omission. When `pin` is true (a re-pin over
-    // an already pinned crate), both agree. Read before the call: the
-    // first argument borrows `manifest` mutably, and a plain function
-    // call gets no two-phase borrow for a later argument.
-    let pinned = pin || manifest.crates.get(name).is_some_and(|e| e.pinned);
+    // `pinned` arrives resolved (see `install_and_commit`): the policy
+    // and the carry-over were read against the pre-commit entry, before
+    // this function's mutable borrow of the manifest began.
     commit_entry(
         manifest,
         prefix,
@@ -1010,7 +1065,9 @@ fn place_and_commit(
     // Announced only after the manifest commit: with a rollback path in
     // play, an "installed" printed before `store` could be followed by that
     // very installation being undone.
-    let pin_note = if pin {
+    // Keyed off the committed state, not the request: the note describes
+    // what the manifest now says, which is what `unpin` would change.
+    let pin_note = if pinned {
         format!(" [pinned; `cargo lbin unpin {name}` to allow updates]")
     } else {
         String::new()
@@ -1137,6 +1194,7 @@ pub(crate) fn tui_install_one(
         &spec.name,
         spec.version.as_ref(),
         locked,
+        PinPolicy::Infer,
         &mut Frontend::Captured {
             on_line,
             before_placement,
@@ -1171,6 +1229,7 @@ fn cmd_install(prefix: &Path, crates: &[String], locked: bool) -> Result<()> {
             &spec.name,
             spec.version.as_ref(),
             locked,
+            PinPolicy::Infer,
             &mut Frontend::Terminal,
         )?;
     }
@@ -1762,6 +1821,7 @@ fn cmd_downgrade(prefix: &Path, name: &str) -> Result<()> {
         name,
         Some(version),
         locked,
+        PinPolicy::Infer,
         &mut Frontend::Terminal,
     )
 }
@@ -1951,6 +2011,7 @@ fn apply_updates(prefix: &Path, cache: &Path, outdated: &[Checked]) -> Result<()
                     &o.name,
                     None,
                     locked,
+                    PinPolicy::Infer,
                     &mut Frontend::Terminal,
                 ) {
                     Ok(()) => updated += 1,
@@ -1989,6 +2050,368 @@ fn apply_updates(prefix: &Path, cache: &Path, outdated: &[Checked]) -> Result<()
         );
     }
     Ok(())
+}
+
+/// The pin bit a committed entry ends up with. `install`'s inference is
+/// a contract with `update --all` — an exact version that arrived
+/// unpinned would be undone by the next run — but it is `install`'s
+/// contract, not every caller's: migrate rebuilds an exact version
+/// *because that is what the source has*, and its pin promise is "the
+/// bit travels unchanged". The policy makes the final bit part of the
+/// one manifest commit; correcting it with a second write afterwards
+/// would open a window in which the entry is right and the intent is
+/// wrong — and a failure of that second write would strand exactly the
+/// state (destination present, wrongly pinned, source still standing)
+/// the snapshot machinery exists to prevent.
+#[derive(Clone, Copy)]
+enum PinPolicy {
+    /// `install`'s inference: an exact-version request pins; otherwise a
+    /// pin already present is carried over — never dropped by a rewrite.
+    Infer,
+    /// The caller states the final bit outright.
+    Exactly(bool),
+}
+
+/// Everything `migrate` promises to preserve about a source entry,
+/// captured under the snapshot lock and revalidated twice on the way.
+/// Built by exhaustively destructuring `manifest::Entry` on purpose: a
+/// new manifest field fails this compilation and forces a decision
+/// whether it belongs to the protected semantics of a migration —
+/// silently ignoring it would be exactly the kind of guess this command
+/// must never make about state it is about to delete.
+struct MigrationSnapshot {
+    version: Version,
+    bins: Vec<String>,
+    locked: bool,
+    pinned: bool,
+}
+
+impl MigrationSnapshot {
+    fn capture(name: &str, entry: &Entry) -> Result<Self> {
+        let Entry {
+            version,
+            bins,
+            locked,
+            pinned,
+        } = entry;
+        Ok(Self {
+            version: Version::parse(version)
+                .with_context(|| format!("`{name}` has an unparseable version `{version}`"))?,
+            bins: bins.clone(),
+            locked: *locked,
+            pinned: *pinned,
+        })
+    }
+
+    /// Whether `entry` is still the entry this snapshot was taken from —
+    /// the question both revalidations ask. The same exhaustive
+    /// destructuring as `capture`, for the same reason.
+    fn still_matches(&self, entry: &Entry) -> bool {
+        let Entry {
+            version,
+            bins,
+            locked,
+            pinned,
+        } = entry;
+        Version::parse(version).is_ok_and(|v| v == self.version)
+            && *bins == self.bins
+            && *locked == self.locked
+            && *pinned == self.pinned
+    }
+}
+
+/// How one migration ended, short of an error — where "error" ends at
+/// the destination commit. Everything past that point is a partial
+/// success, never a plain failure: the rebuilt install exists, and an
+/// error message that hides it invites exactly the wrong reaction (a
+/// blind re-run, which the already-installed refusal would then bounce).
+#[derive(Debug)]
+enum MigrateOutcome {
+    /// Rebuilt at the destination and retired here.
+    Moved,
+    /// The destination committed, but the source was not retired —
+    /// changed under the plan, or the retirement itself failed. Both
+    /// installs (or the source's remainder) stand; the reason says what
+    /// happened and the caller's message says what to do about it.
+    Incomplete(String),
+}
+
+fn cmd_migrate(prefix: &Path, to: &Path, crates: &[String], all: bool, yes: bool) -> Result<()> {
+    for name in crates {
+        validate_name(name)?;
+    }
+    // `Path` equality is component-wise, so trailing-slash spellings
+    // collapse; symlinked spellings of the same place are the person's
+    // to know, the same lexical stance the prefixes module documents.
+    if prefix == to {
+        bail!(
+            "source and destination are the same prefix ({})",
+            prefix.display()
+        );
+    }
+    let cache = cache_dir()?;
+    // Phase 0: read-only snapshot under a shared source lock, released
+    // before the prompt and the builds — an unanswered "proceed?" must
+    // not block every reader and writer on the prefix (`update`'s rule,
+    // for `update`'s reason). Everything decided here is revalidated
+    // under real locks later, so state changing during the unlocked
+    // window is already handled.
+    let snapshot_manifest = {
+        let _lock = StateLock::acquire(prefix, &Mode::Shared)?;
+        Manifest::load(prefix)?
+    };
+    let names: BTreeSet<String> = if all {
+        snapshot_manifest.crates.keys().cloned().collect()
+    } else {
+        select_targets(&snapshot_manifest, crates)?
+    };
+    if names.is_empty() {
+        bail!("nothing to migrate");
+    }
+    let mut snapshots: Vec<(String, MigrationSnapshot)> = Vec::with_capacity(names.len());
+    for name in names {
+        let snap = MigrationSnapshot::capture(&name, &snapshot_manifest.crates[&name])?;
+        snapshots.push((name, snap));
+    }
+    for (name, snap) in &snapshots {
+        println!(
+            "{name} {}: {} -> {}{}",
+            snap.version,
+            prefix.display(),
+            to.display(),
+            if snap.pinned { " [pinned]" } else { "" }
+        );
+    }
+    if !yes && !confirm("proceed with migration?")? {
+        println!("aborted");
+        return Ok(());
+    }
+    // Each crate is its own unit of work, `update --all`'s batch rule:
+    // a failure is reported and the batch moves on — the crates are
+    // independent, and undoing a finished migration would throw away
+    // good work for no consistency gain.
+    let total = snapshots.len();
+    let mut moved = 0usize;
+    let mut incomplete: Vec<&str> = Vec::new();
+    let mut failed: Vec<&str> = Vec::new();
+    for (i, (name, snap)) in snapshots.iter().enumerate() {
+        println!("[{}/{total}] {name}", i + 1);
+        match migrate_one(prefix, to, &cache, name, snap) {
+            Ok(MigrateOutcome::Moved) => moved += 1,
+            Ok(MigrateOutcome::Incomplete(reason)) => {
+                eprintln!("warning: incomplete migration: {reason}");
+                incomplete.push(name);
+            }
+            Err(err) => {
+                eprintln!("error: migrating `{name}` failed: {err:#}");
+                failed.push(name);
+            }
+        }
+    }
+    println!("migrated {moved} of {total}");
+    // The command was asked for `total` migrations; anything short of
+    // that exits non-zero — an incomplete migration is a *safe*
+    // shortfall (the destination stands), but a shortfall: the source
+    // the person asked to retire is still there, in whole or in part.
+    let mut shortfall = Vec::new();
+    if !failed.is_empty() {
+        shortfall.push(format!(
+            "failed before the destination committed: {}",
+            failed.join(", ")
+        ));
+    }
+    if !incomplete.is_empty() {
+        shortfall.push(format!(
+            "destination committed, source not retired: {}",
+            incomplete.join(", ")
+        ));
+    }
+    if !shortfall.is_empty() {
+        bail!(
+            "{} of {total} migrations not completed ({})",
+            total - moved,
+            shortfall.join("; ")
+        );
+    }
+    Ok(())
+}
+
+/// One migration, sequential by design: destination first, source
+/// second. The precise lock property — because "never two locks" would
+/// be a lie by one probe: migrate never *waits* on one prefix while
+/// holding a lock on the other, and never holds two exclusive locks;
+/// the only overlap is the early revalidation's nonblocking shared
+/// probe of the source, taken under the destination lock and refused
+/// (`try_acquire`) rather than waited for. Holding two exclusive locks
+/// for the length of a build would park every other instance on either
+/// prefix behind a compilation, and two migrations in opposite
+/// directions would need a lock order to not deadlock — a discipline
+/// nothing enforces. Sequential locks trade all of that for one honest
+/// window: between the destination commit and the source retirement the
+/// crate exists in both prefixes — a state one `remove` fixes, and one
+/// the listing annotates as `[also in …]` when both sides are the known
+/// pair (`/usr/local`, `~/.local`). For custom prefixes the closed set
+/// in the `prefixes` module cannot see the other side, so the durable
+/// record of an incomplete migration is the command's own message,
+/// which names both paths; the annotation is a bonus where it exists,
+/// never the contract. The order is load-bearing —
+/// the destination commits fully before the source loses anything, so
+/// no failure or crash ever leaves the person without one complete,
+/// working installation (a crash mid-retirement can leave the source
+/// partial — entry still recorded, some binaries already gone — and
+/// `remove`, built on `rm -f`, cleans up such a remainder).
+fn migrate_one(
+    source: &Path,
+    dest: &Path,
+    cache: &Path,
+    name: &str,
+    snap: &MigrationSnapshot,
+) -> Result<MigrateOutcome> {
+    // Phase A: the destination, under its exclusive lock.
+    {
+        let _dest_lock = StateLock::acquire(dest, &Mode::Exclusive)?;
+        let mut dest_manifest = Manifest::load(dest)?;
+        if let Some(existing) = dest_manifest.crates.get(name) {
+            bail!(
+                "`{name}` is already installed under {} at {}; migrate refuses to choose \
+                 between {} and {} — remove one side first (no --force by design)",
+                dest.display(),
+                existing.version,
+                existing.version,
+                snap.version
+            );
+        }
+        // The early revalidation, run by the pipeline at the placement
+        // door — after the build, before the destination commits
+        // anything. Nonblocking and advisory: a busy source or a changed
+        // entry aborts while aborting is still free (the stage is the
+        // only casualty). The authoritative pass runs in phase B under
+        // the real exclusive lock; this one only exists to not commit a
+        // destination the source has already contradicted.
+        let mut checkpoint = || -> Result<()> {
+            let advisory = StateLock::try_acquire_with(
+                source,
+                &Mode::Shared,
+                privileged::Policy::for_prefix(source),
+                &mut |_| {},
+            )?;
+            let Some(_lock) = advisory else {
+                bail!(
+                    "source prefix {} is busy; aborting before the destination commits",
+                    source.display()
+                );
+            };
+            let current = Manifest::load(source)?;
+            match current.crates.get(name) {
+                Some(entry) if snap.still_matches(entry) => Ok(()),
+                Some(_) => bail!(
+                    "`{name}` changed under {} since the plan; aborting before the \
+                     destination commits",
+                    source.display()
+                ),
+                None => bail!(
+                    "`{name}` is no longer installed under {}; aborting before the \
+                     destination commits",
+                    source.display()
+                ),
+            }
+        };
+        // `Exactly(snap.pinned)`: the pin bit travels unchanged, inside
+        // the same manifest commit as the entry itself. Under `install`'s
+        // inference an exact version would arrive pinned, and correcting
+        // that with a second store would open a window — and a failure
+        // mode — in which the destination is right and the intent is
+        // wrong, with the source still standing and a re-run refused.
+        install_and_commit(
+            dest,
+            cache,
+            &mut dest_manifest,
+            name,
+            Some(&snap.version),
+            snap.locked,
+            PinPolicy::Exactly(snap.pinned),
+            &mut Frontend::Checkpointed {
+                checkpoint: &mut checkpoint,
+            },
+        )?;
+    }
+
+    // Phase B: the source, under its exclusive lock — the authoritative
+    // revalidation and the retirement. Nothing here is allowed to
+    // surface as a plain error anymore: the destination has committed,
+    // and from this line on every failure is an *incomplete migration*
+    // whose message must lead with that fact — a bare "migrating foo
+    // failed" would read as "nothing happened, run it again", and the
+    // re-run would bounce off the already-installed refusal.
+    match retire_source(source, name, snap) {
+        Ok(Retirement::Retired) => {
+            println!(
+                "migrated {name} {}: retired from {}",
+                snap.version,
+                source.display()
+            );
+            Ok(MigrateOutcome::Moved)
+        }
+        // Someone retired it during the build. The destination install
+        // was explicitly asked for and stands; there is simply nothing
+        // left to retire, which is the goal state.
+        Ok(Retirement::AlreadyGone) => {
+            println!(
+                "migrated {name} {}: already retired from {}",
+                snap.version,
+                source.display()
+            );
+            Ok(MigrateOutcome::Moved)
+        }
+        Ok(Retirement::Mismatch) => Ok(MigrateOutcome::Incomplete(format!(
+            "`{name}` is installed at {} and stays: the entry under {} changed during the \
+             migration, so the source is deliberately not retired — `remove` retires \
+             whichever side is wrong",
+            dest.display(),
+            source.display()
+        ))),
+        Err(e) => Ok(MigrateOutcome::Incomplete(format!(
+            "`{name}` is installed at {} and stays; retiring it from {} did not complete: \
+             {e:#} — resolve that and `remove` the source installation, do not re-run the \
+             migration blindly (it will refuse: the destination already has the crate)",
+            dest.display(),
+            source.display()
+        ))),
+    }
+}
+
+/// What the authoritative pass found and did at the source.
+enum Retirement {
+    /// Matched the snapshot; binaries removed, manifest committed.
+    Retired,
+    /// No entry anymore; nothing to do.
+    AlreadyGone,
+    /// An entry that no longer matches the snapshot; left untouched.
+    Mismatch,
+}
+
+/// Phase B proper: exclusive source lock, authoritative revalidation
+/// against a manifest freshly loaded under it, then the removal. All
+/// errors bubble; the caller owns the "destination already committed"
+/// framing, because only it knows that context.
+fn retire_source(source: &Path, name: &str, snap: &MigrationSnapshot) -> Result<Retirement> {
+    let _src_lock = StateLock::acquire(source, &Mode::Exclusive)?;
+    let mut src_manifest = Manifest::load(source)?;
+    match src_manifest.crates.get(name) {
+        Some(entry) if snap.still_matches(entry) => {}
+        Some(_) => return Ok(Retirement::Mismatch),
+        None => return Ok(Retirement::AlreadyGone),
+    }
+    let entry = src_manifest
+        .crates
+        .remove(name)
+        .expect("matched by the revalidation above");
+    let bin_dir = source.join("bin");
+    let paths: Vec<PathBuf> = entry.bins.iter().map(|b| bin_dir.join(b)).collect();
+    let refs: Vec<&Path> = paths.iter().map(PathBuf::as_path).collect();
+    privileged::remove_files(privileged::Policy::for_prefix(source), &refs)?;
+    src_manifest.store(source)?;
+    Ok(Retirement::Retired)
 }
 
 #[cfg(test)]
@@ -2416,6 +2839,7 @@ mod tests {
                 "stubborncrate",
                 None,
                 false,
+                PinPolicy::Infer,
                 &mut Frontend::Captured {
                     on_line: &mut |_, _| {},
                     before_placement: &mut || Ok(()),
@@ -2496,6 +2920,7 @@ mod tests {
                 "straycrate",
                 None,
                 false,
+                PinPolicy::Infer,
                 &mut Frontend::Captured {
                     on_line: &mut |_, _| {},
                     before_placement: &mut || Ok(()),
@@ -2585,6 +3010,7 @@ mod tests {
                 "partialcrate",
                 None,
                 false,
+                PinPolicy::Infer,
                 &mut Frontend::Captured {
                     on_line: &mut |_, _| {},
                     before_placement: &mut || Ok(()),
@@ -2660,6 +3086,7 @@ mod tests {
                 "slowcrate",
                 None,
                 false,
+                PinPolicy::Infer,
                 &mut Frontend::Captured {
                     on_line: &mut |_, _| {},
                     before_placement: &mut || Ok(()),
@@ -2701,6 +3128,280 @@ mod tests {
                 .exists(),
             "a cancelled build leaves no stage behind"
         );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn migration_snapshot_protects_every_entry_field() {
+        let base = Entry {
+            version: "1.2.3".into(),
+            bins: vec!["foo".into()],
+            locked: true,
+            pinned: true,
+        };
+        let snap = MigrationSnapshot::capture("foo", &base).unwrap();
+        assert!(snap.still_matches(&base));
+
+        let mut changed = base.clone();
+        changed.version = "1.2.4".into();
+        assert!(!snap.still_matches(&changed), "version is protected");
+
+        let mut changed = base.clone();
+        changed.bins.push("fooctl".into());
+        assert!(!snap.still_matches(&changed), "the bin set is protected");
+
+        let mut changed = base.clone();
+        changed.locked = false;
+        assert!(
+            !snap.still_matches(&changed),
+            "the locked flag is protected"
+        );
+
+        let mut changed = base.clone();
+        changed.pinned = false;
+        assert!(!snap.still_matches(&changed), "the pin is protected");
+    }
+
+    /// Shared scaffolding for the migrate tests: a prefix with a
+    /// manifest entry and a placed binary, as a finished install leaves
+    /// them.
+    fn seeded_prefix(root: &Path, dir: &str, name: &str, locked: bool, pinned: bool) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let prefix = root.join(dir);
+        fs::create_dir_all(prefix.join("bin")).unwrap();
+        fs::create_dir_all(prefix.join("share/cargo-lbin")).unwrap();
+        fs::write(prefix.join("bin").join(name), "#!/bin/sh\ntrue\n").unwrap();
+        fs::set_permissions(
+            prefix.join("bin").join(name),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        let mut manifest = Manifest::default();
+        manifest.crates.insert(
+            name.to_owned(),
+            Entry {
+                version: "0.1.0".into(),
+                bins: vec![name.to_owned()],
+                locked,
+                pinned,
+            },
+        );
+        manifest.store(&prefix).unwrap();
+        prefix
+    }
+
+    /// A fake cargo staging `name` 0.1.0, the migrate tests' build.
+    fn staging_fake(root: &Path, name: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let fake_bin = root.join("fakebin");
+        fs::create_dir_all(&fake_bin).unwrap();
+        let script = fake_bin.join("cargo");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\n\
+                 mkdir -p \"$4/bin\"\n\
+                 printf '#!/bin/sh\\ntrue\\n' > \"$4/bin/{name}\"\n\
+                 chmod 755 \"$4/bin/{name}\"\n\
+                 printf '%s' '{{\"installs\":{{\"{name} 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)\":{{\"bins\":[\"{name}\"]}}}}}}' > \"$4/.crates2.json\"\n\
+                 exit 0\n"
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        script
+    }
+
+    #[test]
+    fn migrate_rebuilds_at_the_destination_and_retires_the_source() {
+        let root = std::env::temp_dir().join("cargo-lbin-test-migrate-moves");
+        let _ = fs::remove_dir_all(&root);
+        let source = seeded_prefix(&root, "source", "okcrate", true, true);
+        let dest = root.join("dest");
+        fs::create_dir_all(dest.join("bin")).unwrap();
+        fs::create_dir_all(dest.join("share/cargo-lbin")).unwrap();
+        let _fake = crate::stage::FakeCargo::install(&staging_fake(&root, "okcrate"));
+
+        let snap = MigrationSnapshot::capture(
+            "okcrate",
+            &Manifest::load(&source).unwrap().crates["okcrate"],
+        )
+        .unwrap();
+        let outcome = migrate_one(&source, &dest, &root.join("cache"), "okcrate", &snap).unwrap();
+        assert!(matches!(outcome, MigrateOutcome::Moved));
+
+        let dest_manifest = Manifest::load(&dest).unwrap();
+        let entry = &dest_manifest.crates["okcrate"];
+        assert_eq!(entry.version, "0.1.0");
+        assert!(entry.pinned, "the pin bit travels with the crate");
+        assert!(entry.locked, "the --locked flag travels with the crate");
+        assert!(dest.join("bin/okcrate").is_file(), "rebuilt and placed");
+
+        let src_manifest = Manifest::load(&source).unwrap();
+        assert!(!src_manifest.crates.contains_key("okcrate"), "retired");
+        assert!(!source.join("bin/okcrate").exists(), "binary removed");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn migrate_carries_an_unpinned_entry_unpinned() {
+        // `install_and_commit` pins every exact-version request — its
+        // contract, corrected by migrate under the same lock. This is
+        // the test that keeps that correction honest.
+        let root = std::env::temp_dir().join("cargo-lbin-test-migrate-unpinned");
+        let _ = fs::remove_dir_all(&root);
+        let source = seeded_prefix(&root, "source", "okcrate", false, false);
+        let dest = root.join("dest");
+        fs::create_dir_all(dest.join("bin")).unwrap();
+        fs::create_dir_all(dest.join("share/cargo-lbin")).unwrap();
+        let _fake = crate::stage::FakeCargo::install(&staging_fake(&root, "okcrate"));
+
+        let snap = MigrationSnapshot::capture(
+            "okcrate",
+            &Manifest::load(&source).unwrap().crates["okcrate"],
+        )
+        .unwrap();
+        migrate_one(&source, &dest, &root.join("cache"), "okcrate", &snap).unwrap();
+        assert!(
+            !Manifest::load(&dest).unwrap().crates["okcrate"].pinned,
+            "an unpinned crate arrives unpinned, not auto-pinned by the exact version"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn migrate_refuses_a_crate_already_at_the_destination() {
+        let root = std::env::temp_dir().join("cargo-lbin-test-migrate-refuses");
+        let _ = fs::remove_dir_all(&root);
+        let source = seeded_prefix(&root, "source", "okcrate", false, false);
+        let dest = seeded_prefix(&root, "dest", "okcrate", false, false);
+        // No fake: the refusal must land before any build is attempted.
+        let snap = MigrationSnapshot::capture(
+            "okcrate",
+            &Manifest::load(&source).unwrap().crates["okcrate"],
+        )
+        .unwrap();
+        let err = migrate_one(&source, &dest, &root.join("cache"), "okcrate", &snap).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("no --force by design"),
+            "the refusal names the policy: {err:#}"
+        );
+        assert!(
+            Manifest::load(&source)
+                .unwrap()
+                .crates
+                .contains_key("okcrate"),
+            "the source is untouched by a refusal"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn migrate_aborts_before_the_destination_commits_when_the_source_changed() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join("cargo-lbin-test-migrate-aborts");
+        let _ = fs::remove_dir_all(&root);
+        let source = seeded_prefix(&root, "source", "okcrate", false, false);
+        let dest = root.join("dest");
+        fs::create_dir_all(dest.join("bin")).unwrap();
+        fs::create_dir_all(dest.join("share/cargo-lbin")).unwrap();
+
+        // A fake cargo that stages fine — and mutates the source
+        // manifest mid-build, exactly the race the early revalidation
+        // exists to catch before the destination commits anything.
+        let fake_bin = root.join("fakebin");
+        fs::create_dir_all(&fake_bin).unwrap();
+        let script = fake_bin.join("cargo");
+        let src_manifest_path = Manifest::path(&source);
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\n\
+                 printf '%s' '{{\"version\":1,\"crates\":{{\"okcrate\":{{\"version\":\"0.2.0\",\"bins\":[\"okcrate\"],\"locked\":false,\"pinned\":false}}}}}}' > \"{}\"\n\
+                 mkdir -p \"$4/bin\"\n\
+                 printf '#!/bin/sh\\ntrue\\n' > \"$4/bin/okcrate\"\n\
+                 chmod 755 \"$4/bin/okcrate\"\n\
+                 printf '%s' '{{\"installs\":{{\"okcrate 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)\":{{\"bins\":[\"okcrate\"]}}}}}}' > \"$4/.crates2.json\"\n\
+                 exit 0\n",
+                src_manifest_path.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        let _fake = crate::stage::FakeCargo::install(&script);
+
+        let snap = MigrationSnapshot::capture(
+            "okcrate",
+            &Manifest::load(&source).unwrap().crates["okcrate"],
+        )
+        .unwrap();
+        let err = migrate_one(&source, &dest, &root.join("cache"), "okcrate", &snap).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("aborting before the destination commits"),
+            "the abort names its moment: {err:#}"
+        );
+        assert!(
+            Manifest::load(&dest).unwrap().crates.is_empty(),
+            "the destination committed nothing"
+        );
+        assert!(
+            !dest.join("bin/okcrate").exists(),
+            "no binary was placed at the destination"
+        );
+        assert_eq!(
+            Manifest::load(&source).unwrap().crates["okcrate"].version,
+            "0.2.0",
+            "the source keeps its newer truth; migrate touched nothing"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn retirement_is_authoritative_and_touches_nothing_on_mismatch() {
+        let root = std::env::temp_dir().join("cargo-lbin-test-retire");
+        let _ = fs::remove_dir_all(&root);
+        let source = seeded_prefix(&root, "source", "okcrate", false, false);
+        let snap = MigrationSnapshot::capture(
+            "okcrate",
+            &Manifest::load(&source).unwrap().crates["okcrate"],
+        )
+        .unwrap();
+
+        // Mismatch: the entry changed after the snapshot — nothing is
+        // removed, the newer truth stays.
+        let mut m = Manifest::load(&source).unwrap();
+        m.crates.get_mut("okcrate").unwrap().version = "0.2.0".into();
+        m.store(&source).unwrap();
+        assert!(matches!(
+            retire_source(&source, "okcrate", &snap).unwrap(),
+            Retirement::Mismatch
+        ));
+        assert!(
+            source.join("bin/okcrate").is_file(),
+            "mismatch removes nothing"
+        );
+
+        // Match: retired — binary gone, entry gone.
+        let mut m = Manifest::load(&source).unwrap();
+        m.crates.get_mut("okcrate").unwrap().version = "0.1.0".into();
+        m.store(&source).unwrap();
+        assert!(matches!(
+            retire_source(&source, "okcrate", &snap).unwrap(),
+            Retirement::Retired
+        ));
+        assert!(!source.join("bin/okcrate").exists());
+        assert!(
+            !Manifest::load(&source)
+                .unwrap()
+                .crates
+                .contains_key("okcrate")
+        );
+
+        // Already gone: the goal state, nothing to do.
+        assert!(matches!(
+            retire_source(&source, "okcrate", &snap).unwrap(),
+            Retirement::AlreadyGone
+        ));
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -2749,6 +3450,7 @@ mod tests {
             "okcrate",
             None,
             false,
+            PinPolicy::Infer,
             &mut Frontend::Captured {
                 on_line: &mut |k, l| lines.push((k, l.to_owned())),
                 before_placement: &mut || {

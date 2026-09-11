@@ -40,13 +40,15 @@ struct InstallInfo {
 /// read by `command` under cfg(test). A plain synchronized value instead
 /// of mutating `$PATH` — the environment is process-global and other
 /// test threads read it concurrently, which is exactly the unsafety
-/// `std::env::set_var` was made unsafe to spotlight.
-#[cfg(all(test, feature = "tui"))]
+/// `std::env::set_var` was made unsafe to spotlight. Plain cfg(test):
+/// the harness serves the terminal pipeline (migrate) as much as the
+/// captured one, so it must exist with the tui feature off.
+#[cfg(test)]
 static CARGO_PROGRAM: std::sync::RwLock<Option<PathBuf>> = std::sync::RwLock::new(None);
 
 /// Serializes tests that install a fake cargo, so one test's fake never
 /// answers another test's spawn.
-#[cfg(all(test, feature = "tui"))]
+#[cfg(test)]
 static FAKE_CARGO_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// RAII around the fake: holds the serialization lock, installs the
@@ -55,12 +57,12 @@ static FAKE_CARGO_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// without taking this guard would still see an active override; today
 /// no such test exists, and this comment is where that assumption is
 /// written down.
-#[cfg(all(test, feature = "tui"))]
+#[cfg(test)]
 pub(crate) struct FakeCargo {
     _serial: std::sync::MutexGuard<'static, ()>,
 }
 
-#[cfg(all(test, feature = "tui"))]
+#[cfg(test)]
 impl FakeCargo {
     pub(crate) fn install(script: &Path) -> Self {
         let serial = FAKE_CARGO_LOCK
@@ -71,7 +73,7 @@ impl FakeCargo {
     }
 }
 
-#[cfg(all(test, feature = "tui"))]
+#[cfg(test)]
 impl Drop for FakeCargo {
     fn drop(&mut self) {
         *CARGO_PROGRAM.write().unwrap() = None;
@@ -79,7 +81,7 @@ impl Drop for FakeCargo {
 }
 
 fn cargo_program() -> std::ffi::OsString {
-    #[cfg(all(test, feature = "tui"))]
+    #[cfg(test)]
     if let Some(p) = CARGO_PROGRAM.read().unwrap().clone() {
         return p.into_os_string();
     }
