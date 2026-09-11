@@ -838,7 +838,7 @@ impl App {
         // be the first one ever prepared there, ahead of any NeedAuth
         // machinery, and a cold sudo would fail `sudo -n` instead of
         // asking.
-        let escalate = match crate::operation_needs_privilege(policy, prefix) {
+        let escalate = match crate::placement_needs_privilege(policy, prefix) {
             Ok(escalate) => escalate,
             Err(e) => {
                 return Ok(Preflight::Reported(format!("{e:#}")));
@@ -2052,7 +2052,7 @@ impl App {
             return;
         }
         let policy = crate::privileged::Policy::for_prefix(&self.prefix);
-        let escalate = match crate::operation_needs_privilege(policy, &self.prefix) {
+        let escalate = match crate::placement_needs_privilege(policy, &self.prefix) {
             Ok(escalate) => escalate,
             Err(e) => {
                 self.error(&format!("{e:#}"));

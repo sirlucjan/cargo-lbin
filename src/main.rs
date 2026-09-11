@@ -1157,8 +1157,9 @@ fn shadow_warnings(prefix: &Path, bins: &[String]) -> Vec<String> {
 /// everything the pipeline touches: binaries under bin, then the
 /// manifest under the state directory — either alone can be the one
 /// that needs sudo (mixed ownership: a user-writable bin next to a
-/// root-owned share). One answer for the TUI preflight and the
-/// pipeline's own checkpoint gating, so the two cannot drift; a reauth
+/// root-owned share). One answer for the pipeline's own checkpoint
+/// gating and — composed into `placement_needs_privilege` — the TUI
+/// preflight, so the two cannot drift; a reauth
 /// decision keyed to bin alone would skip exactly the case the state
 /// write is about to hit. A missing state directory probes as writable
 /// where the prefix allows creating it — `dir_writable` creates parents
@@ -1185,15 +1186,22 @@ fn state_needs_privilege(policy: privileged::Policy, prefix: &Path) -> Result<bo
             && StateLock::preparation_needs_privilege(prefix)))
 }
 
-/// The whole escalation union, for operations whose write set includes
-/// bin: the build preflight, the in-place removal and the captured
-/// migration's retirement warm-up must never disagree about whether a
-/// prefix asks a password; private copies of this `||` would drift
-/// apart the day one of them learns something. The terminal flavor
-/// never consults it — there, sudo may simply ask.
+/// The escalation union for operations that place or remove under bin
+/// — named for the write set it probes, after `operation_needs_privilege`
+/// proved too broad a name the day pin arrived with a smaller one. The
+/// build preflight, the in-place removal and the captured migration's
+/// retirement warm-up must never disagree about whether a prefix asks a
+/// password; private copies of this `||` would drift apart the day one
+/// of them learns something. The terminal flavor never consults it —
+/// there, sudo may simply ask.
 #[cfg(feature = "tui")]
-fn operation_needs_privilege(policy: privileged::Policy, prefix: &Path) -> Result<bool> {
-    Ok(policy.probe_destination(&prefix.join("bin"))? || state_needs_privilege(policy, prefix)?)
+fn placement_needs_privilege(policy: privileged::Policy, prefix: &Path) -> Result<bool> {
+    // Composed from the canonical bin + state probe, not re-spelled: a
+    // change to install's write set reaches the TUI preflight through
+    // this line, without anyone remembering to mirror it.
+    Ok(install_needs_privilege(policy, prefix)?
+        || (matches!(policy.sudo, privileged::Sudo::Allowed)
+            && StateLock::preparation_needs_privilege(prefix)))
 }
 
 /// Insert `entry` and persist the manifest as one unit: on a failed store the
@@ -2748,7 +2756,7 @@ fn retire_with_frontend(
             // freshness after an arbitrarily long wait would need the
             // NeedAuth roundtrip *under* the lock, a hostage-taking not
             // worth the edge.
-            if operation_needs_privilege(policy, source)? {
+            if placement_needs_privilege(policy, source)? {
                 before_placement(source)?;
             }
             retire_source(source, name, snap, policy, &mut |l| {
