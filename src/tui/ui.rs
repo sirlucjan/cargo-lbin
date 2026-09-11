@@ -420,7 +420,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
 fn draw_help(frame: &mut Frame, area: Rect) {
     let lines = [
         "↑/↓ j/k     select        Tab       Packages / Updates / Pinned",
-        "g / G       first / last  ?         this help",
+        "g/G Home/End first / last ?         this help",
         "",
         "Enter, u    update selected crate (confirmed in the terminal)",
         "U           run update --all: fresh plan from crates.io, not the cache",
@@ -434,8 +434,9 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         "M           migrate every crate (asks first; a queue of single",
         "            migrations, one summary; c cancels the batch)",
         "c           cancel the running build (again, or automatically",
-        "            after ~2s of no effect: SIGKILL); placement, once",
-        "            started, always finishes",
+        "            after ~2s of no effect: SIGKILL); past the placement",
+        "            door a cancel is too late: an install finishes placing,",
+        "            a migration proceeds through its retirement attempt",
         "p           pin / unpin selected crate (held back by update --all)",
         "D           downgrade: pick an older version in the terminal, pinned",
         "r           check crates.io for updates (writes the report)",

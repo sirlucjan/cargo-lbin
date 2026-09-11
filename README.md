@@ -501,7 +501,7 @@ The TUI starts entirely from disk — the manifest and the last `checkupdate` re
 | Key | Action |
 | --- | --- |
 | `↑` / `↓`, `j` / `k` | Move selection |
-| `g` / `G` | First / last row |
+| `g` / `G`, `Home` / `End` | First / last row |
 | `Tab` | Cycle Packages, Updates and Pinned (Shift-Tab cycles back) |
 | `Enter`, `u` | Update the selected crate |
 | `U` | Run a fresh `update --all` |
