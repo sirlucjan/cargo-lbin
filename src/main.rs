@@ -703,6 +703,14 @@ pub(crate) enum Frontend<'a> {
         /// pipeline reports the spawn and the reap through it and asks
         /// it for permission to place.
         control: &'a BuildControl,
+        /// Composed *after* the placement door, when present: the door
+        /// decides ownership of the operation first — a cancel that won
+        /// the race must not so much as probe another prefix for a build
+        /// that is already dying — and only the worker that crossed it
+        /// runs the checkpoint, still ahead of anything committing. This
+        /// is how a captured migration gets its early source
+        /// revalidation; a plain install carries None.
+        checkpoint: Option<&'a mut dyn FnMut() -> Result<()>>,
     },
     /// Keeps the lifetime honest when the tui feature is off.
     #[cfg(not(feature = "tui"))]
@@ -801,7 +809,28 @@ impl Frontend<'_> {
             Frontend::Terminal => Ok(()),
             Frontend::Checkpointed { checkpoint } => checkpoint(),
             #[cfg(feature = "tui")]
-            Frontend::Captured { control, .. } => control.begin_placement(),
+            Frontend::Captured {
+                control,
+                checkpoint,
+                ..
+            } => {
+                // The order is the contract: CAS first, checkpoint
+                // second. The door settles who owns the operation — a
+                // lost race returns the typed cancellation and the
+                // checkpoint is never consulted — and a checkpoint that
+                // passes has still run before the first write anything
+                // would have to roll back, which is exactly where the
+                // migrate contract promises its early revalidation. The
+                // brief window in which a cancel is already TooLate
+                // while the destination is still untouched is the price
+                // of one-way doors, and the checkpoint is nonblocking:
+                // it can only wave the operation through or end it fast.
+                control.begin_placement()?;
+                if let Some(checkpoint) = checkpoint {
+                    checkpoint()?;
+                }
+                Ok(())
+            }
             #[cfg(not(feature = "tui"))]
             Frontend::Never(_) => unreachable!(),
         }
@@ -1199,6 +1228,7 @@ pub(crate) fn tui_install_one(
             on_line,
             before_placement,
             control,
+            checkpoint: None,
         },
     )
 }
@@ -2806,6 +2836,48 @@ mod tests {
 
     #[cfg(feature = "tui")]
     #[test]
+    fn the_door_settles_ownership_before_the_checkpoint_runs() {
+        // A lost race must not so much as probe: the checkpoint of a
+        // cancelled operation is never consulted.
+        let control = BuildControl::new();
+        assert!(matches!(control.request_cancel(), CancelOutcome::Accepted));
+        let mut ran = 0usize;
+        let mut frontend = Frontend::Captured {
+            on_line: &mut |_, _| {},
+            before_placement: &mut || Ok(()),
+            control: &control,
+            checkpoint: Some(&mut || {
+                ran += 1;
+                Ok(())
+            }),
+        };
+        let err = frontend.placement_begins().unwrap_err();
+        assert!(err.downcast_ref::<BuildCancelled>().is_some());
+        let _ = frontend;
+        assert_eq!(ran, 0, "a cancelled operation never probes");
+
+        // The winner runs it, exactly once, after the door.
+        let control = BuildControl::new();
+        let mut ran = 0usize;
+        let mut frontend = Frontend::Captured {
+            on_line: &mut |_, _| {},
+            before_placement: &mut || Ok(()),
+            control: &control,
+            checkpoint: Some(&mut || {
+                ran += 1;
+                Ok(())
+            }),
+        };
+        frontend.placement_begins().unwrap();
+        let _ = frontend;
+        assert_eq!(
+            ran, 1,
+            "the worker that crossed the door runs the checkpoint"
+        );
+    }
+
+    #[cfg(feature = "tui")]
+    #[test]
     fn a_second_cancel_kills_a_term_ignoring_build() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -2844,6 +2916,7 @@ mod tests {
                     on_line: &mut |_, _| {},
                     before_placement: &mut || Ok(()),
                     control: &worker_control,
+                    checkpoint: None,
                 },
             )
         });
@@ -2925,6 +2998,7 @@ mod tests {
                     on_line: &mut |_, _| {},
                     before_placement: &mut || Ok(()),
                     control: &worker_control,
+                    checkpoint: None,
                 },
             )
         });
@@ -3015,6 +3089,7 @@ mod tests {
                     on_line: &mut |_, _| {},
                     before_placement: &mut || Ok(()),
                     control: &worker_control,
+                    checkpoint: None,
                 },
             )
         });
@@ -3091,6 +3166,7 @@ mod tests {
                     on_line: &mut |_, _| {},
                     before_placement: &mut || Ok(()),
                     control: &worker_control,
+                    checkpoint: None,
                 },
             )
         });
@@ -3458,6 +3534,7 @@ mod tests {
                     Ok(())
                 },
                 control: &control,
+                checkpoint: None,
             },
         );
         result.unwrap();
