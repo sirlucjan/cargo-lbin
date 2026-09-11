@@ -826,13 +826,12 @@ impl App {
         // be the first one ever prepared there, ahead of any NeedAuth
         // machinery, and a cold sudo would fail `sudo -n` instead of
         // asking.
-        let escalate = match crate::install_needs_privilege(policy, prefix) {
+        let escalate = match crate::operation_needs_privilege(policy, prefix) {
             Ok(escalate) => escalate,
             Err(e) => {
                 return Ok(Preflight::Reported(format!("{e:#}")));
             }
-        } || (matches!(policy.sudo, crate::privileged::Sudo::Allowed)
-            && StateLock::preparation_needs_privilege(prefix));
+        };
         if !escalate {
             return Ok(Preflight::Ready);
         }
@@ -1977,14 +1976,13 @@ impl App {
     /// a busy prefix is an answer, not a frozen interface.
     fn remove_confirmed(&mut self, name: String) {
         let policy = crate::privileged::Policy::for_prefix(&self.prefix);
-        let escalate = match crate::install_needs_privilege(policy, &self.prefix) {
+        let escalate = match crate::operation_needs_privilege(policy, &self.prefix) {
             Ok(escalate) => escalate,
             Err(e) => {
                 self.error(&format!("{e:#}"));
                 return;
             }
-        } || (matches!(policy.sudo, crate::privileged::Sudo::Allowed)
-            && StateLock::preparation_needs_privilege(&self.prefix));
+        };
         if escalate {
             self.queue(PendingAction::Remove(name));
             return;

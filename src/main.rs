@@ -1153,14 +1153,6 @@ fn shadow_warnings(prefix: &Path, bins: &[String]) -> Vec<String> {
         .collect()
 }
 
-/// Insert `entry` and persist the manifest as one unit: on a failed store the
-/// in-memory manifest is restored to what is on disk.
-///
-/// This invariant — the in-memory manifest always mirrors the last successful
-/// commit — is what makes continuing a batch after a failure sound. Without
-/// it, a store failure for crate A would leave A's new entry in memory, and
-/// the next successful commit (for crate B) would persist A's entry for
-/// binaries that were rolled back or never fully placed.
 /// Will an install into `prefix` need privileged writes? The union over
 /// everything the pipeline touches: binaries under bin, then the
 /// manifest under the state directory — either alone can be the one
@@ -1177,6 +1169,30 @@ fn install_needs_privilege(policy: privileged::Policy, prefix: &Path) -> Result<
         || policy.probe_destination(&prefix.join("share/cargo-lbin"))?)
 }
 
+/// The escalation union every screen-shaped decision consults: the
+/// pipeline's own destinations (bin + state) plus, where escalation is
+/// possible at all, the lock file — the worker's first privileged
+/// touch. One place on purpose: the build preflight, the in-place
+/// removal and the captured migration's retirement warm-up must never
+/// disagree about whether a prefix asks a password; three private
+/// copies of this `||` would drift apart the day one of them learns
+/// something. The terminal flavor never consults it — there, sudo may
+/// simply ask.
+#[cfg(feature = "tui")]
+fn operation_needs_privilege(policy: privileged::Policy, prefix: &Path) -> Result<bool> {
+    Ok(install_needs_privilege(policy, prefix)?
+        || (matches!(policy.sudo, privileged::Sudo::Allowed)
+            && StateLock::preparation_needs_privilege(prefix)))
+}
+
+/// Insert `entry` and persist the manifest as one unit: on a failed store the
+/// in-memory manifest is restored to what is on disk.
+///
+/// This invariant — the in-memory manifest always mirrors the last successful
+/// commit — is what makes continuing a batch after a failure sound. Without
+/// it, a store failure for crate A would leave A's new entry in memory, and
+/// the next successful commit (for crate B) would persist A's entry for
+/// binaries that were rolled back or never fully placed.
 fn commit_entry(
     manifest: &mut Manifest,
     prefix: &Path,
@@ -2684,10 +2700,7 @@ fn retire_with_frontend(
             // freshness after an arbitrarily long wait would need the
             // NeedAuth roundtrip *under* the lock, a hostage-taking not
             // worth the edge.
-            if install_needs_privilege(policy, source)?
-                || (matches!(policy.sudo, privileged::Sudo::Allowed)
-                    && StateLock::preparation_needs_privilege(source))
-            {
+            if operation_needs_privilege(policy, source)? {
                 before_placement(source)?;
             }
             retire_source(source, name, snap, policy, &mut |l| {
