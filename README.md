@@ -390,7 +390,8 @@ cargo lbin migrate --all --to ~/.local --yes
 
 The source is the prefix the command addresses, like every other
 command (`--prefix`/`--user`/`CARGO_LBIN_PREFIX`); the destination is
-always explicit via `--to`. The plan is printed and confirmed before
+always explicit via `--to`. In the TUI, `m` on the selected crate runs
+the same operation toward the other prefix of the known pair. The plan is printed and confirmed before
 anything is built; `--yes` skips the prompt.
 
 The crate is **rebuilt** at the destination — at exactly the installed
@@ -506,6 +507,7 @@ The TUI starts entirely from disk — the manifest and the last `checkupdate` re
 | `U` | Run a fresh `update --all` |
 | `i` | Open the install line (`NAME[@VERSION]... [--locked]`; `@VERSION` pins) |
 | `x` | Remove the selected crate after TUI confirmation |
+| `m` | Migrate the selected crate to the other prefix (asks first; known pair only) |
 | `c` | Cancel the running in-place build (a second `c` sends SIGKILL) |
 | `p` | Pin or unpin the selected crate |
 | `D` | Downgrade the selected crate; the version prompt appears in the terminal |
@@ -536,7 +538,27 @@ escalates to SIGKILL. If the group has not stopped within about two
 seconds of the first cancel, SIGKILL follows automatically: a group
 member holding the build's output pipe can wedge the worker inside a
 read — a partial line with no newline is enough — so the interface does
-not depend on the worker to finish the job. Placement is the exception: once binaries start
+not depend on the worker to finish the job.
+
+`m` migrates the selected crate to the other prefix of the known pair —
+`/usr/local` from `~/.local` or the reverse — after a confirmation that
+names the crate, the version and both prefixes. It is a frontend to
+[`migrate`](#migrate), not a second implementation: the exact version is
+rebuilt at the destination inside the same Build panel, `c` cancels it
+through the same door (a cancel before placement is a complete no-op —
+neither prefix is touched), and once placement begins cancellation no
+longer interrupts it: the migration proceeds through the retirement
+attempt, and anything that fails past that point is reported as an
+incomplete migration, never silently. The plan is frozen when you press
+`m`: what the confirmation shows — name, version, both prefixes — is
+exactly what is revalidated and migrated, and a crate that changed in
+the meantime is refused rather than migrated at a version you never
+confirmed. An incomplete migration — the
+destination committed, the source not retired — is shown in a wrapping
+panel with the full explanation, because that message is the durable
+record. With a custom `--prefix` the "other side" stops being a
+function, so the TUI offers no path picker; the message points to the
+CLI's explicit `--to`. Placement is the exception: once binaries start
 moving into the prefix, the operation always finishes — killing
 `sudo install` between two binaries is not an option, and placement is
 seconds, not minutes. `Ctrl-C` keeps its traditional meaning of "quit",
