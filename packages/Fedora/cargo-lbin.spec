@@ -3,7 +3,7 @@
 Name:           cargo-lbin
 Version:        0.10.0
 Release:        1%{?dist}
-Summary:        Thin cargo-install wrapper targeting /usr/local/bin, crates.io only
+Summary:        Cargo-powered application manager for crates.io command-line binaries
 
 License:        MIT AND Apache-2.0
 URL:            https://github.com/sirlucjan/cargo-lbin
@@ -15,7 +15,7 @@ Requires: cargo
 Requires: rust
 
 %description
-Thin cargo-install wrapper targeting /usr/local/bin, crates.io only
+Cargo-powered application manager for crates.io command-line binaries
 
 %prep
 %autosetup -n cargo-lbin-%{version}

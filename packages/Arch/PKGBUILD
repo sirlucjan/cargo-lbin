@@ -3,7 +3,7 @@
 pkgname=cargo-lbin
 pkgver=0.10.0
 pkgrel=1
-pkgdesc='Thin cargo-install wrapper targeting /usr/local/bin, crates.io only'
+pkgdesc='Cargo-powered application manager for crates.io command-line binaries'
 url='https://github.com/sirlucjan/cargo-lbin'
 arch=('x86_64')
 license=('MIT' 'Apache-2.0')
