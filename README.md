@@ -102,6 +102,8 @@ cargo lbin tui
 | `checkupdate [--json]` | Query crates.io for updates and save a full local report |
 | `update <crate>... [--yes]` | Update explicitly selected managed crates; `--yes` skips confirmation |
 | `update --all [--yes]` | Update every managed crate with an available update; `--yes` skips confirmation |
+| `migrate <crate>... --to <prefix> [--yes]` | Rebuild installed crates under another prefix, then retire them here |
+| `migrate --all --to <prefix> [--yes]` | Migrate every managed crate to another prefix |
 | `search <terms>... [--limit N]` | Find crates by keyword |
 | `info <crate>...` | Show exact-name crate information and installed state |
 | `tui` | Interactive frontend over the same operations, when the `tui` feature is enabled |
@@ -375,6 +377,70 @@ The list is crates.io's, filtered by the same release-relevance policy `update` 
 
 The command is interactive on purpose and has no `--yes`; without a terminal it stops and points at `install NAME@VERSION`, which is what a script that knows the version needs. Any answer other than a listed number, an empty line or `q` is an error, and the command can simply be run again.
 
+## Migrate
+
+Move an installed crate to the other prefix — say, promote a personal
+install to the system, or the reverse:
+
+```bash
+cargo lbin migrate hexyl --user --to /usr/local
+cargo lbin migrate hexyl --to ~/.local
+cargo lbin migrate --all --to ~/.local --yes
+```
+
+The source is the prefix the command addresses, like every other
+command (`--prefix`/`--user`/`CARGO_LBIN_PREFIX`); the destination is
+always explicit via `--to`. The plan is printed and confirmed before
+anything is built; `--yes` skips the prompt.
+
+The crate is **rebuilt** at the destination — at exactly the installed
+version, with `--locked` and the pin carried over — never copied.
+Copying would be the wrong guarantee: a faithful copy faithfully
+promotes whatever the binary has become since it was installed, and
+promoting `~/.local` to `/usr/local` is exactly where that matters.
+Rebuilding re-establishes provenance through the same pipeline as
+`install`. It costs a compilation; that is the price of knowing what
+was placed.
+
+The source entry is retired only after the destination has fully
+committed. `migrate` never waits on one prefix while holding a lock on
+the other, and never holds two exclusive locks; the only overlap is a
+nonblocking shared probe of the source right before the destination
+commits. If the source changes while the destination is building, the
+migration aborts before the destination commits anything; anything that
+goes wrong *after* that commit — the source changed, or its retirement
+itself failed — is reported as an incomplete migration whose message
+says the essential thing up front: the destination installation stands,
+do not re-run blindly (it would be refused), resolve the problem and
+`remove` the source installation. That message is the durable record.
+The `[also in …]` annotation additionally shows a crate present on both
+sides, but only for the known pair of prefixes (`/usr/local` and
+`~/.local`) — for a custom `--to`, the listing of either prefix cannot
+see the other, so keep the command's output; the annotation is a bonus
+where it exists, not the guarantee. No failure or crash ever leaves you
+without one complete working installation: the destination commits
+fully before the source loses anything. A crash mid-retirement can
+leave the source partial — its manifest entry still recorded, some
+binaries already gone — and a plain `remove` on the source cleans up
+such a remainder.
+
+A crate already installed at the destination is refused; there is no
+`--force`. `migrate` will not choose between two versions of the same
+crate — remove the wrong side first, then migrate.
+
+Like `update`, a batch reports each failure and moves on, and the
+command exits non-zero whenever fewer migrations completed than were
+confirmed — a crate left in both prefixes is a *safe* shortfall, but a
+shortfall.
+
+The destination follows the same escalation policy as everything else:
+`sudo` is offered only for the canonical `/usr/local`; any other
+destination must be writable by the invoking user. Note the timing when
+migrating *away* from `/usr/local`: the destination is user-writable, so
+the one privileged step is retiring the source — the password prompt can
+therefore appear only at the end, after the build. A declined or failed
+prompt degrades to an incomplete migration with the destination intact.
+
 ## Remove
 
 Remove one or more managed crates:
@@ -440,6 +506,7 @@ The TUI starts entirely from disk — the manifest and the last `checkupdate` re
 | `U` | Run a fresh `update --all` |
 | `i` | Open the install line (`NAME[@VERSION]... [--locked]`; `@VERSION` pins) |
 | `x` | Remove the selected crate after TUI confirmation |
+| `c` | Cancel the running in-place build (a second `c` sends SIGKILL) |
 | `p` | Pin or unpin the selected crate |
 | `D` | Downgrade the selected crate; the version prompt appears in the terminal |
 | `r` | Run `checkupdate` and refresh the saved report |
@@ -447,6 +514,7 @@ The TUI starts entirely from disk — the manifest and the last `checkupdate` re
 | `1`..`9` | With search results open, pick a visible hit into the install line |
 | `?` | Show help |
 | `q`, `Esc` | Quit from the package list; `Esc` also dismisses transient views/input |
+| `Ctrl-C` | Quit; with a build running, cancel it first and leave once it stops |
 
 Search and update checks run without freezing the list. Search hits are displayed in the details panel; installed hits are marked, and pressing a digit opens the normal install input with that crate name, still editable so `--locked` can be added.
 
@@ -460,7 +528,22 @@ whose count sits in the header at all times, and the footer says how many
 pinned crates are behind. The same split shapes the `r` result line:
 `checked: 1 update(s) available; 1 pinned held back`.
 
-Operations that need Cargo output or a `sudo` password (`install`, `update`, `remove`) temporarily hand the real terminal back to the normal CLI. Cargo diagnostics, the update confirmation and password prompt therefore behave exactly as they do outside the TUI; the interface returns afterwards.
+A single-crate install builds in place, inside its own transient Build panel, with `sudo` credentials validated up front; batch installs, `update`, `remove` and `downgrade` temporarily hand the real terminal back to the normal CLI, where Cargo diagnostics, the update confirmation and password prompts behave exactly as they do outside the TUI, and the interface returns afterwards.
+
+An in-place build can be cancelled: `c` sends SIGTERM to cargo's whole
+process group — every rustc and build script included — and a second `c`
+escalates to SIGKILL. If the group has not stopped within about two
+seconds of the first cancel, SIGKILL follows automatically: a group
+member holding the build's output pipe can wedge the worker inside a
+read — a partial line with no newline is enough — so the interface does
+not depend on the worker to finish the job. Placement is the exception: once binaries start
+moving into the prefix, the operation always finishes — killing
+`sudo install` between two binaries is not an option, and placement is
+seconds, not minutes. `Ctrl-C` keeps its traditional meaning of "quit",
+but with a build running it cancels first and leaves only once the
+worker has been collected, so cargo is never orphaned behind a dead
+pipe. A cancelled build reports as one line — it is the outcome that was
+asked for, not a failure.
 
 ## Prefixes and cache
 
@@ -683,6 +766,7 @@ Keeping the scope small is deliberate. `cargo-lbin` does not try to become anoth
 It currently does **not** provide:
 
 - Git or local-path sources (`--git`, `--path`).
+- Copying binaries between prefixes. `migrate` rebuilds, permanently: a faithful copy can promise "the bytes placed are the bytes opened", but not that those bytes are still the artifact the manifest entry describes — and promoting `~/.local` to `/usr/local` is exactly where that difference matters.
 - Privileged installation into arbitrary custom prefixes.
 - Management of libraries, headers, systemd units, configuration files or other distro integration.
 - A dependency resolver of its own — Cargo remains responsible for builds and dependencies.
