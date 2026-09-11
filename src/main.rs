@@ -2156,9 +2156,11 @@ impl MigrationSnapshot {
 /// error message that hides it invites exactly the wrong reaction (a
 /// blind re-run, which the already-installed refusal would then bounce).
 #[derive(Debug)]
-enum MigrateOutcome {
-    /// Rebuilt at the destination and retired here.
-    Moved,
+pub(crate) enum MigrateOutcome {
+    /// Rebuilt at the destination; `already_retired` says whether the
+    /// source entry was found already gone (someone retired it during
+    /// the build — the goal state, reached by other hands).
+    Moved { already_retired: bool },
     /// The destination committed, but the source was not retired —
     /// changed under the plan, or the retirement itself failed. Both
     /// installs (or the source's remainder) stand; the reason says what
@@ -2226,8 +2228,32 @@ fn cmd_migrate(prefix: &Path, to: &Path, crates: &[String], all: bool, yes: bool
     let mut failed: Vec<&str> = Vec::new();
     for (i, (name, snap)) in snapshots.iter().enumerate() {
         println!("[{}/{total}] {name}", i + 1);
-        match migrate_one(prefix, to, &cache, name, snap) {
-            Ok(MigrateOutcome::Moved) => moved += 1,
+        match migrate_one(
+            prefix,
+            to,
+            &cache,
+            name,
+            snap,
+            &mut MigrateFrontend::Terminal,
+        ) {
+            Ok(MigrateOutcome::Moved { already_retired }) => {
+                // The words live with the caller: migrate_one reports
+                // data, the CLI speaks CLI.
+                if already_retired {
+                    println!(
+                        "migrated {name} {}: already retired from {}",
+                        snap.version,
+                        prefix.display()
+                    );
+                } else {
+                    println!(
+                        "migrated {name} {}: retired from {}",
+                        snap.version,
+                        prefix.display()
+                    );
+                }
+                moved += 1;
+            }
             Ok(MigrateOutcome::Incomplete(reason)) => {
                 eprintln!("warning: incomplete migration: {reason}");
                 incomplete.push(name);
@@ -2266,6 +2292,17 @@ fn cmd_migrate(prefix: &Path, to: &Path, crates: &[String], all: bool, yes: bool
     Ok(())
 }
 
+/// The shapes a migration can speak through — a request, not a
+/// `Frontend`: `migrate_one` owns its early-revalidation checkpoint
+/// (it borrows the snapshot and the source path), so the caller names
+/// the flavor and `migrate_one` assembles the real frontend around its
+/// own checkpoint. Terminal is the CLI, unchanged; Captured is the TUI
+/// driving a migration through the same Build panel, cancel door and
+/// sudo roundtrip as an install.
+pub(crate) enum MigrateFrontend {
+    Terminal,
+}
+
 /// One migration, sequential by design: destination first, source
 /// second. The precise lock property — because "never two locks" would
 /// be a lie by one probe: migrate never *waits* on one prefix while
@@ -2296,6 +2333,7 @@ fn migrate_one(
     cache: &Path,
     name: &str,
     snap: &MigrationSnapshot,
+    frontend: &mut MigrateFrontend,
 ) -> Result<MigrateOutcome> {
     // Phase A: the destination, under its exclusive lock.
     {
@@ -2352,18 +2390,23 @@ fn migrate_one(
         // that with a second store would open a window — and a failure
         // mode — in which the destination is right and the intent is
         // wrong, with the source still standing and a re-run refused.
-        install_and_commit(
-            dest,
-            cache,
-            &mut dest_manifest,
-            name,
-            Some(&snap.version),
-            snap.locked,
-            PinPolicy::Exactly(snap.pinned),
-            &mut Frontend::Checkpointed {
-                checkpoint: &mut checkpoint,
-            },
-        )?;
+        // The same pipeline through the caller's shape: the CLI keeps
+        // Checkpointed, the TUI gets its Build panel and cancel door by
+        // composing the checkpoint behind Captured's placement CAS.
+        match frontend {
+            MigrateFrontend::Terminal => install_and_commit(
+                dest,
+                cache,
+                &mut dest_manifest,
+                name,
+                Some(&snap.version),
+                snap.locked,
+                PinPolicy::Exactly(snap.pinned),
+                &mut Frontend::Checkpointed {
+                    checkpoint: &mut checkpoint,
+                },
+            )?,
+        }
     }
 
     // Phase B: the source, under its exclusive lock — the authoritative
@@ -2372,27 +2415,23 @@ fn migrate_one(
     // and from this line on every failure is an *incomplete migration*
     // whose message must lead with that fact — a bare "migrating foo
     // failed" would read as "nothing happened, run it again", and the
-    // re-run would bounce off the already-installed refusal.
-    match retire_source(source, name, snap) {
-        Ok(Retirement::Retired) => {
-            println!(
-                "migrated {name} {}: retired from {}",
-                snap.version,
-                source.display()
-            );
-            Ok(MigrateOutcome::Moved)
-        }
+    // re-run would bounce off the already-installed refusal. Outcomes
+    // carry data, not prose: the caller owns the words (the CLI prints,
+    // the TUI composes), and the Incomplete reason is a payload like
+    // Failed's error, not a success string baked two layers down.
+    let policy = match frontend {
+        MigrateFrontend::Terminal => privileged::Policy::for_prefix(source),
+    };
+    match retire_source(source, name, snap, policy) {
+        Ok(Retirement::Retired) => Ok(MigrateOutcome::Moved {
+            already_retired: false,
+        }),
         // Someone retired it during the build. The destination install
         // was explicitly asked for and stands; there is simply nothing
         // left to retire, which is the goal state.
-        Ok(Retirement::AlreadyGone) => {
-            println!(
-                "migrated {name} {}: already retired from {}",
-                snap.version,
-                source.display()
-            );
-            Ok(MigrateOutcome::Moved)
-        }
+        Ok(Retirement::AlreadyGone) => Ok(MigrateOutcome::Moved {
+            already_retired: true,
+        }),
         Ok(Retirement::Mismatch) => Ok(MigrateOutcome::Incomplete(format!(
             "`{name}` is installed at {} and stays: the entry under {} changed during the \
              migration, so the source is deliberately not retired — `remove` retires \
@@ -2424,7 +2463,12 @@ enum Retirement {
 /// against a manifest freshly loaded under it, then the removal. All
 /// errors bubble; the caller owns the "destination already committed"
 /// framing, because only it knows that context.
-fn retire_source(source: &Path, name: &str, snap: &MigrationSnapshot) -> Result<Retirement> {
+fn retire_source(
+    source: &Path,
+    name: &str,
+    snap: &MigrationSnapshot,
+    policy: privileged::Policy,
+) -> Result<Retirement> {
     let _src_lock = StateLock::acquire(source, &Mode::Exclusive)?;
     let mut src_manifest = Manifest::load(source)?;
     match src_manifest.crates.get(name) {
@@ -2439,7 +2483,7 @@ fn retire_source(source: &Path, name: &str, snap: &MigrationSnapshot) -> Result<
     let bin_dir = source.join("bin");
     let paths: Vec<PathBuf> = entry.bins.iter().map(|b| bin_dir.join(b)).collect();
     let refs: Vec<&Path> = paths.iter().map(PathBuf::as_path).collect();
-    privileged::remove_files(privileged::Policy::for_prefix(source), &refs)?;
+    privileged::remove_files(policy, &refs)?;
     src_manifest.store(source)?;
     Ok(Retirement::Retired)
 }
@@ -3303,8 +3347,21 @@ mod tests {
             &Manifest::load(&source).unwrap().crates["okcrate"],
         )
         .unwrap();
-        let outcome = migrate_one(&source, &dest, &root.join("cache"), "okcrate", &snap).unwrap();
-        assert!(matches!(outcome, MigrateOutcome::Moved));
+        let outcome = migrate_one(
+            &source,
+            &dest,
+            &root.join("cache"),
+            "okcrate",
+            &snap,
+            &mut MigrateFrontend::Terminal,
+        )
+        .unwrap();
+        assert!(matches!(
+            outcome,
+            MigrateOutcome::Moved {
+                already_retired: false
+            }
+        ));
 
         let dest_manifest = Manifest::load(&dest).unwrap();
         let entry = &dest_manifest.crates["okcrate"];
@@ -3337,7 +3394,15 @@ mod tests {
             &Manifest::load(&source).unwrap().crates["okcrate"],
         )
         .unwrap();
-        migrate_one(&source, &dest, &root.join("cache"), "okcrate", &snap).unwrap();
+        migrate_one(
+            &source,
+            &dest,
+            &root.join("cache"),
+            "okcrate",
+            &snap,
+            &mut MigrateFrontend::Terminal,
+        )
+        .unwrap();
         assert!(
             !Manifest::load(&dest).unwrap().crates["okcrate"].pinned,
             "an unpinned crate arrives unpinned, not auto-pinned by the exact version"
@@ -3357,7 +3422,15 @@ mod tests {
             &Manifest::load(&source).unwrap().crates["okcrate"],
         )
         .unwrap();
-        let err = migrate_one(&source, &dest, &root.join("cache"), "okcrate", &snap).unwrap_err();
+        let err = migrate_one(
+            &source,
+            &dest,
+            &root.join("cache"),
+            "okcrate",
+            &snap,
+            &mut MigrateFrontend::Terminal,
+        )
+        .unwrap_err();
         assert!(
             format!("{err:#}").contains("no --force by design"),
             "the refusal names the policy: {err:#}"
@@ -3411,7 +3484,15 @@ mod tests {
             &Manifest::load(&source).unwrap().crates["okcrate"],
         )
         .unwrap();
-        let err = migrate_one(&source, &dest, &root.join("cache"), "okcrate", &snap).unwrap_err();
+        let err = migrate_one(
+            &source,
+            &dest,
+            &root.join("cache"),
+            "okcrate",
+            &snap,
+            &mut MigrateFrontend::Terminal,
+        )
+        .unwrap_err();
         assert!(
             format!("{err:#}").contains("aborting before the destination commits"),
             "the abort names its moment: {err:#}"
@@ -3449,7 +3530,13 @@ mod tests {
         m.crates.get_mut("okcrate").unwrap().version = "0.2.0".into();
         m.store(&source).unwrap();
         assert!(matches!(
-            retire_source(&source, "okcrate", &snap).unwrap(),
+            retire_source(
+                &source,
+                "okcrate",
+                &snap,
+                privileged::Policy::for_prefix(&source)
+            )
+            .unwrap(),
             Retirement::Mismatch
         ));
         assert!(
@@ -3462,7 +3549,13 @@ mod tests {
         m.crates.get_mut("okcrate").unwrap().version = "0.1.0".into();
         m.store(&source).unwrap();
         assert!(matches!(
-            retire_source(&source, "okcrate", &snap).unwrap(),
+            retire_source(
+                &source,
+                "okcrate",
+                &snap,
+                privileged::Policy::for_prefix(&source)
+            )
+            .unwrap(),
             Retirement::Retired
         ));
         assert!(!source.join("bin/okcrate").exists());
@@ -3475,7 +3568,13 @@ mod tests {
 
         // Already gone: the goal state, nothing to do.
         assert!(matches!(
-            retire_source(&source, "okcrate", &snap).unwrap(),
+            retire_source(
+                &source,
+                "okcrate",
+                &snap,
+                privileged::Policy::for_prefix(&source)
+            )
+            .unwrap(),
             Retirement::AlreadyGone
         ));
         let _ = fs::remove_dir_all(&root);
