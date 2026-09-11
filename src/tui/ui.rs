@@ -329,7 +329,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         " ↑/↓ select · c cancel/escalate · Ctrl-C cancel/quit"
     } else {
         " ↑/↓ select · Tab filter · Enter/u update · U update all · i install · x remove · \
-         m migrate · M migrate all · p pin · D downgrade · r check · s search · ? help · q quit"
+         m migrate · M migrate all · B other prefix · p pin · D downgrade · r check · s search · ? help · q quit"
     };
     frame.render_widget(
         Paragraph::new(Span::styled(keys, Style::default().fg(Color::DarkGray))),
@@ -437,6 +437,8 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         "            after ~2s of no effect: SIGKILL); past the placement",
         "            door a cancel is too late: an install finishes placing,",
         "            a migration proceeds through its retirement attempt",
+        "B           jump to the other prefix (/usr/local <-> ~/.local);",
+        "            the selection follows the crate when it is visible there",
         "p           pin / unpin selected crate (held back by update --all)",
         "D           downgrade: pick an older version in the terminal, pinned",
         "r           check crates.io for updates (writes the report)",

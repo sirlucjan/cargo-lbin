@@ -1800,15 +1800,8 @@ impl App {
                     self.queue(PendingAction::Downgrade(name));
                 }
             }
-            KeyCode::Char('x') => {
-                if let Some(row) = self.selected_row() {
-                    let prompt = format!("remove {} ({})? [y/N]", row.name, row.bins.join(", "));
-                    self.confirm = Some(Confirm::new(
-                        &prompt,
-                        OnConfirm::Terminal(PendingAction::Remove(row.name.clone())),
-                    ));
-                }
-            }
+            KeyCode::Char('x') => self.remove_selected(),
+            KeyCode::Char('B') => self.jump_to_other_prefix(),
             // Migrate the selected crate to the other prefix of the
             // known pair — and only there: with a custom --prefix "the
             // other side" stops being a function, and the TUI does not
@@ -1953,6 +1946,85 @@ impl App {
             dest.display()
         );
         self.confirm = Some(Confirm::new(&prompt, OnConfirm::MigrateAll { dest, plan }));
+    }
+
+    /// `x`: remove the selected crate, after the usual confirmation.
+    fn remove_selected(&mut self) {
+        if let Some(row) = self.selected_row() {
+            let prompt = format!("remove {} ({})? [y/N]", row.name, row.bins.join(", "));
+            self.confirm = Some(Confirm::new(
+                &prompt,
+                OnConfirm::Terminal(PendingAction::Remove(row.name.clone())),
+            ));
+        }
+    }
+
+    /// `B`: jump to the other prefix of the known pair — m/M made the
+    /// pair navigable for crates, B makes it navigable for the person.
+    /// The same symmetric gate, the same one-line answer for anything
+    /// else; no path picker grows here either.
+    fn jump_to_other_prefix(&mut self) {
+        match self.known_pair_dest() {
+            Some(dest) => self.jump_to_prefix(dest),
+            None => self.info(
+                "TUI prefix switching covers the /usr/local <-> ~/.local pair; \
+                 run with --prefix for anything else",
+            ),
+        }
+    }
+
+    /// The mechanics of `B`, separate from its gate so the policy and
+    /// the machinery are each testable alone. Everything transient in
+    /// App — a job above all, but also the queued starts — is anchored
+    /// to `self.prefix`, so the jump refuses while any of it is alive:
+    /// switching under a running check would apply the old prefix's
+    /// results to the new prefix's screen, and every surface would lie.
+    /// The switch commits only on a successful read of the other side —
+    /// a title claiming one prefix over rows read from another would
+    /// lie on every line — and the selection follows the *currently*
+    /// selected crate by name when it is visible on the other side
+    /// under the current filter; otherwise it falls back to the top. No
+    /// stronger promise: a migration's retirement reloads the list and
+    /// moves the selection before B is ever pressed, so "lands on the
+    /// crate just migrated" would hold only sometimes, and a hint that
+    /// holds only sometimes is a lie with good days.
+    fn jump_to_prefix(&mut self, dest: PathBuf) {
+        if self.job.is_some()
+            || self.migrate_batch.is_some()
+            || self.pending_migrate.is_some()
+            || self.pending_build.is_some()
+            || self.pending.is_some()
+        {
+            self.error("an operation is running or queued; finish or cancel it first");
+            return;
+        }
+        let keep = self.selected_name();
+        // reload() dismisses the search panel itself, so the panel's
+        // transactionality is by hand: taken before the attempt,
+        // restored after a rollback's own reload — a jump that did not
+        // happen must not cost the person their hits. On success the
+        // saved panel simply drops, together with the build report:
+        // both were the old prefix's (the hits carry its [installed]
+        // marks, the report describes its operations).
+        let search = self.search_result.take();
+        let back = std::mem::replace(&mut self.prefix, dest);
+        if let Err(e) = self.reload() {
+            let failed = std::mem::replace(&mut self.prefix, back);
+            // Best-effort: this read succeeded moments ago; if the world
+            // broke since, the error below still names the real problem.
+            let _ = self.reload();
+            self.search_result = search;
+            self.error(&format!(
+                "cannot read {}: {e:#} — staying here",
+                failed.display()
+            ));
+            return;
+        }
+        self.build_report = None;
+        self.selected = keep
+            .and_then(|name| self.visible().iter().position(|row| row.name == name))
+            .unwrap_or(0);
+        self.info(&format!("now at {}", self.prefix.display()));
     }
 
     fn on_key_confirm(&mut self, key: KeyEvent) {
@@ -2666,6 +2738,151 @@ mod tests {
         // One-shot: a second pass finds nothing armed and does nothing.
         app.escalate_overdue_cancel();
         let _ = std::fs::remove_dir_all(&prefix);
+    }
+
+    #[test]
+    fn a_jump_swaps_reloads_and_the_selection_follows_the_name() {
+        let root = std::env::temp_dir().join("cargo-lbin-test-tui-jump");
+        let _ = std::fs::remove_dir_all(&root);
+        let here = root.join("here");
+        let there = root.join("there");
+        // foo is pinned here and unpinned there: the asymmetry is what
+        // makes the filter case below test the branch it claims to.
+        for (prefix, crates) in [
+            (&here, vec![("alpha", false), ("foo", true)]),
+            (&there, vec![("foo", false), ("zeta", false)]),
+        ] {
+            std::fs::create_dir_all(prefix.join("bin")).unwrap();
+            std::fs::create_dir_all(prefix.join("share/cargo-lbin")).unwrap();
+            let mut manifest = crate::Manifest::default();
+            for (name, pinned) in crates {
+                manifest.crates.insert(
+                    name.to_owned(),
+                    crate::Entry {
+                        version: "0.1.0".into(),
+                        bins: vec![name.to_owned()],
+                        locked: false,
+                        pinned,
+                    },
+                );
+            }
+            manifest.store(prefix).unwrap();
+        }
+        let mut app = App::new(&here).unwrap();
+        app.reload().unwrap();
+        // Select foo on this side…
+        let pos = app
+            .visible()
+            .iter()
+            .position(|row| row.name == "foo")
+            .unwrap();
+        app.selected = pos;
+        app.jump_to_prefix(there.clone());
+        assert_eq!(app.prefix, there, "the jump committed");
+        // …and the selection followed it to the other side.
+        assert_eq!(
+            app.selected_row().map(|row| row.name.as_str()),
+            Some("foo"),
+            "the selection follows the crate by name"
+        );
+        // A name with no counterpart falls back to the top.
+        let pos = app
+            .visible()
+            .iter()
+            .position(|row| row.name == "zeta")
+            .unwrap();
+        app.selected = pos;
+        app.jump_to_prefix(here.clone());
+        assert_eq!(app.prefix, here);
+        assert_eq!(app.selected, 0, "no counterpart: back to the top");
+        // Visible, not merely existing: under the Pinned filter an
+        // unpinned counterpart does not catch the selection — the
+        // documented word is "visible", and this is why. Order matters
+        // twice for the test to exercise the branch it claims to: the
+        // filter goes on *first* and the position is found under it
+        // (an index carried over from the All view would point past the
+        // Pinned view and selected_name would answer None before the
+        // jump even looks), and foo must be visible-here-hidden-there,
+        // which the pinned-here/unpinned-there seeding above provides.
+        app.filter = Filter::Pinned;
+        let pos = app
+            .visible()
+            .iter()
+            .position(|row| row.name == "foo")
+            .expect("foo is pinned here, so the Pinned view shows it");
+        app.selected = pos;
+        assert_eq!(
+            app.selected_name().as_deref(),
+            Some("foo"),
+            "precondition: the jump will carry a name, not a None — \
+             without this the case degrades to the plain fallback"
+        );
+        app.jump_to_prefix(there.clone());
+        assert_eq!(app.prefix, there);
+        assert_eq!(
+            app.selected, 0,
+            "foo exists there but is not visible under Pinned"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_jump_refuses_while_anything_runs_and_rolls_back_on_a_bad_read() {
+        let root = std::env::temp_dir().join("cargo-lbin-test-tui-jump-guard");
+        let _ = std::fs::remove_dir_all(&root);
+        let here = root.join("here");
+        let broken = root.join("broken");
+        std::fs::create_dir_all(here.join("share/cargo-lbin")).unwrap();
+        std::fs::create_dir_all(here.join("bin")).unwrap();
+        crate::Manifest::default().store(&here).unwrap();
+        std::fs::create_dir_all(broken.join("share/cargo-lbin")).unwrap();
+        std::fs::write(broken.join("share/cargo-lbin/manifest.json"), "not json").unwrap();
+
+        let mut app = App::new(&here).unwrap();
+        app.reload().unwrap();
+
+        // Guarded: with a job alive the prefix stays put.
+        let (_tx, rx) = mpsc::channel();
+        let (auth_tx, _auth_rx) = mpsc::channel();
+        app.job = Some(Job::Build {
+            name: "foo".into(),
+            rx,
+            auth_tx,
+            units_started: 0,
+            current: None,
+            tail: VecDeque::new(),
+            status_note: None,
+            warnings: Vec::new(),
+            started: std::time::Instant::now(),
+            needs_auth: None,
+            control: std::sync::Arc::new(crate::BuildControl::new()),
+            kind: BuildKind::Install,
+            cancel_deadline: None,
+        });
+        app.jump_to_prefix(broken.clone());
+        assert_eq!(app.prefix, here, "a live job holds the prefix in place");
+        app.job = None;
+
+        // Committed only on a successful read: an unreadable other side
+        // reports and rolls back — the search panel included, even
+        // though the rollback's own reload dismisses it in passing.
+        app.search_result = Some(SearchResult {
+            query: "foo".into(),
+            hits: Vec::new(),
+            installed: std::collections::BTreeMap::new(),
+        });
+        app.jump_to_prefix(broken);
+        assert_eq!(app.prefix, here, "a failed read never commits the jump");
+        assert!(
+            app.visible().is_empty(),
+            "the rows still describe `here` (whose manifest is empty), \
+             not the unreadable other side"
+        );
+        assert!(
+            app.search_result.is_some(),
+            "a jump that did not happen does not cost the person their hits"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

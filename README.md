@@ -509,6 +509,7 @@ The TUI starts entirely from disk — the manifest and the last `checkupdate` re
 | `x` | Remove the selected crate after TUI confirmation |
 | `m` | Migrate the selected crate to the other prefix (asks first; known pair only) |
 | `M` | Migrate every crate to the other prefix (asks first; `c` cancels the batch) |
+| `B` | Jump to the other prefix of the known pair; the selection follows the crate |
 | `c` | Cancel the running in-place build (a second `c` sends SIGKILL) |
 | `p` | Pin or unpin the selected crate |
 | `D` | Downgrade the selected crate; the version prompt appears in the terminal |
@@ -560,6 +561,15 @@ panel with the full explanation, because that message is the durable
 record. With a custom `--prefix` the "other side" stops being a
 function, so the TUI offers no path picker; the message points to the
 CLI's explicit `--to`.
+
+`B` jumps the whole interface to the other prefix of the known pair —
+the same gate as `m` and `M`, one line pointing at `--prefix` anywhere
+else. The list, the report age and the `[also in …]` annotations all
+reload for the other side, and the selection follows the currently
+selected crate by name when it is visible there under the current
+filter; otherwise it falls back to the top. The jump refuses while an
+operation is running or queued, and commits only when the other side's
+manifest actually reads.
 
 `M` is `migrate --all` in the same shape: the whole plan is frozen at
 the keypress, confirmed once, and executed as a queue of the very same
