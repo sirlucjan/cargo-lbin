@@ -592,6 +592,19 @@ impl App {
             .collect()
     }
 
+    /// Is a build job (install or migrate) running right now? The
+    /// footer asks: while one runs, `c` is the key that matters and
+    /// most of the list keys bounce off "another operation is already
+    /// running" — the hint bar swaps to the build's controls, the same
+    /// way it already does for a confirmation or an input. Controls,
+    /// not promises: the job outlives the placement door, where `c` is
+    /// `TooLate` and Ctrl-C only arms quit-after, so the bar names the
+    /// keys and leaves each press's truthful outcome to the runtime
+    /// message.
+    pub fn build_running(&self) -> bool {
+        matches!(self.job, Some(Job::Build { .. }))
+    }
+
     pub fn selected_row(&self) -> Option<&Row> {
         self.visible().get(self.selected).copied()
     }
@@ -2652,6 +2665,37 @@ mod tests {
         ));
         // One-shot: a second pass finds nothing armed and does nothing.
         app.escalate_overdue_cancel();
+        let _ = std::fs::remove_dir_all(&prefix);
+    }
+
+    #[test]
+    fn build_running_answers_the_footer_truthfully() {
+        let prefix = std::env::temp_dir().join("cargo-lbin-test-tui-footer");
+        let _ = std::fs::remove_dir_all(&prefix);
+        std::fs::create_dir_all(&prefix).unwrap();
+        let mut app = App::new(&prefix).unwrap();
+        assert!(!app.build_running(), "no job, no cancel hint");
+        let (_tx, rx) = mpsc::channel();
+        let (auth_tx, _auth_rx) = mpsc::channel();
+        app.job = Some(Job::Build {
+            name: "foo".into(),
+            rx,
+            auth_tx,
+            units_started: 0,
+            current: None,
+            tail: VecDeque::new(),
+            status_note: None,
+            warnings: Vec::new(),
+            started: std::time::Instant::now(),
+            needs_auth: None,
+            control: std::sync::Arc::new(crate::BuildControl::new()),
+            kind: BuildKind::Install,
+            cancel_deadline: None,
+        });
+        assert!(
+            app.build_running(),
+            "a running build earns the cancel hints"
+        );
         let _ = std::fs::remove_dir_all(&prefix);
     }
 

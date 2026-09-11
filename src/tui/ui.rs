@@ -321,8 +321,15 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         " y confirm · any other key cancel"
     } else if app.input.is_some() {
         " Enter run · Esc cancel"
+    } else if app.build_running() {
+        // Deliberately uncategorical: past the placement door `c`
+        // answers TooLate and Ctrl-C only arms quit-after — the hint
+        // describes the controls, and the truthful per-press outcome is
+        // the runtime message's job (which is typed and never lies).
+        " ↑/↓ select · c cancel/escalate · Ctrl-C cancel/quit"
     } else {
-        " ↑/↓ select · Tab filter · Enter/u update · U update all · i install · x remove · p pin · D downgrade · r check · s search · ? help · q quit"
+        " ↑/↓ select · Tab filter · Enter/u update · U update all · i install · x remove · \
+         m migrate · M migrate all · p pin · D downgrade · r check · s search · ? help · q quit"
     };
     frame.render_widget(
         Paragraph::new(Span::styled(keys, Style::default().fg(Color::DarkGray))),
