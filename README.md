@@ -508,6 +508,7 @@ The TUI starts entirely from disk — the manifest and the last `checkupdate` re
 | `i` | Open the install line (`NAME[@VERSION]... [--locked]`; `@VERSION` pins) |
 | `x` | Remove the selected crate after TUI confirmation |
 | `m` | Migrate the selected crate to the other prefix (asks first; known pair only) |
+| `M` | Migrate every crate to the other prefix (asks first; `c` cancels the batch) |
 | `c` | Cancel the running in-place build (a second `c` sends SIGKILL) |
 | `p` | Pin or unpin the selected crate |
 | `D` | Downgrade the selected crate; the version prompt appears in the terminal |
@@ -558,7 +559,20 @@ destination committed, the source not retired — is shown in a wrapping
 panel with the full explanation, because that message is the durable
 record. With a custom `--prefix` the "other side" stops being a
 function, so the TUI offers no path picker; the message points to the
-CLI's explicit `--to`. Placement is the exception: once binaries start
+CLI's explicit `--to`.
+
+`M` is `migrate --all` in the same shape: the whole plan is frozen at
+the keypress, confirmed once, and executed as a queue of the very same
+single migrations `m` runs — each crate its own unit of work, so a
+member's failure is tallied and the batch moves on, exactly like the
+CLI. The plan is frozen from a fresh view of the prefix at the
+keypress. The summary reports how many migrated; failures, incomplete
+migrations and build warnings land in one report panel with their full
+reasons. `c` cancels the current crate and ends the batch — the
+remaining queue is dropped, never silently continued — and the summary
+says how many were never attempted. A worker that cannot start at all
+(a failed preflight, an uncooperative sudo) ends the batch the same
+way, with the refusal recorded among the failures. Placement is the exception: once binaries start
 moving into the prefix, the operation always finishes — killing
 `sudo install` between two binaries is not an option, and placement is
 seconds, not minutes. `Ctrl-C` keeps its traditional meaning of "quit",
