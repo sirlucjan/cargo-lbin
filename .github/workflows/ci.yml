@@ -32,11 +32,24 @@ jobs:
           toolchain: ${{matrix.rust}}
       - run: cargo build --verbose
       - run: cargo test --verbose
+      # The no-tui half is a build of its own: cfg(not(feature = "tui"))
+      # paths, Frontend::Never, feature-dependent behavior. The local
+      # ritual has always tested both feature sets — the second half
+      # becomes a guarantee here, not a habit.
+      - run: cargo build --verbose --no-default-features
+      - run: cargo test --verbose --no-default-features
 
   clippy:
+    # Deliberately on pull requests too: a denying lint that runs only
+    # after the merge is a horseman who arrives when the battle is over.
+    # Gated through pre_ci like every other blocking job, so a local PR
+    # whose merge tree matches the branch push does not pay for two
+    # identical runs. The beta job below stays advisory and post-merge —
+    # it exists to see the future, not to block the present.
     name: Clippy (MSRV, deny)
+    needs: pre_ci
+    if: needs.pre_ci.outputs.continue
     runs-on: ubuntu-latest
-    if: github.event_name != 'pull_request'
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v5
@@ -45,6 +58,7 @@ jobs:
           toolchain: 1.91.0
           components: clippy
       - run: cargo clippy --tests -- -Dclippy::all -Dclippy::pedantic
+      - run: cargo clippy --tests --no-default-features -- -Dclippy::all -Dclippy::pedantic
 
   clippy_beta:
     name: Clippy (beta, advisory)
