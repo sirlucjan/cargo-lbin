@@ -870,6 +870,10 @@ impl Frontend<'_> {
 /// and commit the manifest — all before the next crate is touched, so a
 /// failure mid-batch never leaves installed files unrecorded.
 ///
+/// Returns the version that was committed — the manifest's new truth,
+/// which for a `None` request is whatever cargo's resolution picked, not
+/// anything the caller could know beforehand.
+///
 /// Each crate gets its own stage directory, wiped before the build and
 /// removed only once the manifest write has succeeded. A shared, persistent stage had two
 /// failure modes: cargo could refuse a build over a stale binary from an
@@ -892,7 +896,7 @@ fn install_and_commit(
     locked: bool,
     pin: PinPolicy,
     frontend: &mut Frontend<'_>,
-) -> Result<()> {
+) -> Result<Version> {
     // Revalidate even though CLI input was already checked: on the update
     // path `name` comes from the manifest, and a hand-edited manifest must
     // not be able to steer the remove_dir_all below via a path-like name.
@@ -1010,6 +1014,11 @@ fn install_and_commit(
         let _ = fs::remove_dir_all(&stage_dir);
     }
     checkpoints?;
+    // The version about to become the manifest's truth, held before
+    // `place_and_commit` consumes `built`: the stage's verified
+    // .crates2.json is the only honest answer to "what was installed" —
+    // for a `None` request nothing upstream knows it.
+    let installed = built.version.clone();
     if let Err(err) = place_and_commit(
         prefix,
         policy,
@@ -1035,7 +1044,7 @@ fn install_and_commit(
         // is empty, i.e. after the last crate of this run.
         let _ = fs::remove_dir(pid_dir);
     }
-    Ok(())
+    Ok(installed)
 }
 
 /// Everything between the first privileged placement and the manifest
@@ -1384,7 +1393,8 @@ pub(crate) fn tui_install_one(
             control,
             checkpoint: None,
         },
-    )
+    )?;
+    Ok(())
 }
 
 fn cmd_install(prefix: &Path, crates: &[String], locked: bool) -> Result<()> {
@@ -2007,7 +2017,8 @@ fn cmd_downgrade(prefix: &Path, name: &str) -> Result<()> {
         locked,
         PinPolicy::Infer,
         &mut Frontend::Terminal,
-    )
+    )?;
+    Ok(())
 }
 
 fn cmd_checkupdate(prefix: &Path, json: bool) -> ExitCode {
@@ -2198,7 +2209,7 @@ fn apply_updates(prefix: &Path, cache: &Path, outdated: &[Checked]) -> Result<()
                     PinPolicy::Infer,
                     &mut Frontend::Terminal,
                 ) {
-                    Ok(()) => updated += 1,
+                    Ok(_) => updated += 1,
                     Err(err) => {
                         eprintln!("error: updating `{}` failed: {err:#}", o.name);
                         failed.push(&o.name);
@@ -2335,10 +2346,16 @@ impl MigrationSnapshot {
 /// blind re-run, which the already-installed refusal would then bounce).
 #[derive(Debug)]
 pub(crate) enum MigrateOutcome {
-    /// Rebuilt at the destination; `already_retired` says whether the
-    /// source entry was found already gone (someone retired it during
-    /// the build — the goal state, reached by other hands).
-    Moved { already_retired: bool },
+    /// Rebuilt at the destination; `version` is what the destination
+    /// actually committed — the stage's verified truth, carried out so
+    /// no caller reports the plan where it means the result.
+    /// `already_retired` says whether the source entry was found
+    /// already gone (someone retired it during the build — the goal
+    /// state, reached by other hands).
+    Moved {
+        already_retired: bool,
+        version: Version,
+    },
     /// The destination committed, but the source was not retired —
     /// changed under the plan, or the retirement itself failed. Both
     /// installs (or the source's remainder) stand; the reason says what
@@ -2427,19 +2444,21 @@ fn cmd_migrate(prefix: &Path, to: &Path, crates: &[String], all: bool, yes: bool
             snap,
             &mut MigrateFrontend::Terminal,
         ) {
-            Ok(MigrateOutcome::Moved { already_retired }) => {
+            Ok(MigrateOutcome::Moved {
+                already_retired,
+                version,
+            }) => {
                 // The words live with the caller: migrate_one reports
-                // data, the CLI speaks CLI.
+                // data, the CLI speaks CLI — and speaks the version the
+                // destination committed, never the plan's.
                 if already_retired {
                     println!(
-                        "migrated {name} {}: already retired from {}",
-                        snap.version,
+                        "migrated {name} {version}: already retired from {}",
                         prefix.display()
                     );
                 } else {
                     println!(
-                        "migrated {name} {}: retired from {}",
-                        snap.version,
+                        "migrated {name} {version}: retired from {}",
                         prefix.display()
                     );
                 }
@@ -2517,7 +2536,7 @@ fn rebuild_at_destination(
     name: &str,
     snap: &MigrationSnapshot,
     frontend: &mut MigrateFrontend<'_>,
-) -> Result<()> {
+) -> Result<Version> {
     let _dest_lock = match frontend {
         MigrateFrontend::Terminal => StateLock::acquire(dest, &Mode::Exclusive)?,
         #[cfg(not(feature = "tui"))]
@@ -2592,7 +2611,7 @@ fn rebuild_at_destination(
     // The same pipeline through the caller's shape: the CLI keeps
     // Checkpointed, the TUI gets its Build panel and cancel door by
     // composing the checkpoint behind Captured's placement CAS.
-    match frontend {
+    let installed = match frontend {
         MigrateFrontend::Terminal => install_and_commit(
             dest,
             cache,
@@ -2627,8 +2646,8 @@ fn rebuild_at_destination(
                 checkpoint: Some(&mut checkpoint),
             },
         )?,
-    }
-    Ok(())
+    };
+    Ok(installed)
 }
 
 /// One migration, sequential by design: destination first, source
@@ -2663,7 +2682,7 @@ fn migrate_one(
     snap: &MigrationSnapshot,
     frontend: &mut MigrateFrontend<'_>,
 ) -> Result<MigrateOutcome> {
-    rebuild_at_destination(source, dest, cache, name, snap, frontend)?;
+    let installed = rebuild_at_destination(source, dest, cache, name, snap, frontend)?;
 
     // Phase B: the source, under its exclusive lock — the authoritative
     // revalidation and the retirement. Nothing here is allowed to
@@ -2680,28 +2699,35 @@ fn migrate_one(
     // contract is "after the destination commit, every failure is an
     // incomplete migration", and a probe that fails a moment after that
     // commit is no exception just because it failed while *asking*
-    // rather than *doing*.
+    // rather than *doing*. The reason names the version the destination
+    // committed: incomplete is precisely the state with two
+    // installations standing, where "what is actually over there" is
+    // the fact the person cleans up by — and this message is its
+    // durable record.
     match retire_with_frontend(source, name, snap, frontend) {
         Ok(Retirement::Retired) => Ok(MigrateOutcome::Moved {
             already_retired: false,
+            version: installed,
         }),
         // Someone retired it during the build. The destination install
         // was explicitly asked for and stands; there is simply nothing
         // left to retire, which is the goal state.
         Ok(Retirement::AlreadyGone) => Ok(MigrateOutcome::Moved {
             already_retired: true,
+            version: installed,
         }),
         Ok(Retirement::Mismatch) => Ok(MigrateOutcome::Incomplete(format!(
-            "`{name}` is installed at {} and stays: the entry under {} changed during the \
-             migration, so the source is deliberately not retired — `remove` retires \
-             whichever side is wrong",
+            "`{name}` {installed} is installed at {} and stays: the entry under {} changed \
+             during the migration, so the source is deliberately not retired — `remove` \
+             retires whichever side is wrong",
             dest.display(),
             source.display()
         ))),
         Err(e) => Ok(MigrateOutcome::Incomplete(format!(
-            "`{name}` is installed at {} and stays; retiring it from {} did not complete: \
-             {e:#} — resolve that and `remove` the source installation, do not re-run the \
-             migration blindly (it will refuse: the destination already has the crate)",
+            "`{name}` {installed} is installed at {} and stays; retiring it from {} did not \
+             complete: {e:#} — resolve that and `remove` the source installation, do not \
+             re-run the migration blindly (it will refuse: the destination already has the \
+             crate)",
             dest.display(),
             source.display()
         ))),
@@ -3668,10 +3694,11 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            outcome,
+            &outcome,
             MigrateOutcome::Moved {
-                already_retired: false
-            }
+                already_retired: false,
+                version,
+            } if version.to_string() == "0.1.0"
         ));
 
         let dest_manifest = Manifest::load(&dest).unwrap();
@@ -3923,10 +3950,11 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            outcome,
+            &outcome,
             MigrateOutcome::Moved {
-                already_retired: false
-            }
+                already_retired: false,
+                version,
+            } if version.to_string() == "0.1.0"
         ));
         assert!(lines > 0, "the captured frontend streamed cargo's lines");
         let entry = &Manifest::load(&dest).unwrap().crates["okcrate"];
