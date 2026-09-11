@@ -1,7 +1,7 @@
 %define _disable_source_fetch 0
 
 Name:           cargo-lbin
-Version:        0.10.0
+Version:        0.10.1
 Release:        1
 Summary:        Cargo-powered application manager for crates.io command-line binaries
 
