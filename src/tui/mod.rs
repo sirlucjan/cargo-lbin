@@ -610,6 +610,18 @@ impl App {
         matches!(self.job, Some(Job::Build { .. }))
     }
 
+    /// Is anything running or queued? The union every in-place mutation
+    /// and the prefix jump consult before touching shared state: a job
+    /// above all, but also the queued starts — a batch between two
+    /// members has an empty job slot and a full queue, and both count.
+    fn anything_running(&self) -> bool {
+        self.job.is_some()
+            || self.migrate_batch.is_some()
+            || self.pending_migrate.is_some()
+            || self.pending_build.is_some()
+            || self.pending.is_some()
+    }
+
     pub fn selected_row(&self) -> Option<&Row> {
         self.visible().get(self.selected).copied()
     }
@@ -1975,6 +1987,18 @@ impl App {
     /// same UI-thread argument as the in-place worker's checkpoints —
     /// a busy prefix is an answer, not a frozen interface.
     fn remove_confirmed(&mut self, name: String) {
+        // The handoff path inherits queue()'s job guard; the in-place
+        // path must refuse for itself, and for the whole running family
+        // — the confirm is reachable mid-build, and an in-place removal
+        // there would race the worker's own placement: the lock is free
+        // while cargo compiles, so the removal would win the lock, drop
+        // the entry and the binaries, and the placement would put them
+        // back — a silently lost removal, exactly the interleaving the
+        // queue guard exists to forbid.
+        if self.anything_running() {
+            self.error("an operation is running or queued; finish or cancel it first");
+            return;
+        }
         let policy = crate::privileged::Policy::for_prefix(&self.prefix);
         let escalate = match crate::operation_needs_privilege(policy, &self.prefix) {
             Ok(escalate) => escalate,
@@ -2032,12 +2056,7 @@ impl App {
     /// crate just migrated" would hold only sometimes, and a hint that
     /// holds only sometimes is a lie with good days.
     fn jump_to_prefix(&mut self, dest: PathBuf) {
-        if self.job.is_some()
-            || self.migrate_batch.is_some()
-            || self.pending_migrate.is_some()
-            || self.pending_build.is_some()
-            || self.pending.is_some()
-        {
+        if self.anything_running() {
             self.error("an operation is running or queued; finish or cancel it first");
             return;
         }
@@ -2970,6 +2989,56 @@ mod tests {
             "the interface owns the words: {}",
             said.text
         );
+
+        // Mid-job the confirm is still reachable, so the in-place path
+        // must refuse for itself: the state lock is free while cargo
+        // compiles, and a removal that won it would be silently undone
+        // by the worker's own placement.
+        let (_tx, rx) = mpsc::channel();
+        let (auth_tx, _auth_rx) = mpsc::channel();
+        app.job = Some(Job::Build {
+            name: "bar".into(),
+            rx,
+            auth_tx,
+            units_started: 0,
+            current: None,
+            tail: VecDeque::new(),
+            status_note: None,
+            warnings: Vec::new(),
+            started: std::time::Instant::now(),
+            needs_auth: None,
+            control: std::sync::Arc::new(crate::BuildControl::new()),
+            kind: BuildKind::Install,
+            cancel_deadline: None,
+        });
+        app.remove_confirmed("bar".into());
+        assert!(
+            prefix.join("bin/bar").exists(),
+            "a running job holds every in-place mutation off the prefix"
+        );
+        app.job = None;
+        app.message = None;
+
+        // The state that earns the union over a bare job check: a batch
+        // between two members has an *empty* job slot and a live queue —
+        // and it must hold the prefix just the same.
+        app.migrate_batch = Some(MigrateBatch {
+            dest: prefix.join("elsewhere"),
+            queue: std::collections::VecDeque::new(),
+            total: 1,
+            moved: 0,
+            warned: Vec::new(),
+            failed: Vec::new(),
+            noticed: Vec::new(),
+            reload_error: None,
+        });
+        app.remove_confirmed("bar".into());
+        assert!(
+            prefix.join("bin/bar").exists(),
+            "a batch with an empty job slot still holds the prefix"
+        );
+        app.migrate_batch = None;
+        app.message = None;
 
         // A held lock is an answer, not a wait: the removal refuses,
         // nothing changes, and the message says busy.
