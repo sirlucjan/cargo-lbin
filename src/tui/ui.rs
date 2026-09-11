@@ -424,6 +424,8 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         "m           migrate selected crate to the other prefix (asks",
         "            first; exact version rebuilt there, retired here;",
         "            /usr/local <-> ~/.local only, custom via CLI --to)",
+        "M           migrate every crate (asks first; a queue of single",
+        "            migrations, one summary; c cancels the batch)",
         "c           cancel the running build (again, or automatically",
         "            after ~2s of no effect: SIGKILL); placement, once",
         "            started, always finishes",

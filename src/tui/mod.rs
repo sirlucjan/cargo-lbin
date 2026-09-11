@@ -187,6 +187,12 @@ enum OnConfirm {
         /// the checkpoint's job to reject.
         snap: crate::MigrationSnapshot,
     },
+    /// `migrate --all`: the whole plan frozen at the keypress, one
+    /// snapshot per row, complete or not at all.
+    MigrateAll {
+        dest: PathBuf,
+        plan: Vec<PendingMigrate>,
+    },
 }
 
 /// Commands that take over the terminal; queued by key handlers and run
@@ -284,6 +290,43 @@ struct PendingMigrate {
     snap: crate::MigrationSnapshot,
 }
 
+/// A confirmed `M`: the CLI's `migrate --all`, as a queue of the very
+/// same single migrations `m` runs — each crate its own unit of work,
+/// its own preflight (a sudo timestamp can expire mid-batch), its own
+/// pass through the Build panel and the cancel door. The batch owns the
+/// tally and the final summary; per-crate panels are suppressed in
+/// favor of one report at the end, which is the CLI's "reported, and
+/// the batch moves on" in the TUI's shape.
+struct MigrateBatch {
+    dest: PathBuf,
+    queue: std::collections::VecDeque<PendingMigrate>,
+    total: usize,
+    moved: usize,
+    /// `(name, lines)` — destination committed, source not retired: the
+    /// full Incomplete reason plus any build warnings of that member.
+    warned: Vec<(String, Vec<String>)>,
+    /// `(name, lines)` — the same diagnostics a single job's failure
+    /// panel gets (error chain, tail excerpt when the chain is terse),
+    /// the authoritative already-installed refusal among them exactly
+    /// as the CLI counts it: a shortfall, not a skip.
+    failed: Vec<(String, Vec<String>)>,
+    /// `(name, warnings)` — members that migrated *fully* but whose
+    /// build spoke warnings: a batch summary must not launder a shadow
+    /// warning into a clean "migrated N of N".
+    noticed: Vec<(String, Vec<String>)>,
+    /// The last mid-batch reload failure, resurfaced at the summary —
+    /// recorded, not discarded.
+    reload_error: Option<String>,
+}
+
+/// Did `start_migrate` actually start a worker? A refusal carries its
+/// reason: the caller — a batch especially — must put it somewhere the
+/// final summary will not overwrite.
+enum StartOutcome {
+    Started,
+    Refused(String),
+}
+
 /// What the escalation preflight found; see `preflight_escalation`.
 enum Preflight {
     /// No escalation ahead, or credentials validated and warm.
@@ -291,8 +334,11 @@ enum Preflight {
     /// sudo validated but does not cache credentials: a captured
     /// `sudo -n` would be asked a question it cannot voice.
     NoCache,
-    /// Something failed and has already been reported to the footer.
-    Reported,
+    /// Something failed; the message is returned, not swallowed — the
+    /// caller decides where it must survive (a footer line for an
+    /// install; the batch's summary panel for a migration, whose later
+    /// summary would overwrite the footer).
+    Reported(String),
 }
 
 /// Where a migration is headed; the UI composes its result lines from
@@ -416,6 +462,9 @@ pub struct App {
     /// A confirmed migration waiting for the run loop, which owns the
     /// terminal the preflight may need for a password.
     pending_migrate: Option<PendingMigrate>,
+    /// A running `M` batch; `finish_build` feeds it and advances the
+    /// queue, `c` on the current crate ends it.
+    migrate_batch: Option<MigrateBatch>,
     pub search_result: Option<SearchResult>,
     /// A build's sticky report pinned to the details panel until dismissed.
     pub build_report: Option<BuildReport>,
@@ -478,6 +527,7 @@ impl App {
             input: None,
             confirm: None,
             pending_migrate: None,
+            migrate_batch: None,
             search_result: None,
             build_report: None,
             pending_build: None,
@@ -649,7 +699,21 @@ impl App {
                 continue;
             }
             if let Some(req) = self.pending_migrate.take() {
-                self.start_migrate(terminal, req)?;
+                let member = req.name.clone();
+                if let StartOutcome::Refused(reason) = self.start_migrate(terminal, req)? {
+                    match self.migrate_batch.as_mut() {
+                        // A batch cannot wait on a worker that never
+                        // existed: the refused member is recorded as a
+                        // failure — with its reason, in the panel, where
+                        // the summary will not overwrite it — and the
+                        // remainder is counted as not attempted.
+                        Some(batch) => {
+                            batch.failed.push((member, vec![reason]));
+                            self.finalize_migrate_batch(Some("aborted"));
+                        }
+                        None => self.error(&reason),
+                    }
+                }
                 continue;
             }
             if matches!(
@@ -751,8 +815,7 @@ impl App {
         let escalate = match crate::install_needs_privilege(policy, prefix) {
             Ok(escalate) => escalate,
             Err(e) => {
-                self.error(&format!("{e:#}"));
-                return Ok(Preflight::Reported);
+                return Ok(Preflight::Reported(format!("{e:#}")));
             }
         } || (matches!(policy.sudo, crate::privileged::Sudo::Allowed)
             && StateLock::preparation_needs_privilege(prefix));
@@ -762,8 +825,7 @@ impl App {
         let fresh = match crate::privileged::credentials_fresh() {
             Ok(fresh) => fresh,
             Err(e) => {
-                self.error(&format!("{e:#}"));
-                return Ok(Preflight::Reported);
+                return Ok(Preflight::Reported(format!("{e:#}")));
             }
         };
         let prefix = prefix.to_path_buf();
@@ -771,8 +833,7 @@ impl App {
             && let Err(e) =
                 Self::suspended(terminal, || crate::privileged::preauthorize(&prefix, true))?
         {
-            self.error(&format!("{e:#}"));
-            return Ok(Preflight::Reported);
+            return Ok(Preflight::Reported(format!("{e:#}")));
         }
         // Right after a successful validation the timestamp should be
         // warm; a sudo that does not cache is detected now, not by the
@@ -780,10 +841,7 @@ impl App {
         match crate::privileged::credentials_fresh() {
             Ok(true) => Ok(Preflight::Ready),
             Ok(false) => Ok(Preflight::NoCache),
-            Err(e) => {
-                self.error(&format!("{e:#}"));
-                Ok(Preflight::Reported)
-            }
+            Err(e) => Ok(Preflight::Reported(format!("{e:#}"))),
         }
     }
 
@@ -827,7 +885,10 @@ impl App {
                 });
                 return Ok(());
             }
-            Preflight::Reported => return Ok(()),
+            Preflight::Reported(message) => {
+                self.error(&message);
+                return Ok(());
+            }
         }
         let (tx, rx) = mpsc::channel();
         let (auth_tx, auth_rx) = mpsc::channel();
@@ -912,7 +973,15 @@ impl App {
     /// roundtrip as an install — the TUI is a frontend to `migrate`,
     /// not a second migrate. The worker reports an outcome; the words
     /// are composed in `finish_build` from the job's own data.
-    fn start_migrate(&mut self, terminal: &mut DefaultTerminal, req: PendingMigrate) -> Result<()> {
+    /// Whether a worker actually started, and if not, why — the reason
+    /// travels back because a running batch must both end (its queue
+    /// cannot wait on a worker that never existed) and *record* the
+    /// refusal where the summary will not overwrite it.
+    fn start_migrate(
+        &mut self,
+        terminal: &mut DefaultTerminal,
+        req: PendingMigrate,
+    ) -> Result<StartOutcome> {
         let PendingMigrate {
             name,
             version,
@@ -920,8 +989,9 @@ impl App {
             snap,
         } = req;
         if self.job.is_some() {
-            self.error("another operation is already running");
-            return Ok(());
+            return Ok(StartOutcome::Refused(
+                "another operation is already running".to_owned(),
+            ));
         }
         // The same invariant as an install: a new in-place attempt
         // supersedes whatever report the last one left up — a stale
@@ -942,13 +1012,13 @@ impl App {
             // No terminal handoff exists for migrate, on purpose; the
             // CLI is the interactive shape.
             Preflight::NoCache => {
-                self.error(
+                return Ok(StartOutcome::Refused(
                     "sudo does not cache credentials here; migrate via the CLI, \
-                     which prompts interactively",
-                );
-                return Ok(());
+                     which prompts interactively"
+                        .to_owned(),
+                ));
             }
-            Preflight::Reported => return Ok(()),
+            Preflight::Reported(message) => return Ok(StartOutcome::Refused(message)),
         }
         let (tx, rx) = mpsc::channel();
         let (auth_tx, auth_rx) = mpsc::channel();
@@ -1025,7 +1095,7 @@ impl App {
             kind: BuildKind::Migrate(Box::new(MigrateTarget { version, dest })),
             cancel_deadline: None,
         });
-        Ok(())
+        Ok(StartOutcome::Started)
     }
 
     /// The worker hit the placement checkpoint with a stale credential
@@ -1137,6 +1207,26 @@ impl App {
         Ok(())
     }
 
+    /// The other prefix of the known pair, when the current prefix is a
+    /// member of it — the gate `m` and `M` share. Symmetric on purpose:
+    /// `known_others` of the current prefix must name exactly one
+    /// candidate *and* that candidate's own view must name us back — a
+    /// custom prefix on a HOME-less system would otherwise pass the
+    /// first half.
+    fn known_pair_dest(&self) -> Option<PathBuf> {
+        let others = crate::prefixes::known_others(&self.prefix);
+        match others.as_slice() {
+            [dest]
+                if crate::prefixes::known_others(dest)
+                    .iter()
+                    .any(|p| p == &self.prefix) =>
+            {
+                Some(dest.clone())
+            }
+            _ => None,
+        }
+    }
+
     /// Advisory precheck for `m`: is the crate already installed at the
     /// destination? Fresh, silent, nonblocking — the same shape as the
     /// pin precheck below, for the same reason: nobody should confirm a
@@ -1219,6 +1309,163 @@ impl App {
         Ok(value)
     }
 
+    /// One batch member finished; tally it, advance the queue or wrap
+    /// up. A cancel ends the whole batch: cancelling one crate and
+    /// silently continuing with the rest would be guessing intent.
+    fn finish_batch_step(
+        &mut self,
+        name: &str,
+        target: &MigrateTarget,
+        outcome: BuildOutcome,
+        tail: &VecDeque<String>,
+        warnings: Vec<String>,
+    ) {
+        // Per-crate reload keeps the list truthful mid-batch; a failure
+        // is recorded on the batch and resurfaces at the summary.
+        let reload_error = self.reload().err().map(|e| format!("{e:#}"));
+        let cancelled = matches!(outcome, BuildOutcome::Cancelled);
+        let (done, total) = {
+            let Some(batch) = self.migrate_batch.as_mut() else {
+                return;
+            };
+            if let Some(e) = reload_error {
+                batch.reload_error = Some(e);
+            }
+            // The same diagnostics contract as a single job, member by
+            // member: a fully successful member's build warnings must
+            // not be laundered by the tally, a terse failure still gets
+            // the tail excerpt, and an Incomplete reason travels with
+            // the warnings its build spoke.
+            match outcome {
+                BuildOutcome::Success => {
+                    batch.moved += 1;
+                    if !warnings.is_empty() {
+                        batch.noticed.push((name.to_owned(), warnings));
+                    }
+                }
+                BuildOutcome::Cancelled => {}
+                BuildOutcome::CompletedWithWarning(reason) => {
+                    let mut lines = vec![crate::text::sanitize(&reason)];
+                    lines.extend(warnings);
+                    batch.warned.push((name.to_owned(), lines));
+                }
+                BuildOutcome::Failed(e) => {
+                    batch
+                        .failed
+                        .push((name.to_owned(), Self::failure_lines(&e, tail)));
+                }
+            }
+            (
+                batch.moved + batch.warned.len() + batch.failed.len(),
+                batch.total,
+            )
+        };
+        if cancelled {
+            self.finalize_migrate_batch(Some("cancelled"));
+            return;
+        }
+        self.info(&format!(
+            "[{done}/{total}] {name} {} processed",
+            target.version
+        ));
+        let next = self
+            .migrate_batch
+            .as_mut()
+            .and_then(|batch| batch.queue.pop_front());
+        match next {
+            Some(req) => self.pending_migrate = Some(req),
+            None => self.finalize_migrate_batch(None),
+        }
+    }
+
+    /// The batch's one summary: counts in the footer, shortfalls in a
+    /// report panel — warnings with their full Incomplete reasons,
+    /// failures with their errors, the already-installed refusal among
+    /// them exactly as the CLI counts it.
+    fn finalize_migrate_batch(&mut self, ended_early: Option<&str>) {
+        let Some(batch) = self.migrate_batch.take() else {
+            return;
+        };
+        let MigrateBatch {
+            dest,
+            queue,
+            total,
+            moved,
+            warned,
+            failed,
+            noticed,
+            reload_error,
+        } = batch;
+        // Everything the tally counted, plus the queue, must add up to
+        // the plan: a member the caller recorded as refused sits in
+        // `failed`, so "not attempted" is exactly what is still queued.
+        let mut summary = format!("migrated {moved} of {total} to {}", dest.display());
+        if let Some(how) = ended_early {
+            let unprocessed = queue.len();
+            summary.push_str(&format!(" ({how}; {unprocessed} not attempted)"));
+        }
+        if warned.is_empty() && failed.is_empty() && noticed.is_empty() && reload_error.is_none() {
+            if ended_early.is_some() {
+                self.warn(&summary);
+            } else {
+                self.info(&summary);
+            }
+            return;
+        }
+        let mut lines = Vec::new();
+        let section = |lines: &mut Vec<String>, header: &str, entries: &[(String, Vec<String>)]| {
+            if entries.is_empty() {
+                return;
+            }
+            if !lines.is_empty() {
+                lines.push(String::new());
+            }
+            lines.push(header.to_owned());
+            for (name, entry_lines) in entries {
+                lines.push(crate::text::sanitize(&format!("  {name}:")));
+                for line in entry_lines {
+                    lines.push(crate::text::sanitize(&format!("    {line}")));
+                }
+            }
+        };
+        section(&mut lines, "failed:", &failed);
+        section(
+            &mut lines,
+            "destination committed, source not retired:",
+            &warned,
+        );
+        section(&mut lines, "migrated, with build warnings:", &noticed);
+        if let Some(e) = reload_error {
+            if !lines.is_empty() {
+                lines.push(String::new());
+            }
+            lines.push(crate::text::sanitize(&format!(
+                "(and a mid-batch list reload failed: {e})"
+            )));
+        }
+        self.build_report = Some(BuildReport {
+            title: format!("migrate --all: {moved} of {total} migrated"),
+            lines,
+            failed: !failed.is_empty(),
+        });
+        self.warn(&format!(
+            "{summary} — details in the panel; Esc/Enter dismisses"
+        ));
+    }
+
+    /// The diagnostics a failure shows, single job and batch member
+    /// alike: the error chain, plus the build's last lines when the
+    /// chain is terse — a placement or commit error carries no tail of
+    /// its own, and the compiler's actual message often lives there.
+    fn failure_lines(e: &anyhow::Error, tail: &VecDeque<String>) -> Vec<String> {
+        let text = format!("{e:#}");
+        let mut lines: Vec<String> = text.lines().map(crate::text::sanitize).collect();
+        if lines.len() <= 1 {
+            lines.extend(tail.iter().rev().take(8).rev().cloned());
+        }
+        lines
+    }
+
     /// A finished captured install: reload, then speak in the pipeline's
     /// own words when it left any — the "installed …" note is more
     /// informative than a generic "finished".
@@ -1237,6 +1484,15 @@ impl App {
             // variants), but a pattern should not lie about the shape.
             BuildKind::Migrate(_) => "migrate",
         };
+        // A batch owns its members' presentation: tallies instead of
+        // per-crate panels, one summary at the end — the CLI's
+        // "reported, and the batch moves on", in the TUI's shape.
+        if self.migrate_batch.is_some()
+            && let BuildKind::Migrate(target) = kind
+        {
+            self.finish_batch_step(name, target, outcome, tail, warnings);
+            return;
+        }
         // A cancelled build ended exactly as asked: no failure panel,
         // no log path — the pipeline wrote no log and removed the stage
         // — one line saying the person's own decision was carried out.
@@ -1337,14 +1593,10 @@ impl App {
                 ));
             }
             BuildOutcome::Failed(e) => {
-                // An anyhow chain carries paths too; same boundary rule.
-                let text = format!("{e:#}");
-                let mut lines: Vec<String> = text.lines().map(crate::text::sanitize).collect();
-                if lines.len() <= 1 {
-                    // A placement or commit error carries no tail of its
-                    // own; give the panel the build's last lines instead.
-                    lines.extend(tail.iter().rev().take(8).rev().cloned());
-                }
+                // An anyhow chain carries paths too; same boundary rule
+                // — shared with the batch, so both surfaces diagnose
+                // identically.
+                let mut lines = Self::failure_lines(&e, tail);
                 // Deliberately no warnings here: they were spoken about
                 // binaries the rollback has since removed — "foo is
                 // shadowed" is not true of an install that did not
@@ -1557,13 +1809,8 @@ impl App {
                 // below needs `&mut self` (it reports through the
                 // footer), and the row is a reference into `self`.
                 if let Some(row) = self.selected_row().cloned() {
-                    let others = crate::prefixes::known_others(&self.prefix);
-                    match others.as_slice() {
-                        [dest]
-                            if crate::prefixes::known_others(dest)
-                                .iter()
-                                .any(|p| p == &self.prefix) =>
-                        {
+                    match self.known_pair_dest() {
+                        Some(dest) => {
                             // The agreed UX for "already on the other
                             // side" is a plain error line, not a sticky
                             // failure panel — decided on a *fresh*
@@ -1579,7 +1826,7 @@ impl App {
                             // authoritative refusal, which then surfaces
                             // as Failed — the race window, accepted for
                             // now over a typed refusal variant.
-                            if self.destination_occupied(dest, &row.name) {
+                            if self.destination_occupied(&dest, &row.name) {
                                 return;
                             }
                             // Frozen here, from the row on screen: the
@@ -1611,17 +1858,76 @@ impl App {
                                 OnConfirm::Migrate {
                                     name: row.name.clone(),
                                     version: row.version.clone(),
-                                    dest: dest.clone(),
+                                    dest,
                                     snap,
                                 },
                             ));
                         }
-                        _ => self.info(
+                        None => self.info(
                             "TUI migrate covers the /usr/local <-> ~/.local pair; \
                              migrate elsewhere via the CLI: cargo lbin migrate NAME --to PREFIX",
                         ),
                     }
                 }
+            }
+            // The whole prefix to the other side: `migrate --all` as a
+            // queue of the exact single migrations `m` runs. The plan is
+            // frozen here, one snapshot per row, complete or not at all
+            // — a plan that silently dropped an unparseable row would
+            // migrate a different set than the person confirmed.
+            KeyCode::Char('M') => {
+                let Some(dest) = self.known_pair_dest() else {
+                    self.info(
+                        "TUI migrate covers the /usr/local <-> ~/.local pair; \
+                         migrate elsewhere via the CLI: cargo lbin migrate --all --to PREFIX",
+                    );
+                    return;
+                };
+                // `--all` means all crates *now*, not all as of the last
+                // reload: a crate installed by another process since
+                // would otherwise be silently absent from the plan, and
+                // no checkpoint can reject a member the plan never had.
+                // (Small `m` is the opposite case on purpose: there the
+                // person confirms exactly the row they are looking at.)
+                // Races *after* this moment are the per-crate
+                // revalidation's job, as ever.
+                if let Err(e) = self.reload() {
+                    self.error(&format!("cannot plan the batch: {e:#}"));
+                    return;
+                }
+                if self.rows.is_empty() {
+                    self.info("nothing to migrate");
+                    return;
+                }
+                let mut plan = Vec::with_capacity(self.rows.len());
+                for row in &self.rows {
+                    match crate::MigrationSnapshot::from_parts(
+                        &row.name,
+                        &row.version,
+                        row.bins.clone(),
+                        row.locked,
+                        row.pinned,
+                    ) {
+                        Ok(snap) => plan.push(PendingMigrate {
+                            name: row.name.clone(),
+                            version: row.version.clone(),
+                            dest: dest.clone(),
+                            snap,
+                        }),
+                        Err(e) => {
+                            self.error(&format!("{e:#}"));
+                            return;
+                        }
+                    }
+                }
+                let prompt = format!(
+                    "migrate all {} crate(s): {} -> {}? exact versions are rebuilt \
+                     there, then retired here; c cancels the batch [y/N]",
+                    plan.len(),
+                    self.prefix.display(),
+                    dest.display()
+                );
+                self.confirm = Some(Confirm::new(&prompt, OnConfirm::MigrateAll { dest, plan }));
             }
             _ => {}
         }
@@ -1646,6 +1952,25 @@ impl App {
                         dest,
                         snap,
                     });
+                }
+                OnConfirm::MigrateAll { dest, plan } => {
+                    let mut queue: std::collections::VecDeque<PendingMigrate> =
+                        plan.into_iter().collect();
+                    let total = queue.len();
+                    let Some(first) = queue.pop_front() else {
+                        return;
+                    };
+                    self.migrate_batch = Some(MigrateBatch {
+                        dest,
+                        queue,
+                        total,
+                        moved: 0,
+                        warned: Vec::new(),
+                        failed: Vec::new(),
+                        noticed: Vec::new(),
+                        reload_error: None,
+                    });
+                    self.pending_migrate = Some(first);
                 }
             }
         } else {
@@ -2314,6 +2639,104 @@ mod tests {
         ));
         // One-shot: a second pass finds nothing armed and does nothing.
         app.escalate_overdue_cancel();
+        let _ = std::fs::remove_dir_all(&prefix);
+    }
+
+    #[test]
+    fn a_batch_tallies_advances_and_a_cancel_ends_it() {
+        let prefix = std::env::temp_dir().join("cargo-lbin-test-tui-batch");
+        let _ = std::fs::remove_dir_all(&prefix);
+        std::fs::create_dir_all(&prefix).unwrap();
+        let mut app = App::new(&prefix).unwrap();
+        let dest = prefix.join("other");
+
+        let pending = |name: &str| PendingMigrate {
+            name: name.into(),
+            version: "0.1.0".into(),
+            dest: dest.clone(),
+            snap: crate::MigrationSnapshot::from_parts(
+                name,
+                "0.1.0",
+                vec![name.into()],
+                false,
+                false,
+            )
+            .unwrap(),
+        };
+        let target = MigrateTarget {
+            version: "0.1.0".into(),
+            dest: dest.clone(),
+        };
+
+        // Success advances the queue into pending_migrate — and a fully
+        // successful member's build warnings are not laundered by the
+        // tally.
+        app.migrate_batch = Some(MigrateBatch {
+            dest: dest.clone(),
+            queue: [pending("bar")].into_iter().collect(),
+            total: 2,
+            moved: 0,
+            warned: Vec::new(),
+            failed: Vec::new(),
+            noticed: Vec::new(),
+            reload_error: None,
+        });
+        let no_tail = VecDeque::new();
+        app.finish_batch_step(
+            "foo",
+            &target,
+            BuildOutcome::Success,
+            &no_tail,
+            vec!["foo shadows something".to_owned()],
+        );
+        assert!(app.pending_migrate.is_some(), "the queue advanced");
+        let batch = app.migrate_batch.as_ref().unwrap();
+        assert_eq!(batch.moved, 1);
+        assert_eq!(batch.noticed.len(), 1, "the shadow warning survived");
+
+        // …a failure on the last member finalizes with a failed panel
+        // that carries the successful member's warning section too…
+        app.pending_migrate = None;
+        app.finish_batch_step(
+            "bar",
+            &target,
+            BuildOutcome::Failed(anyhow::anyhow!("already installed, say")),
+            &no_tail,
+            Vec::new(),
+        );
+        assert!(app.migrate_batch.is_none(), "the batch wrapped up");
+        let report = app.build_report.take().expect("a shortfall gets a panel");
+        assert!(report.failed);
+        assert!(report.title.contains("1 of 2"));
+        assert!(
+            report.lines.iter().any(|l| l.contains("shadows something")),
+            "the successful member's warning reached the summary panel"
+        );
+
+        // …and a cancel ends the batch with the queue dropped, never
+        // silently continued.
+        app.migrate_batch = Some(MigrateBatch {
+            dest: dest.clone(),
+            queue: [pending("baz"), pending("qux")].into_iter().collect(),
+            total: 3,
+            moved: 1,
+            warned: Vec::new(),
+            failed: Vec::new(),
+            noticed: Vec::new(),
+            reload_error: None,
+        });
+        app.finish_batch_step(
+            "bar",
+            &target,
+            BuildOutcome::Cancelled,
+            &no_tail,
+            Vec::new(),
+        );
+        assert!(app.migrate_batch.is_none(), "a cancel ends the whole batch");
+        assert!(
+            app.pending_migrate.is_none(),
+            "nothing was silently continued"
+        );
         let _ = std::fs::remove_dir_all(&prefix);
     }
 
