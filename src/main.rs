@@ -698,7 +698,13 @@ pub(crate) enum Frontend<'a> {
     #[cfg(feature = "tui")]
     Captured {
         on_line: &'a mut dyn FnMut(LineKind, &str),
-        before_placement: &'a mut dyn FnMut() -> Result<()>,
+        /// Called with the prefix the escalation is *for*: one worker
+        /// can revalidate for two different prefixes in one job (a
+        /// migration's destination placement and its source
+        /// retirement), and the auth prompt must name the right one —
+        /// guessing it from job state on the UI side would lie in
+        /// exactly one direction of the pair.
+        before_placement: &'a mut dyn FnMut(&Path) -> Result<()>,
         /// The cancel state machine shared with the UI thread; the
         /// pipeline reports the spawn and the reap through it and asks
         /// it for permission to place.
@@ -840,13 +846,16 @@ impl Frontend<'_> {
     /// re-validation hook when captured — a build can outlive sudo's
     /// credential timestamp. Called only when placement will escalate;
     /// a user-writable prefix never reaches it.
-    fn before_placement(&mut self) -> Result<()> {
+    // `prefix` is consumed only by the tui arm; the parameter is the
+    // contract either way — the site that escalates names its target.
+    #[cfg_attr(not(feature = "tui"), allow(unused_variables))]
+    fn before_placement(&mut self, prefix: &Path) -> Result<()> {
         match self {
             Frontend::Terminal | Frontend::Checkpointed { .. } => Ok(()),
             #[cfg(feature = "tui")]
             Frontend::Captured {
                 before_placement, ..
-            } => before_placement(),
+            } => before_placement(prefix),
             #[cfg(not(feature = "tui"))]
             Frontend::Never(_) => unreachable!(),
         }
@@ -987,7 +996,7 @@ fn install_and_commit(
     // result propagates bare.
     let checkpoints = (|| -> Result<()> {
         if install_needs_privilege(policy, prefix)? {
-            frontend.before_placement()?;
+            frontend.before_placement(prefix)?;
         }
         frontend.placement_begins()
     })();
@@ -1187,6 +1196,39 @@ fn commit_entry(
     Ok(())
 }
 
+/// `migrate_one` for a frontend that owns the screen. The snapshot
+/// arrives *frozen* from the frontend — built from the row at the
+/// keypress, confirmed by the person, never re-taken here: a fresh
+/// snapshot after the `y` could bless a version the person never saw,
+/// and the existing checkpoint already rejects a source that moved on.
+/// The migration runs through `MigrateFrontend::Captured` — the same
+/// Build panel, cancel door, lock policy and sudo roundtrip as an
+/// install. Returns the outcome as data; the UI owns the words.
+#[cfg(feature = "tui")]
+pub(crate) fn tui_migrate_one(
+    source: &Path,
+    dest: &Path,
+    name: &str,
+    snap: &MigrationSnapshot,
+    on_line: &mut dyn FnMut(LineKind, &str),
+    before_placement: &mut dyn FnMut(&Path) -> Result<()>,
+    control: &BuildControl,
+) -> Result<MigrateOutcome> {
+    let cache = cache_dir()?;
+    migrate_one(
+        source,
+        dest,
+        &cache,
+        name,
+        snap,
+        &mut MigrateFrontend::Captured {
+            on_line,
+            before_placement,
+            control,
+        },
+    )
+}
+
 /// One crate for the TUI, end to end: the same locking, pin refusal and
 /// pipeline as `cmd_install`, for a single already-parsed spec, with a
 /// captured frontend. The exclusive lock spans build and placement, as
@@ -1198,7 +1240,7 @@ pub(crate) fn tui_install_one(
     spec: &InstallSpec,
     locked: bool,
     on_line: &mut dyn FnMut(LineKind, &str),
-    before_placement: &mut dyn FnMut() -> Result<()>,
+    before_placement: &mut dyn FnMut(&Path) -> Result<()>,
     control: &BuildControl,
 ) -> Result<()> {
     let cache = cache_dir()?;
@@ -2109,7 +2151,7 @@ enum PinPolicy {
 /// whether it belongs to the protected semantics of a migration —
 /// silently ignoring it would be exactly the kind of guess this command
 /// must never make about state it is about to delete.
-struct MigrationSnapshot {
+pub(crate) struct MigrationSnapshot {
     version: Version,
     bins: Vec<String>,
     locked: bool,
@@ -2117,6 +2159,30 @@ struct MigrationSnapshot {
 }
 
 impl MigrationSnapshot {
+    /// A snapshot from parts a frontend already holds — the TUI's row.
+    /// This is how the plan a person confirms is *frozen*: built at the
+    /// keypress, carried through the confirmation, and handed to the
+    /// worker unchanged, so what was approved is what is revalidated —
+    /// never a fresh snapshot taken after the `y`, which could bless a
+    /// version the person never saw. Exhaustive by listing every field
+    /// for the same reason `capture` destructures exhaustively.
+    #[cfg(feature = "tui")]
+    pub(crate) fn from_parts(
+        name: &str,
+        version: &str,
+        bins: Vec<String>,
+        locked: bool,
+        pinned: bool,
+    ) -> Result<Self> {
+        Ok(Self {
+            version: Version::parse(version)
+                .with_context(|| format!("`{name}` has an unparseable version `{version}`"))?,
+            bins,
+            locked,
+            pinned,
+        })
+    }
+
     fn capture(name: &str, entry: &Entry) -> Result<Self> {
         let Entry {
             version,
@@ -2299,8 +2365,19 @@ fn cmd_migrate(prefix: &Path, to: &Path, crates: &[String], all: bool, yes: bool
 /// own checkpoint. Terminal is the CLI, unchanged; Captured is the TUI
 /// driving a migration through the same Build panel, cancel door and
 /// sudo roundtrip as an install.
-pub(crate) enum MigrateFrontend {
+pub(crate) enum MigrateFrontend<'a> {
     Terminal,
+    /// Keeps the lifetime honest when the tui feature is off — the same
+    /// phantom `Frontend::Never` carries, for the same reason.
+    #[cfg(not(feature = "tui"))]
+    #[allow(dead_code)]
+    Never(std::marker::PhantomData<&'a ()>),
+    #[cfg(feature = "tui")]
+    Captured {
+        on_line: &'a mut dyn FnMut(LineKind, &str),
+        before_placement: &'a mut dyn FnMut(&Path) -> Result<()>,
+        control: &'a BuildControl,
+    },
 }
 
 /// One migration, sequential by design: destination first, source
@@ -2333,11 +2410,26 @@ fn migrate_one(
     cache: &Path,
     name: &str,
     snap: &MigrationSnapshot,
-    frontend: &mut MigrateFrontend,
+    frontend: &mut MigrateFrontend<'_>,
 ) -> Result<MigrateOutcome> {
-    // Phase A: the destination, under its exclusive lock.
+    // Phase A: the destination, under its exclusive lock — acquired
+    // through the flavor's own policy and notice path: a captured
+    // migration must not reach an interactive sudo or print to stderr
+    // beneath the alternate screen through the *lock*, having been so
+    // carefully denied both everywhere else (see `acquire_with`).
     {
-        let _dest_lock = StateLock::acquire(dest, &Mode::Exclusive)?;
+        let _dest_lock = match frontend {
+            MigrateFrontend::Terminal => StateLock::acquire(dest, &Mode::Exclusive)?,
+            #[cfg(not(feature = "tui"))]
+            MigrateFrontend::Never(_) => unreachable!(),
+            #[cfg(feature = "tui")]
+            MigrateFrontend::Captured { on_line, .. } => StateLock::acquire_with(
+                dest,
+                &Mode::Exclusive,
+                privileged::Policy::for_prefix(dest).screen_owned(),
+                &mut |l| on_line(LineKind::Notice, l),
+            )?,
+        };
         let mut dest_manifest = Manifest::load(dest)?;
         if let Some(existing) = dest_manifest.crates.get(name) {
             bail!(
@@ -2356,13 +2448,22 @@ fn migrate_one(
         // only casualty). The authoritative pass runs in phase B under
         // the real exclusive lock; this one only exists to not commit a
         // destination the source has already contradicted.
+        // The probe's policy follows the flavor too: under a screen the
+        // lock preparation may only run `sudo -n`. Its notices stay
+        // silent in both shapes — an advisory read that would rather
+        // say nothing, exactly as `try_acquire_with` documents.
+        let checkpoint_policy = match frontend {
+            MigrateFrontend::Terminal => privileged::Policy::for_prefix(source),
+            #[cfg(not(feature = "tui"))]
+            MigrateFrontend::Never(_) => unreachable!(),
+            #[cfg(feature = "tui")]
+            MigrateFrontend::Captured { .. } => {
+                privileged::Policy::for_prefix(source).screen_owned()
+            }
+        };
         let mut checkpoint = || -> Result<()> {
-            let advisory = StateLock::try_acquire_with(
-                source,
-                &Mode::Shared,
-                privileged::Policy::for_prefix(source),
-                &mut |_| {},
-            )?;
+            let advisory =
+                StateLock::try_acquire_with(source, &Mode::Shared, checkpoint_policy, &mut |_| {})?;
             let Some(_lock) = advisory else {
                 bail!(
                     "source prefix {} is busy; aborting before the destination commits",
@@ -2406,6 +2507,28 @@ fn migrate_one(
                     checkpoint: &mut checkpoint,
                 },
             )?,
+            #[cfg(not(feature = "tui"))]
+            MigrateFrontend::Never(_) => unreachable!(),
+            #[cfg(feature = "tui")]
+            MigrateFrontend::Captured {
+                on_line,
+                before_placement,
+                control,
+            } => install_and_commit(
+                dest,
+                cache,
+                &mut dest_manifest,
+                name,
+                Some(&snap.version),
+                snap.locked,
+                PinPolicy::Exactly(snap.pinned),
+                &mut Frontend::Captured {
+                    on_line: &mut **on_line,
+                    before_placement: &mut **before_placement,
+                    control,
+                    checkpoint: Some(&mut checkpoint),
+                },
+            )?,
         }
     }
 
@@ -2419,10 +2542,13 @@ fn migrate_one(
     // carry data, not prose: the caller owns the words (the CLI prints,
     // the TUI composes), and the Incomplete reason is a payload like
     // Failed's error, not a success string baked two layers down.
-    let policy = match frontend {
-        MigrateFrontend::Terminal => privileged::Policy::for_prefix(source),
-    };
-    match retire_source(source, name, snap, policy) {
+    // Everything from here — the privilege probes included — is one
+    // fallible unit, and every error in it maps to Incomplete: the
+    // contract is "after the destination commit, every failure is an
+    // incomplete migration", and a probe that fails a moment after that
+    // commit is no exception just because it failed while *asking*
+    // rather than *doing*.
+    match retire_with_frontend(source, name, snap, frontend) {
         Ok(Retirement::Retired) => Ok(MigrateOutcome::Moved {
             already_retired: false,
         }),
@@ -2459,6 +2585,60 @@ enum Retirement {
     Mismatch,
 }
 
+/// Phase B assembled for the frontend's shape: policy, lock notices and
+/// the pre-retirement credential revalidation all follow the flavor,
+/// then `retire_source` does the work. All errors bubble; the caller
+/// owns the "destination already committed" framing, because only it
+/// knows that context.
+fn retire_with_frontend(
+    source: &Path,
+    name: &str,
+    snap: &MigrationSnapshot,
+    frontend: &mut MigrateFrontend<'_>,
+) -> Result<Retirement> {
+    match frontend {
+        MigrateFrontend::Terminal => retire_source(
+            source,
+            name,
+            snap,
+            privileged::Policy::for_prefix(source),
+            &mut |l| eprintln!("{l}"),
+        ),
+        #[cfg(not(feature = "tui"))]
+        MigrateFrontend::Never(_) => unreachable!(),
+        #[cfg(feature = "tui")]
+        MigrateFrontend::Captured {
+            on_line,
+            before_placement,
+            ..
+        } => {
+            let policy = privileged::Policy::for_prefix(source).screen_owned();
+            // A retirement that will escalate — for the removal itself
+            // or for preparing the lock file — revalidates credentials
+            // first, through the same roundtrip an install's placement
+            // uses: the build was long, sudo's timestamp may be stale,
+            // and a screen-owned policy cannot prompt. One edge is
+            // accepted deliberately: the revalidation runs *before* the
+            // blocking source lock below, so a wait on someone else's
+            // ten-minute build can outlive the freshly warmed timestamp
+            // and the `sudo -n` removal ends as Incomplete — safe, and
+            // exactly what Incomplete's message covers; guaranteeing
+            // freshness after an arbitrarily long wait would need the
+            // NeedAuth roundtrip *under* the lock, a hostage-taking not
+            // worth the edge.
+            if install_needs_privilege(policy, source)?
+                || (matches!(policy.sudo, privileged::Sudo::Allowed)
+                    && StateLock::preparation_needs_privilege(source))
+            {
+                before_placement(source)?;
+            }
+            retire_source(source, name, snap, policy, &mut |l| {
+                on_line(LineKind::Notice, l);
+            })
+        }
+    }
+}
+
 /// Phase B proper: exclusive source lock, authoritative revalidation
 /// against a manifest freshly loaded under it, then the removal. All
 /// errors bubble; the caller owns the "destination already committed"
@@ -2468,8 +2648,9 @@ fn retire_source(
     name: &str,
     snap: &MigrationSnapshot,
     policy: privileged::Policy,
+    notice: &mut dyn FnMut(&str),
 ) -> Result<Retirement> {
-    let _src_lock = StateLock::acquire(source, &Mode::Exclusive)?;
+    let _src_lock = StateLock::acquire_with(source, &Mode::Exclusive, policy, notice)?;
     let mut src_manifest = Manifest::load(source)?;
     match src_manifest.crates.get(name) {
         Some(entry) if snap.still_matches(entry) => {}
@@ -2888,7 +3069,7 @@ mod tests {
         let mut ran = 0usize;
         let mut frontend = Frontend::Captured {
             on_line: &mut |_, _| {},
-            before_placement: &mut || Ok(()),
+            before_placement: &mut |_| Ok(()),
             control: &control,
             checkpoint: Some(&mut || {
                 ran += 1;
@@ -2905,7 +3086,7 @@ mod tests {
         let mut ran = 0usize;
         let mut frontend = Frontend::Captured {
             on_line: &mut |_, _| {},
-            before_placement: &mut || Ok(()),
+            before_placement: &mut |_| Ok(()),
             control: &control,
             checkpoint: Some(&mut || {
                 ran += 1;
@@ -2958,7 +3139,7 @@ mod tests {
                 PinPolicy::Infer,
                 &mut Frontend::Captured {
                     on_line: &mut |_, _| {},
-                    before_placement: &mut || Ok(()),
+                    before_placement: &mut |_| Ok(()),
                     control: &worker_control,
                     checkpoint: None,
                 },
@@ -3040,7 +3221,7 @@ mod tests {
                 PinPolicy::Infer,
                 &mut Frontend::Captured {
                     on_line: &mut |_, _| {},
-                    before_placement: &mut || Ok(()),
+                    before_placement: &mut |_| Ok(()),
                     control: &worker_control,
                     checkpoint: None,
                 },
@@ -3131,7 +3312,7 @@ mod tests {
                 PinPolicy::Infer,
                 &mut Frontend::Captured {
                     on_line: &mut |_, _| {},
-                    before_placement: &mut || Ok(()),
+                    before_placement: &mut |_| Ok(()),
                     control: &worker_control,
                     checkpoint: None,
                 },
@@ -3208,7 +3389,7 @@ mod tests {
                 PinPolicy::Infer,
                 &mut Frontend::Captured {
                     on_line: &mut |_, _| {},
-                    before_placement: &mut || Ok(()),
+                    before_placement: &mut |_| Ok(()),
                     control: &worker_control,
                     checkpoint: None,
                 },
@@ -3534,7 +3715,8 @@ mod tests {
                 &source,
                 "okcrate",
                 &snap,
-                privileged::Policy::for_prefix(&source)
+                privileged::Policy::for_prefix(&source),
+                &mut |_| {}
             )
             .unwrap(),
             Retirement::Mismatch
@@ -3553,7 +3735,8 @@ mod tests {
                 &source,
                 "okcrate",
                 &snap,
-                privileged::Policy::for_prefix(&source)
+                privileged::Policy::for_prefix(&source),
+                &mut |_| {}
             )
             .unwrap(),
             Retirement::Retired
@@ -3572,11 +3755,173 @@ mod tests {
                 &source,
                 "okcrate",
                 &snap,
-                privileged::Policy::for_prefix(&source)
+                privileged::Policy::for_prefix(&source),
+                &mut |_| {}
             )
             .unwrap(),
             Retirement::AlreadyGone
         ));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(feature = "tui")]
+    #[test]
+    fn a_captured_migration_moves_and_reports_data() {
+        let root = std::env::temp_dir().join("cargo-lbin-test-migrate-captured");
+        let _ = fs::remove_dir_all(&root);
+        let source = seeded_prefix(&root, "source", "okcrate", true, true);
+        let dest = root.join("dest");
+        fs::create_dir_all(dest.join("bin")).unwrap();
+        fs::create_dir_all(dest.join("share/cargo-lbin")).unwrap();
+        let _fake = crate::stage::FakeCargo::install(&staging_fake(&root, "okcrate"));
+
+        let control = BuildControl::new();
+        let mut lines = 0usize;
+        let snap = MigrationSnapshot::capture(
+            "okcrate",
+            &Manifest::load(&source).unwrap().crates["okcrate"],
+        )
+        .unwrap();
+        let outcome = tui_migrate_one(
+            &source,
+            &dest,
+            "okcrate",
+            &snap,
+            &mut |_, _| lines += 1,
+            &mut |_| Ok(()),
+            &control,
+        )
+        .unwrap();
+        assert!(matches!(
+            outcome,
+            MigrateOutcome::Moved {
+                already_retired: false
+            }
+        ));
+        assert!(lines > 0, "the captured frontend streamed cargo's lines");
+        let entry = &Manifest::load(&dest).unwrap().crates["okcrate"];
+        assert!(entry.pinned && entry.locked, "both bits travelled");
+        assert!(
+            !Manifest::load(&source)
+                .unwrap()
+                .crates
+                .contains_key("okcrate"),
+            "retired"
+        );
+        assert!(
+            matches!(control.phase(), BuildPhase::Placement),
+            "the migration crossed the same door an install does"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(feature = "tui")]
+    #[test]
+    fn a_frozen_plan_rejects_a_source_that_moved_on() {
+        // The review scenario: the person confirms 1.2.0, another
+        // process updates the crate before the worker runs. The frozen
+        // snapshot travels; the checkpoint rejects; nothing migrates —
+        // never "confirmed one version, migrated another".
+        let root = std::env::temp_dir().join("cargo-lbin-test-migrate-frozen");
+        let _ = fs::remove_dir_all(&root);
+        let source = seeded_prefix(&root, "source", "okcrate", false, false);
+        let dest = root.join("dest");
+        fs::create_dir_all(dest.join("bin")).unwrap();
+        fs::create_dir_all(dest.join("share/cargo-lbin")).unwrap();
+        let _fake = crate::stage::FakeCargo::install(&staging_fake(&root, "okcrate"));
+
+        // Frozen from the state the person saw…
+        let snap =
+            MigrationSnapshot::from_parts("okcrate", "0.1.0", vec!["okcrate".into()], false, false)
+                .unwrap();
+        // …then the world moves on before the worker starts.
+        let mut m = Manifest::load(&source).unwrap();
+        m.crates.get_mut("okcrate").unwrap().version = "0.2.0".into();
+        m.store(&source).unwrap();
+
+        let control = BuildControl::new();
+        let err = tui_migrate_one(
+            &source,
+            &dest,
+            "okcrate",
+            &snap,
+            &mut |_, _| {},
+            &mut |_| Ok(()),
+            &control,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("aborting before the destination commits"),
+            "the checkpoint rejected the stale plan: {err:#}"
+        );
+        assert!(
+            Manifest::load(&dest).unwrap().crates.is_empty(),
+            "nothing was migrated under a plan nobody confirmed"
+        );
+        assert_eq!(
+            Manifest::load(&source).unwrap().crates["okcrate"].version,
+            "0.2.0",
+            "the source keeps its newer truth"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(feature = "tui")]
+    #[test]
+    fn a_cancelled_migration_touches_neither_prefix() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join("cargo-lbin-test-migrate-cancel");
+        let _ = fs::remove_dir_all(&root);
+        let source = seeded_prefix(&root, "source", "okcrate", false, false);
+        let dest = root.join("dest");
+        fs::create_dir_all(dest.join("bin")).unwrap();
+        fs::create_dir_all(dest.join("share/cargo-lbin")).unwrap();
+
+        let fake_bin = root.join("fakebin");
+        fs::create_dir_all(&fake_bin).unwrap();
+        let script = fake_bin.join("cargo");
+        fs::write(&script, "#!/bin/sh\nsleep 30\n").unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        let _fake = crate::stage::FakeCargo::install(&script);
+
+        let control = std::sync::Arc::new(BuildControl::new());
+        let worker_control = std::sync::Arc::clone(&control);
+        let source_w = source.clone();
+        let dest_w = dest.clone();
+        let snap = MigrationSnapshot::capture(
+            "okcrate",
+            &Manifest::load(&source).unwrap().crates["okcrate"],
+        )
+        .unwrap();
+        let worker = std::thread::spawn(move || {
+            tui_migrate_one(
+                &source_w,
+                &dest_w,
+                "okcrate",
+                &snap,
+                &mut |_, _| {},
+                &mut |_| Ok(()),
+                &worker_control,
+            )
+        });
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(matches!(control.request_cancel(), CancelOutcome::Accepted));
+        let err = worker.join().unwrap().expect_err("cancelled");
+        assert!(
+            err.downcast_ref::<BuildCancelled>().is_some(),
+            "the migration's cancel is the same typed cancellation: {err:#}"
+        );
+        assert!(
+            Manifest::load(&dest).unwrap().crates.is_empty(),
+            "the destination committed nothing"
+        );
+        assert!(
+            Manifest::load(&source)
+                .unwrap()
+                .crates
+                .contains_key("okcrate"),
+            "the source is untouched — a cancelled migration is a no-op"
+        );
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -3628,7 +3973,7 @@ mod tests {
             PinPolicy::Infer,
             &mut Frontend::Captured {
                 on_line: &mut |k, l| lines.push((k, l.to_owned())),
-                before_placement: &mut || {
+                before_placement: &mut |_| {
                     checkpoints += 1;
                     Ok(())
                 },

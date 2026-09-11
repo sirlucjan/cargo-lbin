@@ -53,6 +53,7 @@ const TICK: Duration = Duration::from_millis(100);
 const CANCEL_GRACE: Duration = Duration::from_secs(2);
 
 /// One installed crate as the list shows it.
+#[derive(Clone)]
 pub struct Row {
     pub name: String,
     pub version: String,
@@ -154,7 +155,38 @@ pub struct Input {
 /// A destructive action waiting for a `y`.
 pub struct Confirm {
     pub prompt: String,
-    action: PendingAction,
+    action: OnConfirm,
+}
+
+impl Confirm {
+    /// The one funnel: the prompt is Span-bound like every other line,
+    /// and both builders interpolate strings the TUI does not control —
+    /// binary names from the manifest, prefixes inherited from $HOME.
+    fn new(prompt: &str, action: OnConfirm) -> Self {
+        Self {
+            prompt: crate::text::sanitize(prompt),
+            action,
+        }
+    }
+}
+
+/// What a confirmed `y` triggers: most actions hand the terminal over,
+/// a migration starts an in-place job like an install does.
+enum OnConfirm {
+    Terminal(PendingAction),
+    Migrate {
+        name: String,
+        /// The row's version string, for the result line — display data
+        /// for the same plan the snapshot freezes.
+        version: String,
+        dest: PathBuf,
+        /// The plan, frozen at the keypress from the very row the person
+        /// is looking at. The worker receives *this* snapshot — never a
+        /// fresh one taken after the `y`, which could bless a version
+        /// the person never confirmed; a source that moved on since is
+        /// the checkpoint's job to reject.
+        snap: crate::MigrationSnapshot,
+    },
 }
 
 /// Commands that take over the terminal; queued by key handlers and run
@@ -205,10 +237,13 @@ enum BuildMsg {
     /// Kept past success: a shadowed binary does not stop being
     /// shadowed because the install succeeded.
     Warning(String),
-    /// Placement wants sudo revalidated on a real terminal. The worker
-    /// blocks on the auth channel until the run loop — the only place
-    /// that owns the terminal — answers.
-    NeedAuth,
+    /// A privileged step wants sudo revalidated on a real terminal —
+    /// for the named prefix: one worker can escalate for two prefixes
+    /// in one job (a migration's destination placement, then its source
+    /// retirement), and the prompt must name the one actually asking.
+    /// The worker blocks on the auth channel until the run loop — the
+    /// only place that owns the terminal — answers.
+    NeedAuth(PathBuf),
     /// The pipeline finished, one way or the other — classified by the
     /// worker, where the error itself is at hand: the UI must not guess
     /// "cancelled" from a phase flag that a late `c` can set an instant
@@ -219,11 +254,52 @@ enum BuildMsg {
 /// How a build ended. `Cancelled` is a real outcome of the pipeline
 /// (the `BuildCancelled` marker travelling up as an error), not a UI
 /// interpretation: a cancelled build writes no failure log and leaves
-/// no stage behind.
+/// no stage behind. `CompletedWithWarning` is a job whose build
+/// succeeded but whose follow-through did not finish as asked — the
+/// name is deliberately generic: the payload owns the specifics, and
+/// the protocol does not learn any one operation's vocabulary.
 enum BuildOutcome {
     Success,
     Cancelled,
+    CompletedWithWarning(String),
     Failed(anyhow::Error),
+}
+
+/// What the job is building toward. The UI composes its result lines
+/// from this data — the worker reports outcomes, never prose.
+enum BuildKind {
+    Install,
+    /// Boxed: `Job::Build` is already the enum's largest variant, and
+    /// the target rides in every build job regardless of kind — an
+    /// inline payload here is dead weight on every install.
+    Migrate(Box<MigrateTarget>),
+}
+
+/// A confirmed migration on its way to `start_migrate`, carried through
+/// the run loop because the destination preflight may need the terminal.
+struct PendingMigrate {
+    name: String,
+    version: String,
+    dest: PathBuf,
+    snap: crate::MigrationSnapshot,
+}
+
+/// What the escalation preflight found; see `preflight_escalation`.
+enum Preflight {
+    /// No escalation ahead, or credentials validated and warm.
+    Ready,
+    /// sudo validated but does not cache credentials: a captured
+    /// `sudo -n` would be asked a question it cannot voice.
+    NoCache,
+    /// Something failed and has already been reported to the footer.
+    Reported,
+}
+
+/// Where a migration is headed; the UI composes its result lines from
+/// this.
+struct MigrateTarget {
+    version: String,
+    dest: PathBuf,
 }
 
 /// A build's sticky report, held in the details panel until dismissed.
@@ -275,12 +351,16 @@ enum Job {
         /// the clock answers "how long has this operation been running",
         /// not "how long has cargo been compiling".
         started: std::time::Instant,
-        /// Set by `poll_job` when the worker asked for revalidation;
-        /// answered by the run loop, which owns the terminal.
-        needs_auth: bool,
+        /// Set by `poll_job` when the worker asked for revalidation —
+        /// carrying the prefix the escalation is for; answered by the
+        /// run loop, which owns the terminal.
+        needs_auth: Option<PathBuf>,
         /// The cancel state machine shared with the worker: `c` and
         /// Ctrl-C talk to the build through this and nothing else.
         control: std::sync::Arc<crate::BuildControl>,
+        /// What is being built toward; the result lines are composed
+        /// from this.
+        kind: BuildKind,
         /// When the grace period of an accepted cancel runs out; armed
         /// by the first Accepted, one-shot. The run loop escalates to
         /// SIGKILL when it passes, because the worker cannot be trusted
@@ -333,6 +413,9 @@ pub struct App {
     pub message: Option<Message>,
     pub input: Option<Input>,
     pub confirm: Option<Confirm>,
+    /// A confirmed migration waiting for the run loop, which owns the
+    /// terminal the preflight may need for a password.
+    pending_migrate: Option<PendingMigrate>,
     pub search_result: Option<SearchResult>,
     /// A build's sticky report pinned to the details panel until dismissed.
     pub build_report: Option<BuildReport>,
@@ -394,6 +477,7 @@ impl App {
             message: None,
             input: None,
             confirm: None,
+            pending_migrate: None,
             search_result: None,
             build_report: None,
             pending_build: None,
@@ -564,10 +648,14 @@ impl App {
                 self.start_build(terminal, &spec, locked)?;
                 continue;
             }
+            if let Some(req) = self.pending_migrate.take() {
+                self.start_migrate(terminal, req)?;
+                continue;
+            }
             if matches!(
                 &self.job,
                 Some(Job::Build {
-                    needs_auth: true,
+                    needs_auth: Some(_),
                     ..
                 })
             ) {
@@ -643,6 +731,62 @@ impl App {
         Ok(())
     }
 
+    /// What the escalation preflight found for one prefix; both captured
+    /// workflows (install, migrate) run it before spawning a worker, and
+    /// each maps the outcomes to what it can offer.
+    fn preflight_escalation(
+        &mut self,
+        terminal: &mut DefaultTerminal,
+        prefix: &Path,
+    ) -> Result<Preflight> {
+        let policy = crate::privileged::Policy::for_prefix(prefix);
+        // The pipeline's own union (bin + state) plus the lock file —
+        // the worker's first privileged touch. Mixed ownership needs the
+        // state term up front; lock preparation is consulted only where
+        // escalation is possible at all — and it must be consulted: for
+        // a migration into /usr/local the destination's state lock may
+        // be the first one ever prepared there, ahead of any NeedAuth
+        // machinery, and a cold sudo would fail `sudo -n` instead of
+        // asking.
+        let escalate = match crate::install_needs_privilege(policy, prefix) {
+            Ok(escalate) => escalate,
+            Err(e) => {
+                self.error(&format!("{e:#}"));
+                return Ok(Preflight::Reported);
+            }
+        } || (matches!(policy.sudo, crate::privileged::Sudo::Allowed)
+            && StateLock::preparation_needs_privilege(prefix));
+        if !escalate {
+            return Ok(Preflight::Ready);
+        }
+        let fresh = match crate::privileged::credentials_fresh() {
+            Ok(fresh) => fresh,
+            Err(e) => {
+                self.error(&format!("{e:#}"));
+                return Ok(Preflight::Reported);
+            }
+        };
+        let prefix = prefix.to_path_buf();
+        if !fresh
+            && let Err(e) =
+                Self::suspended(terminal, || crate::privileged::preauthorize(&prefix, true))?
+        {
+            self.error(&format!("{e:#}"));
+            return Ok(Preflight::Reported);
+        }
+        // Right after a successful validation the timestamp should be
+        // warm; a sudo that does not cache is detected now, not by the
+        // worker's first `sudo -n`.
+        match crate::privileged::credentials_fresh() {
+            Ok(true) => Ok(Preflight::Ready),
+            Ok(false) => Ok(Preflight::NoCache),
+            Err(e) => {
+                self.error(&format!("{e:#}"));
+                Ok(Preflight::Reported)
+            }
+        }
+    }
+
     /// A captured single-crate install. The run loop calls this because
     /// only it owns the terminal: when placement will need sudo and the
     /// credential timestamp is stale, the initial prompt happens here, up
@@ -668,56 +812,22 @@ impl App {
         // the wrong world. Cleared here, once the attempt is definitely
         // starting, so the terminal-fallback path supersedes it too.
         self.build_report = None;
-        let policy = crate::privileged::Policy::for_prefix(&self.prefix);
-        // The pipeline's own union (bin + state) plus the lock file —
-        // the worker's first privileged touch. Mixed ownership needs the
-        // state term up front; lock preparation is consulted only where
-        // escalation is possible at all.
-        let escalate = match crate::install_needs_privilege(policy, &self.prefix) {
-            Ok(escalate) => escalate,
-            Err(e) => {
-                self.error(&format!("{e:#}"));
-                return Ok(());
-            }
-        } || (matches!(policy.sudo, crate::privileged::Sudo::Allowed)
-            && StateLock::preparation_needs_privilege(&self.prefix));
-        if escalate {
-            let fresh = match crate::privileged::credentials_fresh() {
-                Ok(fresh) => fresh,
-                Err(e) => {
-                    self.error(&format!("{e:#}"));
-                    return Ok(());
-                }
-            };
-            let prefix = self.prefix.clone();
-            if !fresh
-                && let Err(e) =
-                    Self::suspended(terminal, || crate::privileged::preauthorize(&prefix, true))?
-            {
-                self.error(&format!("{e:#}"));
-                return Ok(());
-            }
+        match self.preflight_escalation(terminal, &self.prefix.clone())? {
+            Preflight::Ready => {}
             // Captured placement runs `sudo -n`, so a sudo that does not
             // cache credentials (timestamp_timeout=0, per-TTY quirks)
-            // would be asked a question it cannot voice. Detect that now
-            // — right after a successful validation the timestamp should
-            // be warm — and hand the terminal over the old way instead
-            // of starting a build that must end in an error.
-            match crate::privileged::credentials_fresh() {
-                Ok(true) => {}
-                Ok(false) => {
-                    self.info("sudo does not cache credentials here; handing the terminal over");
-                    self.pending = Some(PendingAction::Install {
-                        crates: vec![raw_spec.to_owned()],
-                        locked,
-                    });
-                    return Ok(());
-                }
-                Err(e) => {
-                    self.error(&format!("{e:#}"));
-                    return Ok(());
-                }
+            // would be asked a question it cannot voice. Install has an
+            // old way to fall back to: hand the terminal over instead of
+            // starting a build that must end in an error.
+            Preflight::NoCache => {
+                self.info("sudo does not cache credentials here; handing the terminal over");
+                self.pending = Some(PendingAction::Install {
+                    crates: vec![raw_spec.to_owned()],
+                    locked,
+                });
+                return Ok(());
             }
+            Preflight::Reported => return Ok(()),
         }
         let (tx, rx) = mpsc::channel();
         let (auth_tx, auth_rx) = mpsc::channel();
@@ -736,7 +846,7 @@ impl App {
                 &mut |k: crate::LineKind, l: &str| {
                     let _ = line_tx.send(build_msg(k, l));
                 },
-                &mut || {
+                &mut |escalating: &Path| {
                     // A cancelled build must not ask anyone for a
                     // password: refuse here instead of raising NeedAuth
                     // for an install that will never place. The run
@@ -749,7 +859,7 @@ impl App {
                         // fresh and placement proceeds without a word.
                         Ok(true) => Ok(()),
                         Ok(false) => {
-                            let _ = worker_tx.send(BuildMsg::NeedAuth);
+                            let _ = worker_tx.send(BuildMsg::NeedAuth(escalating.to_path_buf()));
                             match auth_rx.recv() {
                                 Ok(true) => Ok(()),
                                 // A denial that answers a cancel *is*
@@ -789,8 +899,130 @@ impl App {
             status_note: None,
             warnings: Vec::new(),
             started: std::time::Instant::now(),
-            needs_auth: false,
+            needs_auth: None,
             control,
+            kind: BuildKind::Install,
+            cancel_deadline: None,
+        });
+        Ok(())
+    }
+
+    /// Start an in-place migration of `name` to `dest`: the same
+    /// Job::Build, gauge, cancel door, dead-man switch and sudo
+    /// roundtrip as an install — the TUI is a frontend to `migrate`,
+    /// not a second migrate. The worker reports an outcome; the words
+    /// are composed in `finish_build` from the job's own data.
+    fn start_migrate(&mut self, terminal: &mut DefaultTerminal, req: PendingMigrate) -> Result<()> {
+        let PendingMigrate {
+            name,
+            version,
+            dest,
+            snap,
+        } = req;
+        if self.job.is_some() {
+            self.error("another operation is already running");
+            return Ok(());
+        }
+        // The same invariant as an install: a new in-place attempt
+        // supersedes whatever report the last one left up — a stale
+        // "install foo failed" must not sit over a fresh migration of
+        // bar, and a cancelled outcome returns early without reaching
+        // any later cleanup.
+        self.build_report = None;
+        // The destination's preflight, before the worker exists: its
+        // state lock may be the first ever prepared under /usr/local,
+        // ahead of any NeedAuth roundtrip — a cold sudo must be asked
+        // here, on the suspended terminal, not fail `sudo -n` in the
+        // dark. The source deliberately keeps its late, in-flight
+        // revalidation instead: the prompt-at-the-end timing is
+        // documented, and warming its timestamp before a long build
+        // would buy nothing.
+        match self.preflight_escalation(terminal, &dest)? {
+            Preflight::Ready => {}
+            // No terminal handoff exists for migrate, on purpose; the
+            // CLI is the interactive shape.
+            Preflight::NoCache => {
+                self.error(
+                    "sudo does not cache credentials here; migrate via the CLI, \
+                     which prompts interactively",
+                );
+                return Ok(());
+            }
+            Preflight::Reported => return Ok(()),
+        }
+        let (tx, rx) = mpsc::channel();
+        let (auth_tx, auth_rx) = mpsc::channel();
+        let control = std::sync::Arc::new(crate::BuildControl::new());
+        let worker_control = std::sync::Arc::clone(&control);
+        let source = self.prefix.clone();
+        let dest_w = dest.clone();
+        let worker_name = name.clone();
+        let worker_tx = tx.clone();
+        std::thread::spawn(move || {
+            let line_tx = worker_tx.clone();
+            let control = worker_control;
+            let result = crate::tui_migrate_one(
+                &source,
+                &dest_w,
+                &worker_name,
+                &snap,
+                &mut |k: crate::LineKind, l: &str| {
+                    let _ = line_tx.send(build_msg(k, l));
+                },
+                &mut |escalating: &Path| {
+                    // The same auth roundtrip as an install; a cancelled
+                    // job must not ask anyone for a password, and a
+                    // denial that answers a cancel is the cancel.
+                    if control.cancelled() {
+                        return Err(anyhow::Error::new(crate::BuildCancelled));
+                    }
+                    match crate::privileged::credentials_fresh() {
+                        Ok(true) => Ok(()),
+                        Ok(false) => {
+                            let _ = worker_tx.send(BuildMsg::NeedAuth(escalating.to_path_buf()));
+                            match auth_rx.recv() {
+                                Ok(true) => Ok(()),
+                                Ok(false) if control.cancelled() => {
+                                    Err(anyhow::Error::new(crate::BuildCancelled))
+                                }
+                                Ok(false) => anyhow::bail!("sudo authentication failed"),
+                                Err(_) => {
+                                    anyhow::bail!("the interface went away mid-authorization")
+                                }
+                            }
+                        }
+                        Err(e) => Err(e),
+                    }
+                },
+                &control,
+            );
+            // Classified once, by type and by data — the UI never
+            // guesses.
+            let outcome = match result {
+                Ok(crate::MigrateOutcome::Moved { .. }) => BuildOutcome::Success,
+                Ok(crate::MigrateOutcome::Incomplete(reason)) => {
+                    BuildOutcome::CompletedWithWarning(reason)
+                }
+                Err(e) if e.downcast_ref::<crate::BuildCancelled>().is_some() => {
+                    BuildOutcome::Cancelled
+                }
+                Err(e) => BuildOutcome::Failed(e),
+            };
+            let _ = tx.send(BuildMsg::Done(outcome));
+        });
+        self.job = Some(Job::Build {
+            name,
+            rx,
+            auth_tx,
+            units_started: 0,
+            current: None,
+            tail: VecDeque::new(),
+            status_note: None,
+            warnings: Vec::new(),
+            started: std::time::Instant::now(),
+            needs_auth: None,
+            control,
+            kind: BuildKind::Migrate(Box::new(MigrateTarget { version, dest })),
             cancel_deadline: None,
         });
         Ok(())
@@ -857,12 +1089,23 @@ impl App {
         }) = &mut self.job
             && control.cancelled()
         {
-            *needs_auth = false;
+            *needs_auth = None;
             let _ = auth_tx.send(false);
             return Ok(());
         }
-        let prefix = self.prefix.clone();
-        let outcome = Self::suspended(terminal, || crate::privileged::preauthorize(&prefix, true))?;
+        // The prefix comes from the request, never from the app: a
+        // migration escalates for its *destination* mid-job while
+        // `self.prefix` is the source, and a prompt naming the wrong
+        // side would lie in exactly one direction of the pair.
+        let Some(target) = self.job.as_mut().and_then(|job| {
+            let Job::Build { needs_auth, .. } = job else {
+                return None;
+            };
+            needs_auth.take()
+        }) else {
+            return Ok(());
+        };
+        let outcome = Self::suspended(terminal, || crate::privileged::preauthorize(&target, true))?;
         let ok = match outcome {
             Ok(()) => match crate::privileged::credentials_fresh() {
                 Ok(true) => true,
@@ -886,16 +1129,41 @@ impl App {
                 false
             }
         };
-        if let Some(Job::Build {
-            auth_tx,
-            needs_auth,
-            ..
-        }) = &mut self.job
-        {
-            *needs_auth = false;
+        if let Some(Job::Build { auth_tx, .. }) = &mut self.job {
+            // `needs_auth` was taken with the target above; only the
+            // answer remains.
             let _ = auth_tx.send(ok);
         }
         Ok(())
+    }
+
+    /// Advisory precheck for `m`: is the crate already installed at the
+    /// destination? Fresh, silent, nonblocking — the same shape as the
+    /// pin precheck below, for the same reason: nobody should confirm a
+    /// migration (or type sudo's password for its preflight) that the
+    /// authoritative refusal will bounce a moment later. A busy lock or
+    /// an unreadable manifest answers "not occupied": advisory means
+    /// the flow proceeds and the backend stays the judge.
+    fn destination_occupied(&mut self, dest: &Path, name: &str) -> bool {
+        let advisory = StateLock::try_acquire_with(
+            dest,
+            &Mode::Shared,
+            crate::privileged::Policy::for_prefix(dest).screen_owned(),
+            &mut |_| {},
+        );
+        if let Ok(Some(_lock)) = advisory
+            && let Ok(manifest) = Manifest::load(dest)
+            && let Some(entry) = manifest.crates.get(name)
+        {
+            self.error(&format!(
+                "{name} is already installed at {} ({}); remove one side first \
+                 (no --force by design)",
+                dest.display(),
+                entry.version
+            ));
+            return true;
+        }
+        false
     }
 
     /// Advisory state check before anyone is asked for a password:
@@ -957,10 +1225,18 @@ impl App {
     fn finish_build(
         &mut self,
         name: &str,
+        kind: &BuildKind,
         outcome: BuildOutcome,
         tail: &VecDeque<String>,
         warnings: Vec<String>,
     ) {
+        let verb = match kind {
+            BuildKind::Install => "install",
+            // Tuple variant, tuple pattern: `Migrate { .. }` would also
+            // parse (a rest pattern in braces is legal on tuple
+            // variants), but a pattern should not lie about the shape.
+            BuildKind::Migrate(_) => "migrate",
+        };
         // A cancelled build ended exactly as asked: no failure panel,
         // no log path — the pipeline wrote no log and removed the stage
         // — one line saying the person's own decision was carried out.
@@ -970,7 +1246,7 @@ impl App {
         // phase flag: a cancel that lost every race arrives here as the
         // Success or Failed it truly was on disk.
         if matches!(outcome, BuildOutcome::Cancelled) {
-            self.info(&format!("install {name} cancelled"));
+            self.info(&format!("{verb} {name} cancelled"));
             return;
         }
         // The pipeline's error outranks a reload error: the tail and the
@@ -981,12 +1257,26 @@ impl App {
         match outcome {
             BuildOutcome::Cancelled => unreachable!("returned above"),
             BuildOutcome::Success => {
-                let note = tail
-                    .iter()
-                    .rev()
-                    .find(|l| l.starts_with("installed "))
-                    .cloned()
-                    .unwrap_or_else(|| format!("install {name} finished"));
+                // Composed from the job's data, not fished out of the
+                // pipeline's prose: the worker reports outcomes, the UI
+                // owns the words. The install note keeps its historical
+                // shape (the pipeline's own summary line is the best
+                // one-liner it has); the migrate note says what is true
+                // in every success flavor — including a source someone
+                // else already retired — without overclaiming.
+                let note = match kind {
+                    BuildKind::Install => tail
+                        .iter()
+                        .rev()
+                        .find(|l| l.starts_with("installed "))
+                        .cloned()
+                        .unwrap_or_else(|| format!("install {name} finished")),
+                    BuildKind::Migrate(target) => format!(
+                        "migrated {name} {} to {}",
+                        target.version,
+                        target.dest.display()
+                    ),
+                };
                 // A failed reload does not eat the outcome: the install
                 // happened and a shadow warning stays true, so the
                 // report is pinned first and the reload complains after.
@@ -1008,7 +1298,7 @@ impl App {
                         )));
                     }
                     self.build_report = Some(BuildReport {
-                        title: format!("install {name}: warnings"),
+                        title: format!("{verb} {name}: warnings"),
                         lines,
                         failed: false,
                     });
@@ -1016,6 +1306,35 @@ impl App {
                         "{note} — with warnings in the panel; Esc/Enter dismisses"
                     ));
                 }
+            }
+            BuildOutcome::CompletedWithWarning(reason) => {
+                // The build half succeeded and the state on disk has
+                // changed — the reload above already reflects it. The
+                // reason is a payload, shown whole in the panel (which
+                // wraps): it is multi-sentence by design — what stands
+                // where, what not to re-run — and a truncated footer
+                // line must not be its only copy. Not a failure panel:
+                // nothing here is broken, something is unfinished.
+                let mut lines: Vec<String> = vec![crate::text::sanitize(&reason)];
+                if !warnings.is_empty() {
+                    lines.push(String::new());
+                    lines.extend(warnings);
+                }
+                if let Err(e) = &reload {
+                    lines.push(String::new());
+                    lines.push(crate::text::sanitize(&format!(
+                        "(and the list reload failed: {e:#})"
+                    )));
+                }
+                self.build_report = Some(BuildReport {
+                    title: format!("{verb} {name}: completed with a warning"),
+                    lines,
+                    failed: false,
+                });
+                self.warn(&format!(
+                    "{verb} {name} finished with a warning — details in the panel; \
+                     Esc/Enter dismisses"
+                ));
             }
             BuildOutcome::Failed(e) => {
                 // An anyhow chain carries paths too; same boundary rule.
@@ -1218,10 +1537,90 @@ impl App {
             KeyCode::Char('x') => {
                 if let Some(row) = self.selected_row() {
                     let prompt = format!("remove {} ({})? [y/N]", row.name, row.bins.join(", "));
-                    self.confirm = Some(Confirm {
-                        prompt,
-                        action: PendingAction::Remove(row.name.clone()),
-                    });
+                    self.confirm = Some(Confirm::new(
+                        &prompt,
+                        OnConfirm::Terminal(PendingAction::Remove(row.name.clone())),
+                    ));
+                }
+            }
+            // Migrate the selected crate to the other prefix of the
+            // known pair — and only there: with a custom --prefix "the
+            // other side" stops being a function, and the TUI does not
+            // grow a path picker for it; the CLI's explicit --to is the
+            // tool. The gate is symmetric on purpose: `known_others` of
+            // the current prefix must name exactly one candidate *and*
+            // that candidate's own view must name us back — a custom
+            // prefix with HOME unset would otherwise pass the first
+            // half.
+            KeyCode::Char('m') => {
+                // Cloned out of the borrow: the fresh advisory precheck
+                // below needs `&mut self` (it reports through the
+                // footer), and the row is a reference into `self`.
+                if let Some(row) = self.selected_row().cloned() {
+                    let others = crate::prefixes::known_others(&self.prefix);
+                    match others.as_slice() {
+                        [dest]
+                            if crate::prefixes::known_others(dest)
+                                .iter()
+                                .any(|p| p == &self.prefix) =>
+                        {
+                            // The agreed UX for "already on the other
+                            // side" is a plain error line, not a sticky
+                            // failure panel — decided on a *fresh*
+                            // advisory read of the destination, never on
+                            // the row's cached `[also in …]`: that
+                            // annotation is a lockless snapshot of the
+                            // last reload, so it can refuse a migration
+                            // whose destination was emptied minutes ago
+                            // (and stay wrong until the next reload).
+                            // Advisory in the other direction too: a busy
+                            // lock or a fresh install racing this read
+                            // falls through to migrate_one's
+                            // authoritative refusal, which then surfaces
+                            // as Failed — the race window, accepted for
+                            // now over a typed refusal variant.
+                            if self.destination_occupied(dest, &row.name) {
+                                return;
+                            }
+                            // Frozen here, from the row on screen: the
+                            // plan the person confirms is byte for byte
+                            // the plan the worker revalidates.
+                            let snap = match crate::MigrationSnapshot::from_parts(
+                                &row.name,
+                                &row.version,
+                                row.bins.clone(),
+                                row.locked,
+                                row.pinned,
+                            ) {
+                                Ok(snap) => snap,
+                                Err(e) => {
+                                    self.error(&format!("{e:#}"));
+                                    return;
+                                }
+                            };
+                            let prompt = format!(
+                                "migrate {} {}: {} -> {}? the exact version is rebuilt \
+                                 there, then retired here [y/N]",
+                                row.name,
+                                row.version,
+                                self.prefix.display(),
+                                dest.display()
+                            );
+                            self.confirm = Some(Confirm::new(
+                                &prompt,
+                                OnConfirm::Migrate {
+                                    name: row.name.clone(),
+                                    version: row.version.clone(),
+                                    dest: dest.clone(),
+                                    snap,
+                                },
+                            ));
+                        }
+                        _ => self.info(
+                            "TUI migrate covers the /usr/local <-> ~/.local pair; \
+                             migrate elsewhere via the CLI: cargo lbin migrate NAME --to PREFIX",
+                        ),
+                    }
                 }
             }
             _ => {}
@@ -1233,7 +1632,22 @@ impl App {
             return;
         };
         if matches!(key.code, KeyCode::Char('y' | 'Y')) {
-            self.queue(confirm.action);
+            match confirm.action {
+                OnConfirm::Terminal(action) => self.queue(action),
+                OnConfirm::Migrate {
+                    name,
+                    version,
+                    dest,
+                    snap,
+                } => {
+                    self.pending_migrate = Some(PendingMigrate {
+                        name,
+                        version,
+                        dest,
+                        snap,
+                    });
+                }
+            }
         } else {
             self.info("cancelled");
         }
@@ -1396,6 +1810,7 @@ impl App {
                 started,
                 mut needs_auth,
                 control,
+                kind,
                 cancel_deadline,
             } => {
                 // Drain everything queued since the last frame: a fast
@@ -1438,7 +1853,7 @@ impl App {
                         // would print them twice under a one-line
                         // placement error.
                         Ok(BuildMsg::Warning(line)) => warnings.push(line),
-                        Ok(BuildMsg::NeedAuth) => needs_auth = true,
+                        Ok(BuildMsg::NeedAuth(target)) => needs_auth = Some(target),
                         Ok(BuildMsg::Done(outcome)) => {
                             done = Some(outcome);
                             break;
@@ -1451,7 +1866,7 @@ impl App {
                 }
                 match done {
                     Some(outcome) => {
-                        self.finish_build(&name, outcome, &tail, warnings);
+                        self.finish_build(&name, &kind, outcome, &tail, warnings);
                         // A Ctrl-C during this build asked to leave once
                         // the worker was collected; that is now.
                         if self.quit_after_build {
@@ -1471,6 +1886,7 @@ impl App {
                             started,
                             needs_auth,
                             control,
+                            kind,
                             cancel_deadline,
                         });
                     }
@@ -1864,8 +2280,9 @@ mod tests {
             status_note: None,
             warnings: Vec::new(),
             started: std::time::Instant::now(),
-            needs_auth: false,
+            needs_auth: None,
             control: std::sync::Arc::clone(&control),
+            kind: BuildKind::Install,
             cancel_deadline: Some(std::time::Instant::now() + Duration::from_secs(60)),
         });
 
@@ -1922,8 +2339,9 @@ mod tests {
             status_note: None,
             warnings: Vec::new(),
             started: std::time::Instant::now(),
-            needs_auth: false,
+            needs_auth: None,
             control: std::sync::Arc::new(crate::BuildControl::new()),
+            kind: BuildKind::Install,
             cancel_deadline: None,
         });
 
@@ -1983,7 +2401,7 @@ mod tests {
         ] {
             let line = match build_msg(kind, hostile) {
                 BuildMsg::Cargo(l) | BuildMsg::Notice(l) | BuildMsg::Warning(l) => l,
-                BuildMsg::NeedAuth | BuildMsg::Done(_) => {
+                BuildMsg::NeedAuth(_) | BuildMsg::Done(_) => {
                     panic!("a line kind maps to a line message")
                 }
             };
