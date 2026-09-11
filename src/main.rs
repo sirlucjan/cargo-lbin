@@ -190,9 +190,12 @@ enum Cmd {
     /// Rebuild an installed crate under another prefix, then retire it
     /// here
     ///
-    /// The exact installed version is rebuilt at the destination — never
-    /// copied, so provenance is re-established by the same pipeline as
-    /// `install` — carrying `--locked` and the pin. The entry here is
+    /// The crate is rebuilt at the destination — never copied, so
+    /// provenance is re-established by the same pipeline as `install` —
+    /// carrying `--locked` and the pin. The version follows the pin: a
+    /// pinned crate is rebuilt at exactly its pinned version, an
+    /// unpinned one gets the latest available, because without a pin the
+    /// version was never part of the intent. The entry here is
     /// retired only after the destination has fully committed; a failure
     /// in between leaves the crate installed in both prefixes — never in
     /// neither — with the command's output naming both paths (the
@@ -2250,9 +2253,10 @@ fn apply_updates(prefix: &Path, cache: &Path, outdated: &[Checked]) -> Result<()
 /// The pin bit a committed entry ends up with. `install`'s inference is
 /// a contract with `update --all` — an exact version that arrived
 /// unpinned would be undone by the next run — but it is `install`'s
-/// contract, not every caller's: migrate rebuilds an exact version
-/// *because that is what the source has*, and its pin promise is "the
-/// bit travels unchanged". The policy makes the final bit part of the
+/// contract, not every caller's: migrate names an exact version only
+/// *for a pinned source* — the pin is what makes the version intent —
+/// and its pin promise either way is "the bit travels unchanged". The
+/// policy makes the final bit part of the
 /// one manifest commit; correcting it with a second write afterwards
 /// would open a window in which the entry is right and the intent is
 /// wrong — and a failure of that second write would strand exactly the
@@ -2269,6 +2273,10 @@ enum PinPolicy {
 
 /// Everything `migrate` promises to preserve about a source entry,
 /// captured under the snapshot lock and revalidated twice on the way.
+/// A guard on the *source*, not a description of the destination: the
+/// version here is what the source must still be for the retirement to
+/// proceed, while what the destination receives follows the pin —
+/// exactly this version when pinned, the latest when not.
 /// Built by exhaustively destructuring `manifest::Entry` on purpose: a
 /// new manifest field fails this compilation and forces a decision
 /// whether it belongs to the protected semantics of a migration —
@@ -2394,12 +2402,21 @@ fn plan_migration(
         snapshots.push((name, snap));
     }
     for (name, snap) in &snapshots {
+        // The plan states what each crate *gets*, not only what it is:
+        // the confirmation is the contract, and "1.2.3 -> latest" for an
+        // unpinned crate is exactly the difference a person may want to
+        // veto. The snapshot's version is still printed for both — it is
+        // the source state the revalidations will hold the migration to.
         println!(
-            "{name} {}: {} -> {}{}",
+            "{name} {}: {} -> {} [{}]",
             snap.version,
             prefix.display(),
             to.display(),
-            if snap.pinned { " [pinned]" } else { "" }
+            if snap.pinned {
+                "pinned; the exact version is rebuilt"
+            } else {
+                "unpinned; the latest version is installed"
+            }
         );
     }
     if !yes && !confirm("proceed with migration?")? {
@@ -2552,12 +2569,10 @@ fn rebuild_at_destination(
     let mut dest_manifest = Manifest::load(dest)?;
     if let Some(existing) = dest_manifest.crates.get(name) {
         bail!(
-            "`{name}` is already installed under {} at {}; migrate refuses to choose \
-             between {} and {} — remove one side first (no --force by design)",
+            "`{name}` is already installed under {} at {}; migrate refuses to overwrite \
+             it with the migrating install — remove one side first (no --force by design)",
             dest.display(),
-            existing.version,
-            existing.version,
-            snap.version
+            existing.version
         );
     }
     // The early revalidation, run by the pipeline at the placement
@@ -2602,22 +2617,33 @@ fn rebuild_at_destination(
             ),
         }
     };
+    // The version request follows the pin, because the pin is what
+    // makes a version part of the person's intent: pinned rebuilds
+    // exactly the pinned version, unpinned asks for nothing and gets
+    // whatever cargo resolves as latest — migrating a crate lbin
+    // manages normally is no reason to fossilize the version it
+    // happened to be at. Migrate preserves policy, not necessarily
+    // version. The snapshot's version still guards the *source*: it is
+    // what both revalidations compare against before anything is
+    // retired, for pinned and unpinned alike.
     // `Exactly(snap.pinned)`: the pin bit travels unchanged, inside
     // the same manifest commit as the entry itself. Under `install`'s
-    // inference an exact version would arrive pinned, and correcting
-    // that with a second store would open a window — and a failure
-    // mode — in which the destination is right and the intent is
-    // wrong, with the source still standing and a re-run refused.
+    // inference an exact version would arrive pinned (and a bare
+    // request would drop a pin), and correcting that with a second
+    // store would open a window — and a failure mode — in which the
+    // destination is right and the intent is wrong, with the source
+    // still standing and a re-run refused.
     // The same pipeline through the caller's shape: the CLI keeps
     // Checkpointed, the TUI gets its Build panel and cancel door by
     // composing the checkpoint behind Captured's placement CAS.
+    let version = snap.pinned.then_some(&snap.version);
     let installed = match frontend {
         MigrateFrontend::Terminal => install_and_commit(
             dest,
             cache,
             &mut dest_manifest,
             name,
-            Some(&snap.version),
+            version,
             snap.locked,
             PinPolicy::Exactly(snap.pinned),
             &mut Frontend::Checkpointed {
@@ -2636,7 +2662,7 @@ fn rebuild_at_destination(
             cache,
             &mut dest_manifest,
             name,
-            Some(&snap.version),
+            version,
             snap.locked,
             PinPolicy::Exactly(snap.pinned),
             &mut Frontend::Captured {
@@ -3669,6 +3695,36 @@ mod tests {
         script
     }
 
+    /// A fake cargo with a registry: `--version =X` stages exactly X,
+    /// no version request stages 0.2.0 — the fake's "latest". This is
+    /// the fake for tests about *which* version a pipeline asks for;
+    /// `staging_fake` above, blind to the request, cannot tell an
+    /// exact rebuild from a latest install.
+    fn versioned_fake(root: &Path, name: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let fake_bin = root.join("fakebin");
+        fs::create_dir_all(&fake_bin).unwrap();
+        let script = fake_bin.join("cargo");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\n\
+                 ver=0.2.0\n\
+                 for a in \"$@\"; do\n\
+                 case \"$a\" in =*) ver=${{a#=}};; esac\n\
+                 done\n\
+                 mkdir -p \"$4/bin\"\n\
+                 printf '#!/bin/sh\\ntrue\\n' > \"$4/bin/{name}\"\n\
+                 chmod 755 \"$4/bin/{name}\"\n\
+                 printf '%s' \"{{\\\"installs\\\":{{\\\"{name} $ver (registry+https://github.com/rust-lang/crates.io-index)\\\":{{\\\"bins\\\":[\\\"{name}\\\"]}}}}}}\" > \"$4/.crates2.json\"\n\
+                 exit 0\n"
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        script
+    }
+
     #[test]
     fn migrate_rebuilds_at_the_destination_and_retires_the_source() {
         let root = std::env::temp_dir().join("cargo-lbin-test-migrate-moves");
@@ -3716,9 +3772,11 @@ mod tests {
 
     #[test]
     fn migrate_carries_an_unpinned_entry_unpinned() {
-        // `install_and_commit` pins every exact-version request — its
-        // contract, corrected by migrate under the same lock. This is
-        // the test that keeps that correction honest.
+        // An unpinned migration makes no exact-version request anymore,
+        // so `install`'s inference would happen to agree — but the pin
+        // bit travelling unchanged is migrate's stated promise
+        // (`PinPolicy::Exactly`), not a coincidence of inference, and
+        // this is the test that keeps the promise the load-bearing one.
         let root = std::env::temp_dir().join("cargo-lbin-test-migrate-unpinned");
         let _ = fs::remove_dir_all(&root);
         let source = seeded_prefix(&root, "source", "okcrate", false, false);
@@ -3743,8 +3801,103 @@ mod tests {
         .unwrap();
         assert!(
             !Manifest::load(&dest).unwrap().crates["okcrate"].pinned,
-            "an unpinned crate arrives unpinned, not auto-pinned by the exact version"
+            "an unpinned crate arrives unpinned — the bit travels as stated policy"
         );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn migrate_installs_the_latest_version_for_an_unpinned_crate() {
+        // The contract in one test: migrate preserves policy, not
+        // necessarily version. Without a pin the version was never part
+        // of the intent, so the destination gets what a fresh `install`
+        // would — the registry's latest — and the outcome reports that
+        // version, not the plan's.
+        let root = std::env::temp_dir().join("cargo-lbin-test-migrate-latest");
+        let _ = fs::remove_dir_all(&root);
+        let source = seeded_prefix(&root, "source", "okcrate", false, false);
+        let dest = root.join("dest");
+        fs::create_dir_all(dest.join("bin")).unwrap();
+        fs::create_dir_all(dest.join("share/cargo-lbin")).unwrap();
+        let _fake = crate::stage::FakeCargo::install(&versioned_fake(&root, "okcrate"));
+
+        let snap = MigrationSnapshot::capture(
+            "okcrate",
+            &Manifest::load(&source).unwrap().crates["okcrate"],
+        )
+        .unwrap();
+        let outcome = migrate_one(
+            &source,
+            &dest,
+            &root.join("cache"),
+            "okcrate",
+            &snap,
+            &mut MigrateFrontend::Terminal,
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                &outcome,
+                MigrateOutcome::Moved {
+                    already_retired: false,
+                    version,
+                } if version.to_string() == "0.2.0"
+            ),
+            "the outcome speaks the installed version, not the plan's: {outcome:?}"
+        );
+
+        let entry = &Manifest::load(&dest).unwrap().crates["okcrate"];
+        assert_eq!(entry.version, "0.2.0", "unpinned migrates to latest");
+        assert!(!entry.pinned, "and stays unpinned — policy preserved");
+        assert!(
+            !Manifest::load(&source)
+                .unwrap()
+                .crates
+                .contains_key("okcrate"),
+            "the source 0.1.0 still matched its snapshot and was retired"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn migrate_rebuilds_the_pinned_version_even_when_latest_is_newer() {
+        // The other half of the contract, against a registry that
+        // *would* offer 0.2.0: a pin makes the version intent, and the
+        // destination gets exactly it. `staging_fake`, blind to the
+        // request, could never fail this test; `versioned_fake` can.
+        let root = std::env::temp_dir().join("cargo-lbin-test-migrate-pinned-exact");
+        let _ = fs::remove_dir_all(&root);
+        let source = seeded_prefix(&root, "source", "okcrate", false, true);
+        let dest = root.join("dest");
+        fs::create_dir_all(dest.join("bin")).unwrap();
+        fs::create_dir_all(dest.join("share/cargo-lbin")).unwrap();
+        let _fake = crate::stage::FakeCargo::install(&versioned_fake(&root, "okcrate"));
+
+        let snap = MigrationSnapshot::capture(
+            "okcrate",
+            &Manifest::load(&source).unwrap().crates["okcrate"],
+        )
+        .unwrap();
+        let outcome = migrate_one(
+            &source,
+            &dest,
+            &root.join("cache"),
+            "okcrate",
+            &snap,
+            &mut MigrateFrontend::Terminal,
+        )
+        .unwrap();
+        assert!(matches!(
+            &outcome,
+            MigrateOutcome::Moved {
+                already_retired: false,
+                version,
+            } if version.to_string() == "0.1.0"
+        ));
+
+        let entry = &Manifest::load(&dest).unwrap().crates["okcrate"];
+        assert_eq!(entry.version, "0.1.0", "pinned rebuilds the exact version");
+        assert!(entry.pinned, "and stays pinned");
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -3976,10 +4129,14 @@ mod tests {
     #[cfg(feature = "tui")]
     #[test]
     fn a_frozen_plan_rejects_a_source_that_moved_on() {
-        // The review scenario: the person confirms 1.2.0, another
-        // process updates the crate before the worker runs. The frozen
-        // snapshot travels; the checkpoint rejects; nothing migrates —
-        // never "confirmed one version, migrated another".
+        // The review scenario: the person confirms the row at 0.1.0,
+        // another process updates the crate before the worker runs. The
+        // frozen snapshot travels; the checkpoint rejects; nothing
+        // migrates — never a migration from a source state different
+        // from the one that was confirmed. (What the destination
+        // *receives* follows the pin — an unpinned confirmation at
+        // 0.1.0 legitimately installs a newer latest — so the frozen
+        // plan guards the source, not the destination's version.)
         let root = std::env::temp_dir().join("cargo-lbin-test-migrate-frozen");
         let _ = fs::remove_dir_all(&root);
         let source = seeded_prefix(&root, "source", "okcrate", false, false);

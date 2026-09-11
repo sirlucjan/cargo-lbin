@@ -1896,13 +1896,23 @@ impl App {
                             return;
                         }
                     };
+                    // The prompt is the contract: for a pinned crate the
+                    // shown version is what the destination gets, for an
+                    // unpinned one it is the source state being retired —
+                    // and the difference is said out loud, because
+                    // "1.2.3 here, latest there" is exactly what the
+                    // person may want to veto.
                     let prompt = format!(
-                        "migrate {} {}: {} -> {}? the exact version is rebuilt \
-                         there, then retired here [y/N]",
+                        "migrate {} {}: {} -> {}? {} there, then retired here [y/N]",
                         row.name,
                         row.version,
                         self.prefix.display(),
-                        dest.display()
+                        dest.display(),
+                        if row.pinned {
+                            "the exact pinned version is rebuilt"
+                        } else {
+                            "the latest version is installed"
+                        }
                     );
                     self.confirm = Some(Confirm::new(
                         &prompt,
@@ -1973,8 +1983,9 @@ impl App {
             }
         }
         let prompt = format!(
-            "migrate all {} crate(s): {} -> {}? exact versions are rebuilt \
-             there, then retired here; c cancels the batch [y/N]",
+            "migrate all {} crate(s): {} -> {}? pinned crates keep their exact \
+             version, unpinned get the latest, then retired here; c cancels the \
+             batch [y/N]",
             plan.len(),
             self.prefix.display(),
             dest.display()
