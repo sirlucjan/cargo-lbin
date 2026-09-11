@@ -582,11 +582,13 @@ reasons. `c` cancels the current crate and ends the batch — the
 remaining queue is dropped, never silently continued — and the summary
 says how many were never attempted. A worker that cannot start at all
 (a failed preflight, an uncooperative sudo) ends the batch the same
-way, with the refusal recorded among the failures. Placement is the exception: once binaries start
-moving into the prefix, the operation always finishes — killing
-`sudo install` between two binaries is not an option, and placement is
-seconds, not minutes. `Ctrl-C` keeps its traditional meaning of "quit",
-but with a build running it cancels first and leaves only once the
+way, with the refusal recorded among the failures. Placement is the
+exception: once binaries start moving into the prefix, a cancel is too
+late — an install finishes placing, and a migration proceeds through
+its retirement attempt — because killing `sudo install` between two
+binaries is not an option, and placement is seconds, not minutes.
+`Ctrl-C` keeps its traditional meaning of "quit", but with a build
+running it cancels first and leaves only once the
 worker has been collected, so cargo is never orphaned behind a dead
 pipe. A cancelled build reports as one line — it is the outcome that was
 asked for, not a failure.
