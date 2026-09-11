@@ -1169,20 +1169,31 @@ fn install_needs_privilege(policy: privileged::Policy, prefix: &Path) -> Result<
         || policy.probe_destination(&prefix.join("share/cargo-lbin"))?)
 }
 
-/// The escalation union every screen-shaped decision consults: the
-/// pipeline's own destinations (bin + state) plus, where escalation is
-/// possible at all, the lock file — the worker's first privileged
-/// touch. One place on purpose: the build preflight, the in-place
-/// removal and the captured migration's retirement warm-up must never
-/// disagree about whether a prefix asks a password; three private
-/// copies of this `||` would drift apart the day one of them learns
-/// something. The terminal flavor never consults it — there, sudo may
-/// simply ask.
+/// The state half of the escalation union: the manifest under the
+/// state directory plus, where escalation is possible at all, the lock
+/// file — the worker's first privileged touch. Its own question because
+/// it is its own write set: a pin flip writes exactly this and nothing
+/// under bin, so a read-only bin must not force a handoff for an
+/// operation that never touches it — and on a custom prefix, where sudo
+/// is forbidden, a bin probe's error must not refuse an operation the
+/// CLI performs. The privilege check answers for what the operation
+/// writes, not for the prefix as a whole.
 #[cfg(feature = "tui")]
-fn operation_needs_privilege(policy: privileged::Policy, prefix: &Path) -> Result<bool> {
-    Ok(install_needs_privilege(policy, prefix)?
+fn state_needs_privilege(policy: privileged::Policy, prefix: &Path) -> Result<bool> {
+    Ok(policy.probe_destination(&prefix.join("share/cargo-lbin"))?
         || (matches!(policy.sudo, privileged::Sudo::Allowed)
             && StateLock::preparation_needs_privilege(prefix)))
+}
+
+/// The whole escalation union, for operations whose write set includes
+/// bin: the build preflight, the in-place removal and the captured
+/// migration's retirement warm-up must never disagree about whether a
+/// prefix asks a password; private copies of this `||` would drift
+/// apart the day one of them learns something. The terminal flavor
+/// never consults it — there, sudo may simply ask.
+#[cfg(feature = "tui")]
+fn operation_needs_privilege(policy: privileged::Policy, prefix: &Path) -> Result<bool> {
+    Ok(policy.probe_destination(&prefix.join("bin"))? || state_needs_privilege(policy, prefix)?)
 }
 
 /// Insert `entry` and persist the manifest as one unit: on a failed store the
@@ -1210,6 +1221,43 @@ fn commit_entry(
         return Err(err);
     }
     Ok(())
+}
+
+/// `pin`/`unpin` for a frontend that owns the screen: one crate, no
+/// stdout, the outcome as data. The same nonblocking screen-owned lock
+/// as `tui_remove_one`, for the same UI-thread reason; the same
+/// semantics as `cmd_set_pinned` for one crate — an entry already in
+/// the requested state is an answer, not a write.
+#[cfg(feature = "tui")]
+pub(crate) enum TuiSetPinned {
+    /// The bit flipped and committed; the version, for the report line.
+    Set {
+        version: String,
+    },
+    /// Nothing to do — the manifest already agrees (it moved since the
+    /// row was read, or the row was stale).
+    Already,
+    PrefixBusy,
+}
+
+#[cfg(feature = "tui")]
+pub(crate) fn tui_set_pinned(prefix: &Path, name: &str, pinned: bool) -> Result<TuiSetPinned> {
+    let policy = privileged::Policy::for_prefix(prefix).screen_owned();
+    let Some(_lock) = StateLock::try_acquire_with(prefix, &Mode::Exclusive, policy, &mut |_| {})?
+    else {
+        return Ok(TuiSetPinned::PrefixBusy);
+    };
+    let mut manifest = Manifest::load(prefix)?;
+    let Some(entry) = manifest.crates.get_mut(name) else {
+        bail!("`{name}` is not in the manifest (changed since the list was read?)");
+    };
+    if entry.pinned == pinned {
+        return Ok(TuiSetPinned::Already);
+    }
+    entry.pinned = pinned;
+    let version = entry.version.clone();
+    manifest.store_with_policy(prefix, policy)?;
+    Ok(TuiSetPinned::Set { version })
 }
 
 /// `remove` for a frontend that owns the screen: one crate, no stdout,

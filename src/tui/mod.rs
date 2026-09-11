@@ -1801,14 +1801,7 @@ impl App {
             // the manifest under the lock, so a pin changed by another
             // process since the last reload is reported, not overwritten
             // blindly ("already pinned").
-            KeyCode::Char('p') => {
-                if let Some(row) = self.selected_row() {
-                    self.queue(PendingAction::SetPinned {
-                        name: row.name.clone(),
-                        pinned: !row.pinned,
-                    });
-                }
-            }
+            KeyCode::Char('p') => self.pin_selected(),
             // The choice of version is made in the terminal, by the
             // command itself — one prompt, the real list, no TUI copy.
             KeyCode::Char('D') => {
@@ -1974,6 +1967,65 @@ impl App {
                     name: row.name.clone(),
                 },
             ));
+        }
+    }
+
+    /// `p`: pin or unpin the selected crate — a manifest write, so the
+    /// same shape decision as `x`, made at the keypress: `p` has no
+    /// confirmation, so the keypress is its `y`. Escalation queues the
+    /// terminal handoff as before; otherwise it runs in place, because
+    /// the most trivial mutation in the tool least deserves a screen
+    /// flip. The
+    /// running guard is the in-place family's, refused up front so the
+    /// two shapes cannot diverge on it.
+    fn pin_selected(&mut self) {
+        let Some(row) = self.selected_row() else {
+            return;
+        };
+        let name = row.name.clone();
+        let pinned = !row.pinned;
+        if self.anything_running() {
+            self.error("an operation is running or queued; finish or cancel it first");
+            return;
+        }
+        let policy = crate::privileged::Policy::for_prefix(&self.prefix);
+        // The state half only: a pin writes the manifest and prepares
+        // the lock, never bin — asking the whole union would let a
+        // read-only bin force a handoff (or, on a custom prefix, an
+        // error) for an operation that never goes near it.
+        let escalate = match crate::state_needs_privilege(policy, &self.prefix) {
+            Ok(escalate) => escalate,
+            Err(e) => {
+                self.error(&format!("{e:#}"));
+                return;
+            }
+        };
+        if escalate {
+            self.queue(PendingAction::SetPinned { name, pinned });
+            return;
+        }
+        let verb = if pinned { "pinned" } else { "unpinned" };
+        match crate::tui_set_pinned(&self.prefix, &name, pinned) {
+            Ok(crate::TuiSetPinned::Set { version }) => {
+                if let Err(e) = self.reload() {
+                    self.error(&format!("{verb} {name}, but the reload failed: {e:#}"));
+                    return;
+                }
+                self.info(&format!("{verb} {name} at {version}"));
+            }
+            Ok(crate::TuiSetPinned::Already) => {
+                // The manifest already agrees, so the row was stale —
+                // reload so the screen agrees too, and say what stands.
+                if let Err(e) = self.reload() {
+                    self.error(&format!("{e:#}"));
+                    return;
+                }
+                self.info(&format!("{name} is already {verb}"));
+            }
+            Ok(crate::TuiSetPinned::PrefixBusy) => {
+                self.info("the prefix is busy (another cargo-lbin holds its lock); try again");
+            }
+            Err(e) => self.error(&format!("{verb} failed for `{name}`: {e:#}")),
         }
     }
 
@@ -3054,6 +3106,79 @@ mod tests {
         assert!(
             app.visible().iter().any(|row| row.name == "bar"),
             "the row survives the refusal"
+        );
+        let _ = std::fs::remove_dir_all(&prefix);
+    }
+
+    #[test]
+    fn a_pin_flips_in_place_when_no_privilege_is_needed() {
+        let prefix = std::env::temp_dir().join("cargo-lbin-test-tui-pin");
+        let _ = std::fs::remove_dir_all(&prefix);
+        std::fs::create_dir_all(prefix.join("bin")).unwrap();
+        std::fs::create_dir_all(prefix.join("share/cargo-lbin")).unwrap();
+        let mut manifest = Manifest::default();
+        manifest.crates.insert(
+            "foo".into(),
+            Entry {
+                version: "0.1.0".into(),
+                bins: vec!["foo".into()],
+                locked: false,
+                pinned: false,
+            },
+        );
+        manifest.store(&prefix).unwrap();
+        let mut app = App::new(&prefix).unwrap();
+        app.reload().unwrap();
+        app.selected = 0;
+
+        // In place: no handoff queued, the bit lands on disk, the row
+        // and the message agree.
+        app.pin_selected();
+        assert!(
+            app.pending.is_none(),
+            "no handoff for a passwordless prefix"
+        );
+        assert!(
+            Manifest::load(&prefix).unwrap().crates["foo"].pinned,
+            "the pin is committed"
+        );
+        assert!(
+            app.selected_row().is_some_and(|row| row.pinned),
+            "the reloaded row agrees"
+        );
+        let said = app.message.take().expect("the pin reports itself");
+        assert!(
+            said.text.contains("pinned foo at 0.1.0"),
+            "the interface owns the words: {}",
+            said.text
+        );
+
+        // And back: the same key is its own inverse.
+        app.pin_selected();
+        assert!(!Manifest::load(&prefix).unwrap().crates["foo"].pinned);
+        let said = app.message.take().expect("the unpin reports itself");
+        assert!(said.text.contains("unpinned foo"), "{}", said.text);
+
+        // A stale row: the manifest moved underneath (pinned by another
+        // instance), so the flip finds itself already answered — the
+        // screen is reloaded to agree and the message says what stands.
+        let mut moved = Manifest::load(&prefix).unwrap();
+        moved.crates.get_mut("foo").unwrap().pinned = true;
+        moved.store(&prefix).unwrap();
+        app.pin_selected();
+        assert!(
+            Manifest::load(&prefix).unwrap().crates["foo"].pinned,
+            "already answered: nothing flips"
+        );
+        let said = app.message.take().expect("the no-op reports itself");
+        assert!(
+            said.text.contains("already pinned"),
+            "named as already: {}",
+            said.text
+        );
+        assert!(
+            app.selected_row().is_some_and(|row| row.pinned),
+            "the reloaded row shows the state that stands"
         );
         let _ = std::fs::remove_dir_all(&prefix);
     }
