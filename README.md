@@ -95,7 +95,7 @@ cargo lbin tui
 | --- | --- |
 | `install <crate[@version]>... [--locked]` | Build crates with Cargo and install their binaries; `@version` installs exactly that version and pins it |
 | `remove <crate>...` | Remove managed crates and their binaries |
-| `pin <crate>...` / `unpin <crate>...` | Hold crates at their installed version / release the hold |
+| `pin <crate>...` / `unpin <crate>...` | Pin crates to their installed version / release the pin |
 | `pinned [--check] [--json]` | List pinned crates and whether newer versions exist |
 | `downgrade <crate>` | Pick an older version from crates.io, install it and pin it |
 | `list [--json]` | List managed crates, using the last update report for annotations |
@@ -325,7 +325,7 @@ cargo lbin unpin hexyl
 
 `install NAME@VERSION` pins as part of installing (see [Install](#install)); `pin` is for a crate already in place.
 
-A pinned crate is left out of `update --all` — listed as `[pinned, skipped]` so the hold is visible, never silent, and not queried at all, so a pinned crate whose lookup fails cannot stop the others from updating — and refused by `update NAME` and by `install NAME` (a reinstall builds the newest version, which is what the pin forbids) until it is unpinned. `checkupdate` and `list` still check and report a newer version when one exists: the pin is a decision about what to do with that fact, not a reason to hide it. `list` marks pinned crates with `[pinned]`, and a pin set by another process between confirming an update and running it counts as changed state, so that crate is skipped. Removing a pinned crate is allowed; a pin holds a version, not a binary.
+A pinned crate is left out of `update --all` — listed as `[pinned, skipped]` so the hold is visible, never silent, and not queried at all, so a pinned crate whose lookup fails cannot stop the others from updating — and refused by `update NAME` and by `install NAME` (a reinstall builds the newest version, which is what the pin forbids) until it is unpinned. `migrate` rebuilds a pinned crate at exactly its pinned version, while an unpinned one gets the latest (see [Migrate](#migrate)): the pin is a declaration of version policy, honored wherever a version is chosen, not merely a hold against the next update. `checkupdate` and `list` still check and report a newer version when one exists: the pin is a decision about what to do with that fact, not a reason to hide it. `list` marks pinned crates with `[pinned]`, and a pin set by another process between confirming an update and running it counts as changed state, so that crate is skipped. Removing a pinned crate is allowed; a pin holds a version, not a binary.
 
 Pinning writes the manifest, so it needs the same privilege as installing into the prefix.
 

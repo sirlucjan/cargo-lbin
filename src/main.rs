@@ -114,10 +114,13 @@ enum Cmd {
         #[arg(required = true)]
         crates: Vec<String>,
     },
-    /// Hold crates at their installed version
+    /// Pin crates to their installed version
     ///
-    /// A pinned crate is left out of `update --all` and refused by
-    /// `update NAME` and `install NAME` until unpinned.
+    /// A pin declares the version, not just a hold against the next
+    /// update: `update --all` leaves the crate out, `update NAME` and
+    /// `install NAME` are refused until unpinned, and `migrate` rebuilds
+    /// exactly the pinned version at the destination (an unpinned crate
+    /// migrates to the latest).
     Pin {
         #[arg(required = true)]
         crates: Vec<String>,
