@@ -506,7 +506,7 @@ The TUI starts entirely from disk — the manifest and the last `checkupdate` re
 | `Enter`, `u` | Update the selected crate |
 | `U` | Run a fresh `update --all` |
 | `i` | Open the install line (`NAME[@VERSION]... [--locked]`; `@VERSION` pins) |
-| `x` | Remove the selected crate after TUI confirmation; in place unless the prefix needs `sudo` |
+| `x` | Remove the selected crate after TUI confirmation; in place unless removal needs `sudo` |
 | `m` | Migrate the selected crate to the other prefix (asks first; known pair only) |
 | `M` | Migrate every crate to the other prefix (asks first; `c` cancels the batch) |
 | `B` | Jump to the other prefix of the known pair; the selection follows the crate |
