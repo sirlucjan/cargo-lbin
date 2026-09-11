@@ -269,8 +269,14 @@ enum BuildMsg {
 /// succeeded but whose follow-through did not finish as asked — the
 /// name is deliberately generic: the payload owns the specifics, and
 /// the protocol does not learn any one operation's vocabulary.
+/// `Migrated` is a moved migration's success, carrying the version the
+/// destination actually committed: the frozen plan's version is what
+/// was confirmed and revalidated, not necessarily what was installed,
+/// and the note must speak the result — never fished out of the
+/// pipeline's prose, never guessed from the plan.
 enum BuildOutcome {
     Success,
+    Migrated(Version),
     Cancelled,
     CompletedWithWarning(String),
     Failed(anyhow::Error),
@@ -1094,7 +1100,7 @@ impl App {
             // Classified once, by type and by data — the UI never
             // guesses.
             let outcome = match result {
-                Ok(crate::MigrateOutcome::Moved { .. }) => BuildOutcome::Success,
+                Ok(crate::MigrateOutcome::Moved { version, .. }) => BuildOutcome::Migrated(version),
                 Ok(crate::MigrateOutcome::Incomplete(reason)) => {
                     BuildOutcome::CompletedWithWarning(reason)
                 }
@@ -1345,6 +1351,20 @@ impl App {
         tail: &VecDeque<String>,
         warnings: Vec<String>,
     ) {
+        // The footer speaks the result where there is one: a moved
+        // member's version is the destination's (Migrated's payload) —
+        // an unpinned 0.1.0 that arrived as 0.2.0 must be announced as
+        // 0.2.0. A bare Success on a migrate job — a worker bug by the
+        // classification's own contract — claims no version rather than
+        // inventing one from the plan, the single job's rule. Every
+        // other outcome identifies the plan member by the source version
+        // it was confirmed at, the only version those outcomes
+        // truthfully have.
+        let spoken = match &outcome {
+            BuildOutcome::Migrated(installed) => format!(" {installed}"),
+            BuildOutcome::Success => String::new(),
+            _ => format!(" {}", target.version),
+        };
         // Per-crate reload keeps the list truthful mid-batch; a failure
         // is recorded on the batch and resurfaces at the summary.
         let reload_error = self.reload().err().map(|e| format!("{e:#}"));
@@ -1362,7 +1382,7 @@ impl App {
             // the tail excerpt, and an Incomplete reason travels with
             // the warnings its build spoke.
             match outcome {
-                BuildOutcome::Success => {
+                BuildOutcome::Success | BuildOutcome::Migrated(_) => {
                     batch.moved += 1;
                     if !warnings.is_empty() {
                         batch.noticed.push((name.to_owned(), warnings));
@@ -1389,10 +1409,7 @@ impl App {
             self.finalize_migrate_batch(Some("cancelled"));
             return;
         }
-        self.info(&format!(
-            "[{done}/{total}] {name} {} processed",
-            target.version
-        ));
+        self.info(&format!("[{done}/{total}] {name}{spoken} processed"));
         let next = self
             .migrate_batch
             .as_mut()
@@ -1542,14 +1559,17 @@ impl App {
         let reload = self.reload();
         match outcome {
             BuildOutcome::Cancelled => unreachable!("returned above"),
-            BuildOutcome::Success => {
+            outcome @ (BuildOutcome::Success | BuildOutcome::Migrated(_)) => {
                 // Composed from the job's data, not fished out of the
                 // pipeline's prose: the worker reports outcomes, the UI
                 // owns the words. The install note keeps its historical
                 // shape (the pipeline's own summary line is the best
                 // one-liner it has); the migrate note says what is true
                 // in every success flavor — including a source someone
-                // else already retired — without overclaiming.
+                // else already retired — and speaks the version the
+                // destination committed (Migrated's payload), never the
+                // frozen plan's, which is what was confirmed, not
+                // necessarily what was installed.
                 let note = match kind {
                     BuildKind::Install => tail
                         .iter()
@@ -1557,11 +1577,16 @@ impl App {
                         .find(|l| l.starts_with("installed "))
                         .cloned()
                         .unwrap_or_else(|| format!("install {name} finished")),
-                    BuildKind::Migrate(target) => format!(
-                        "migrated {name} {} to {}",
-                        target.version,
-                        target.dest.display()
-                    ),
+                    BuildKind::Migrate(target) => match &outcome {
+                        BuildOutcome::Migrated(installed) => {
+                            format!("migrated {name} {installed} to {}", target.dest.display())
+                        }
+                        // A migrate worker classifies every move as
+                        // Migrated; a bare Success here would be a
+                        // worker bug — claim no version rather than
+                        // invent one from the plan.
+                        _ => format!("migrated {name} to {}", target.dest.display()),
+                    },
                 };
                 // A failed reload does not eat the outcome: the install
                 // happened and a shadow warning stays true, so the
@@ -3242,7 +3267,9 @@ mod tests {
 
         // Success advances the queue into pending_migrate — and a fully
         // successful member's build warnings are not laundered by the
-        // tally.
+        // tally. The outcome's version (0.2.0) deliberately differs from
+        // the plan's (0.1.0): the footer must announce what the
+        // destination committed, not echo the plan back.
         app.migrate_batch = Some(MigrateBatch {
             dest: dest.clone(),
             queue: [pending("bar")].into_iter().collect(),
@@ -3257,7 +3284,7 @@ mod tests {
         app.finish_batch_step(
             "foo",
             &target,
-            BuildOutcome::Success,
+            BuildOutcome::Migrated(Version::new(0, 2, 0)),
             &no_tail,
             vec!["foo shadows something".to_owned()],
         );
@@ -3265,6 +3292,13 @@ mod tests {
         let batch = app.migrate_batch.as_ref().unwrap();
         assert_eq!(batch.moved, 1);
         assert_eq!(batch.noticed.len(), 1, "the shadow warning survived");
+        assert!(
+            app.message
+                .as_ref()
+                .is_some_and(|m| m.text.contains("foo 0.2.0")),
+            "the footer speaks the destination's version, not the plan's: {:?}",
+            app.message.as_ref().map(|m| m.text.clone())
+        );
 
         // …a failure on the last member finalizes with a failed panel
         // that carries the successful member's warning section too…
