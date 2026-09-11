@@ -1,11 +1,12 @@
 //! Prefix-scoped state lock.
 //!
 //! Serializes cargo-lbin instances operating on the same prefix: mutations
-//! (install/update/remove) take an exclusive lock for their whole duration,
-//! builds included; readers (list/checkupdate) take a shared lock. The lock
-//! lives next to the state (`<prefix>/share/cargo-lbin/lock`), so it protects the
-//! prefix rather than a particular user — two different users driving
-//! `/usr/local` contend on the same file.
+//! (install/update/remove/downgrade, pin/unpin, migrate) take an exclusive
+//! lock for their whole duration, builds included; readers
+//! (list/checkupdate) take a shared lock. The lock lives next to the state
+//! (`<prefix>/share/cargo-lbin/lock`), so it protects the prefix rather than
+//! a particular user — two different users driving `/usr/local` contend on
+//! the same file.
 //!
 //! The lock must be acquired before `Manifest::load()`, otherwise the
 //! load-mutate-store sequence is a textbook lost update.
@@ -160,7 +161,7 @@ impl StateLock {
                 // to protect yet and no reason to demand sudo for a `list`.
                 notice(&format!(
                     "warning: cannot open {} — proceeding without a state lock \
-                     (the file is created by the first install/update/remove)",
+                     (the file is created by the first mutation)",
                     path.display()
                 ));
                 return Ok(Some(Self { _file: None }));
