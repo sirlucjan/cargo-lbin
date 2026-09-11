@@ -1196,6 +1196,43 @@ fn commit_entry(
     Ok(())
 }
 
+/// `remove` for a frontend that owns the screen: one crate, no stdout,
+/// the outcome as data — the UI owns the words. The exclusive lock is
+/// taken nonblocking under the screen-owned policy: a blocking wait
+/// here would freeze the interface with no redraw and no explanation,
+/// so a held lock is an answer, not a wait. Escalation is the caller's
+/// decision — by the time this runs the caller has concluded none is
+/// needed, and the screen-owned policy holds everything below to that
+/// (`sudo -n` at most, never a prompt beneath the alternate screen).
+#[cfg(feature = "tui")]
+pub(crate) enum TuiRemove {
+    Removed(Vec<String>),
+    PrefixBusy,
+}
+
+#[cfg(feature = "tui")]
+pub(crate) fn tui_remove_one(prefix: &Path, name: &str) -> Result<TuiRemove> {
+    let policy = privileged::Policy::for_prefix(prefix).screen_owned();
+    let Some(_lock) = StateLock::try_acquire_with(prefix, &Mode::Exclusive, policy, &mut |_| {})?
+    else {
+        return Ok(TuiRemove::PrefixBusy);
+    };
+    let mut manifest = Manifest::load(prefix)?;
+    let Some(entry) = manifest.crates.remove(name) else {
+        // The row came from a reload moments ago; a manifest that moved
+        // on since is a real answer, not a skip to swallow.
+        bail!("`{name}` is not in the manifest (changed since the list was read?)");
+    };
+    let bin_dir = prefix.join("bin");
+    let paths: Vec<PathBuf> = entry.bins.iter().map(|b| bin_dir.join(b)).collect();
+    let refs: Vec<&Path> = paths.iter().map(PathBuf::as_path).collect();
+    privileged::remove_files(policy, &refs)?;
+    // The same commit order as the CLI: files first, bookkeeping after,
+    // so a failure never records a removal that did not happen.
+    manifest.store_with_policy(prefix, policy)?;
+    Ok(TuiRemove::Removed(entry.bins))
+}
+
 /// `migrate_one` for a frontend that owns the screen. The snapshot
 /// arrives *frozen* from the frontend — built from the row at the
 /// keypress, confirmed by the person, never re-taken here: a fresh

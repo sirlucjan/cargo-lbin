@@ -506,7 +506,7 @@ The TUI starts entirely from disk — the manifest and the last `checkupdate` re
 | `Enter`, `u` | Update the selected crate |
 | `U` | Run a fresh `update --all` |
 | `i` | Open the install line (`NAME[@VERSION]... [--locked]`; `@VERSION` pins) |
-| `x` | Remove the selected crate after TUI confirmation |
+| `x` | Remove the selected crate after TUI confirmation; in place unless the prefix needs `sudo` |
 | `m` | Migrate the selected crate to the other prefix (asks first; known pair only) |
 | `M` | Migrate every crate to the other prefix (asks first; `c` cancels the batch) |
 | `B` | Jump to the other prefix of the known pair; the selection follows the crate |
@@ -532,7 +532,7 @@ whose count sits in the header at all times, and the footer says how many
 pinned crates are behind. The same split shapes the `r` result line:
 `checked: 1 update(s) available; 1 pinned held back`.
 
-A single-crate install builds in place, inside its own transient Build panel, with `sudo` credentials validated up front; batch installs, `update`, `remove` and `downgrade` temporarily hand the real terminal back to the normal CLI, where Cargo diagnostics, the update confirmation and password prompts behave exactly as they do outside the TUI, and the interface returns afterwards.
+A single-crate install builds in place, inside its own transient Build panel, with `sudo` credentials validated up front, and a removal under a prefix that needs no password runs in place too; batch installs, `update`, `downgrade` and — where the prefix needs `sudo` — `remove` temporarily hand the real terminal back to the normal CLI, where Cargo diagnostics, the update confirmation and password prompts behave exactly as they do outside the TUI, and the interface returns afterwards.
 
 An in-place build can be cancelled: `c` sends SIGTERM to cargo's whole
 process group — every rustc and build script included — and a second `c`

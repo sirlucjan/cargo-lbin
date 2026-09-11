@@ -170,10 +170,11 @@ impl Confirm {
     }
 }
 
-/// What a confirmed `y` triggers: most actions hand the terminal over,
-/// a migration starts an in-place job like an install does.
+/// What a confirmed `y` triggers. A migration starts an in-place job
+/// like an install does; a removal decides its shape only at the `y` —
+/// in place, or the terminal handoff — because privilege is a property
+/// of the world, checked fresh (see `remove_confirmed`).
 enum OnConfirm {
-    Terminal(PendingAction),
     Migrate {
         name: String,
         /// The row's version string, for the result line — display data
@@ -187,6 +188,10 @@ enum OnConfirm {
         /// the checkpoint's job to reject.
         snap: crate::MigrationSnapshot,
     },
+    /// `x`: the shape (in place or terminal handoff) is decided fresh
+    /// at the `y`, not at the keypress — privilege is a property of the
+    /// world, and the world may move while the prompt is open.
+    Remove { name: String },
     /// `migrate --all`: the whole plan frozen at the keypress, one
     /// snapshot per row, complete or not at all.
     MigrateAll {
@@ -1954,8 +1959,48 @@ impl App {
             let prompt = format!("remove {} ({})? [y/N]", row.name, row.bins.join(", "));
             self.confirm = Some(Confirm::new(
                 &prompt,
-                OnConfirm::Terminal(PendingAction::Remove(row.name.clone())),
+                OnConfirm::Remove {
+                    name: row.name.clone(),
+                },
             ));
+        }
+    }
+
+    /// The decision at the `y`: the same escalation test the build
+    /// preflight consults (destination writability plus, where sudo is
+    /// possible at all, lock preparation). Escalation means today's
+    /// terminal handoff — a password prompt belongs on the real
+    /// terminal, and sudo asks naturally there. No escalation means in
+    /// place: removal is instant, and a prefix that never asks a
+    /// password earns no screen flip. The lock is nonblocking by the
+    /// same UI-thread argument as the in-place worker's checkpoints —
+    /// a busy prefix is an answer, not a frozen interface.
+    fn remove_confirmed(&mut self, name: String) {
+        let policy = crate::privileged::Policy::for_prefix(&self.prefix);
+        let escalate = match crate::install_needs_privilege(policy, &self.prefix) {
+            Ok(escalate) => escalate,
+            Err(e) => {
+                self.error(&format!("{e:#}"));
+                return;
+            }
+        } || (matches!(policy.sudo, crate::privileged::Sudo::Allowed)
+            && StateLock::preparation_needs_privilege(&self.prefix));
+        if escalate {
+            self.queue(PendingAction::Remove(name));
+            return;
+        }
+        match crate::tui_remove_one(&self.prefix, &name) {
+            Ok(crate::TuiRemove::Removed(bins)) => {
+                if let Err(e) = self.reload() {
+                    self.error(&format!("removed {name}, but the reload failed: {e:#}"));
+                    return;
+                }
+                self.info(&format!("removed {name} ({})", bins.join(", ")));
+            }
+            Ok(crate::TuiRemove::PrefixBusy) => {
+                self.info("the prefix is busy (another cargo-lbin holds its lock); try again");
+            }
+            Err(e) => self.error(&format!("removing `{name}` failed: {e:#}")),
         }
     }
 
@@ -2033,7 +2078,7 @@ impl App {
         };
         if matches!(key.code, KeyCode::Char('y' | 'Y')) {
             match confirm.action {
-                OnConfirm::Terminal(action) => self.queue(action),
+                OnConfirm::Remove { name } => self.remove_confirmed(name),
                 OnConfirm::Migrate {
                     name,
                     version,
@@ -2883,6 +2928,67 @@ mod tests {
             "a jump that did not happen does not cost the person their hits"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_confirmed_remove_runs_in_place_when_no_privilege_is_needed() {
+        let prefix = std::env::temp_dir().join("cargo-lbin-test-tui-remove");
+        let _ = std::fs::remove_dir_all(&prefix);
+        std::fs::create_dir_all(prefix.join("bin")).unwrap();
+        std::fs::create_dir_all(prefix.join("share/cargo-lbin")).unwrap();
+        let mut manifest = Manifest::default();
+        for name in ["foo", "bar"] {
+            std::fs::write(prefix.join("bin").join(name), "#!/bin/sh\n").unwrap();
+            manifest.crates.insert(
+                name.to_owned(),
+                Entry {
+                    version: "0.1.0".into(),
+                    bins: vec![name.to_owned()],
+                    locked: false,
+                    pinned: false,
+                },
+            );
+        }
+        manifest.store(&prefix).unwrap();
+        let mut app = App::new(&prefix).unwrap();
+        app.reload().unwrap();
+
+        // A user-writable prefix: the decision lands in place — no
+        // terminal handoff is queued, the file and the row are gone,
+        // and the interface says so itself.
+        app.remove_confirmed("foo".into());
+        assert!(
+            app.pending.is_none(),
+            "no handoff for a passwordless prefix"
+        );
+        assert!(!prefix.join("bin/foo").exists(), "the binary is gone");
+        assert!(
+            app.visible().iter().all(|row| row.name != "foo"),
+            "the row is gone from the reloaded list"
+        );
+        let said = app.message.take().expect("the removal reports itself");
+        assert!(
+            said.text.contains("removed foo"),
+            "the interface owns the words: {}",
+            said.text
+        );
+
+        // A held lock is an answer, not a wait: the removal refuses,
+        // nothing changes, and the message says busy.
+        let held = StateLock::acquire(&prefix, &Mode::Exclusive).unwrap();
+        app.remove_confirmed("bar".into());
+        drop(held);
+        assert!(
+            prefix.join("bin/bar").exists(),
+            "a busy prefix removes nothing"
+        );
+        let said = app.message.take().expect("the refusal reports itself");
+        assert!(said.text.contains("busy"), "named as busy: {}", said.text);
+        assert!(
+            app.visible().iter().any(|row| row.name == "bar"),
+            "the row survives the refusal"
+        );
+        let _ = std::fs::remove_dir_all(&prefix);
     }
 
     #[test]
