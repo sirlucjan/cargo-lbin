@@ -122,7 +122,7 @@ fn non_yanked(name: &str, releases: Vec<Release>) -> Result<Vec<Version>> {
 ///
 /// This is history, not eligibility: the newest releases are reported
 /// whether or not they were yanked, and carry the flag so the reader sees
-/// "1.1.0 [yanked]" rather than being told 1.0.0 is the latest — that would
+/// "1.1.0 \[yanked\]" rather than being told 1.0.0 is the latest — that would
 /// hide the yank, which is the single most useful thing to know about it.
 /// Whether the *installed* copy can move anywhere is a separate question
 /// answered from the non-yanked subset, by the same rules `update` uses.

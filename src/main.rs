@@ -45,17 +45,20 @@ placement. State lives in <prefix>/share/cargo-lbin/manifest.json. Sources are \
 crates.io exclusively."
 )]
 struct Cli {
-    /// Installation prefix; binaries land in <prefix>/bin
     // Precedence: explicit --prefix, then $CARGO_LBIN_PREFIX, then
     // /usr/local — clap's env support handles the ordering and appends
     // the [env: ...] and [default: ...] annotations to --help on its
     // own. The point: a user who never wants sudo exports
     // CARGO_LBIN_PREFIX=~/.local once (expanded by the shell) and stops
     // typing --prefix on every command.
+    // `help =`, not a doc comment: the text is help-text only, and
+    // `<prefix>/bin` — the help's established notation, used twice in
+    // the long about — parses as an unclosed HTML tag under rustdoc.
     #[arg(
         long,
         global = true,
         env = "CARGO_LBIN_PREFIX",
+        help = "Installation prefix; binaries land in <prefix>/bin",
         default_value = "/usr/local"
     )]
     prefix: PathBuf,
