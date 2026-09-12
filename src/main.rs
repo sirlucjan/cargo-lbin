@@ -1255,9 +1255,12 @@ pub(crate) struct VerifyReport {
 /// a lockless-by-design look at the other prefixes, a PATH scan that
 /// may ask the distro package manager who owns a file — run after it
 /// drops, because nobody's install should wait on `rpm -qf`.
-pub(crate) fn verify_prefix(prefix: &Path) -> Result<VerifyReport> {
+pub(crate) fn verify_prefix(
+    prefix: &Path,
+    lock_notice: &mut dyn FnMut(&str),
+) -> Result<VerifyReport> {
     let (crates, errors, names, all_bins) = {
-        let _lock = StateLock::acquire_shared_existing(prefix)?;
+        let _lock = StateLock::acquire_shared_existing(prefix, lock_notice)?;
         // `load_unvalidated`, because the validated loader refuses
         // exactly the corrupt states verify exists to name: behind
         // `Manifest::load`, an unparseable version or a doubly-claimed
@@ -1622,7 +1625,10 @@ fn stale_stages(cache: &Path) -> Vec<PathBuf> {
 /// consistent. Warnings alone exit zero on purpose: a deliberate PATH
 /// or a leftover stage must not turn a healthy prefix red in a script.
 fn cmd_verify(prefix: &Path) -> Result<()> {
-    let report = verify_prefix(prefix)?;
+    // The CLI's channel for the lock wait: stderr, like every other
+    // notice — a silent multi-minute wait on someone else's build is
+    // indistinguishable from a hang.
+    let report = verify_prefix(prefix, &mut |m: &str| eprintln!("{m}"))?;
     for e in &report.errors {
         eprintln!("error: {e}");
     }
@@ -4512,7 +4518,7 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         let prefix = root.join("fresh");
         fs::create_dir_all(&prefix).unwrap();
-        let report = verify_prefix(&prefix).unwrap();
+        let report = verify_prefix(&prefix, &mut |_| {}).unwrap();
         assert_eq!(
             report.crates,
             Some(0),
@@ -4571,7 +4577,7 @@ mod tests {
         let prefix = root.join("prefix");
         fs::create_dir_all(prefix.join("share/cargo-lbin")).unwrap();
         fs::write(Manifest::path(&prefix), "not json at all").unwrap();
-        let report = verify_prefix(&prefix).unwrap();
+        let report = verify_prefix(&prefix, &mut |_| {}).unwrap();
         assert_eq!(report.errors.len(), 1, "{:?}", report.errors);
         assert!(
             report.errors[0].contains("cannot be parsed"),
@@ -4593,7 +4599,7 @@ mod tests {
         // corrupt — read_to_string would have laundered this into
         // InvalidData and the wrong finding.
         fs::write(Manifest::path(&prefix), b"\xff\xfe not utf8").unwrap();
-        let report = verify_prefix(&prefix).unwrap();
+        let report = verify_prefix(&prefix, &mut |_| {}).unwrap();
         assert!(
             report.errors[0].contains("cannot be parsed"),
             "corrupt bytes are corruption, not I/O: {:?}",
@@ -4610,7 +4616,7 @@ mod tests {
         // healthy, so the finding must not suggest restoring anything.
         fs::remove_file(Manifest::path(&prefix)).unwrap();
         fs::create_dir(Manifest::path(&prefix)).unwrap();
-        let report = verify_prefix(&prefix).unwrap();
+        let report = verify_prefix(&prefix, &mut |_| {}).unwrap();
         assert!(
             report.errors[0].contains("cannot be inspected"),
             "an I/O failure says nothing about the content: {:?}",
@@ -4854,7 +4860,7 @@ mod tests {
             r#"{"crates":{"esccrate":{"version":"0.1.0\u001b[31m","bins":["esccrate"]}}}"#,
         )
         .unwrap();
-        let report = verify_prefix(&prefix).unwrap();
+        let report = verify_prefix(&prefix, &mut |_| {}).unwrap();
         assert!(
             !report.errors.is_empty(),
             "the smuggled version is at least unparseable"

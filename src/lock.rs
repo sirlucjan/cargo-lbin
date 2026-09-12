@@ -52,10 +52,17 @@ impl StateLock {
     /// not from a racing removal; an auditor's findings are advisory
     /// either way, and a spurious one costs a re-run, never state.
     /// Blocks like `acquire` when the lock exists — waiting out someone
-    /// else's build beats auditing a prefix mid-placement — but silently:
-    /// the callers are read-only paths that may run beneath an alternate
-    /// screen, and an advisory read would rather say nothing.
-    pub fn acquire_shared_existing(prefix: &Path) -> Result<Option<Self>> {
+    /// else's build beats auditing a prefix mid-placement — and says so
+    /// through `notice`, the same channel split `acquire_with` uses: the
+    /// CLI prints it to stderr, because a silent multi-minute wait on
+    /// someone else's build is indistinguishable from a hang, while the
+    /// TUI passes a noop — its spinner already says a job is alive, and
+    /// a worker's eprintln beneath the alternate screen is exactly what
+    /// this path's quiet design forbids.
+    pub fn acquire_shared_existing(
+        prefix: &Path,
+        notice: &mut dyn FnMut(&str),
+    ) -> Result<Option<Self>> {
         let path = prefix.join("share/cargo-lbin/lock");
         let file = match OpenOptions::new().read(true).open(&path) {
             Ok(file) => file,
@@ -76,8 +83,21 @@ impl StateLock {
                 return Err(e).with_context(|| format!("opening {}", path.display()));
             }
         };
-        file.lock_shared()
-            .with_context(|| format!("locking {} (shared)", path.display()))?;
+        // The same probe-then-block shape as `acquire_impl`, for the
+        // same reason: a non-blocking probe tells an actual wait apart
+        // from an instant acquisition, so the notice fires only when
+        // there is genuinely someone to wait for.
+        match file.try_lock_shared() {
+            Ok(()) => {}
+            Err(TryLockError::WouldBlock) => {
+                notice("another cargo-lbin instance holds the state lock; waiting...");
+                file.lock_shared()
+                    .with_context(|| format!("locking {} (shared)", path.display()))?;
+            }
+            Err(TryLockError::Error(e)) => {
+                return Err(e).with_context(|| format!("locking {} (shared)", path.display()));
+            }
+        }
         Ok(Some(Self { _file: Some(file) }))
     }
 
@@ -237,6 +257,52 @@ impl StateLock {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_contended_shared_existing_wait_is_announced_and_a_free_one_is_not() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let root = std::env::temp_dir().join("cargo-lbin-test-lock-notice");
+        let _ = std::fs::remove_dir_all(&root);
+        let prefix = root.join("prefix");
+        std::fs::create_dir_all(prefix.join("share/cargo-lbin")).unwrap();
+        let lock_path = prefix.join("share/cargo-lbin/lock");
+
+        // Free lock: instant acquisition, and the probe keeps the
+        // notice quiet — nobody to wait for means nothing to announce.
+        std::fs::File::create(&lock_path).unwrap();
+        let mut fired = false;
+        let got = StateLock::acquire_shared_existing(&prefix, &mut |_| fired = true)
+            .unwrap()
+            .expect("the lock file exists");
+        assert!(!fired, "an instant acquisition says nothing");
+        drop(got);
+
+        // Contended: an exclusive holder on a separate description, the
+        // waiter on a thread, the notice through a channel — it must
+        // arrive while the holder still holds, or the wait was silent.
+        let holder = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        holder.lock().unwrap();
+        let (tx, rx) = mpsc::channel();
+        let p2 = prefix.clone();
+        let waiter = std::thread::spawn(move || {
+            let mut notice = |m: &str| {
+                let _ = tx.send(m.to_owned());
+            };
+            StateLock::acquire_shared_existing(&p2, &mut notice)
+        });
+        let msg = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the wait announces itself while the holder holds");
+        assert!(msg.contains("waiting"), "{msg}");
+        drop(holder);
+        let got = waiter.join().unwrap().unwrap();
+        assert!(got.is_some(), "the lock arrives once the holder lets go");
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn try_variant_yields_instead_of_waiting() {

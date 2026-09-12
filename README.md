@@ -475,7 +475,9 @@ It is read-only in the strictest sense: it does not even prepare the
 lock. A shared lock is taken only where one already exists — never
 created, along with nothing else — and a prefix that has no lock yet is
 read without one, which the atomic manifest placement keeps safe from
-torn files. There is no `--fix` by design — a finding names the
+torn files; when someone else's operation holds the lock, the wait
+says so on stderr rather than looking like a hang. There is no `--fix`
+by design — a finding names the
 existing repair command where lbin has an unambiguous one, and
 otherwise describes the state and leaves the decision to you; the
 repair commands already own the locks, confirmations and privilege

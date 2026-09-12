@@ -2511,7 +2511,13 @@ impl App {
         let (tx, rx) = mpsc::channel();
         let prefix = self.prefix.clone();
         thread::spawn(move || {
-            let _ = tx.send(crate::verify_prefix(&prefix));
+            // The lock-wait notice is a noop here on purpose: the
+            // spinner already says a job is alive, and a worker's
+            // eprintln beneath the alternate screen is exactly what the
+            // read-only path's quiet design forbids. The CLI passes its
+            // stderr printer instead — same channel split as
+            // acquire_with.
+            let _ = tx.send(crate::verify_prefix(&prefix, &mut |_| {}));
         });
         self.job = Some(Job::Verify {
             rx,
