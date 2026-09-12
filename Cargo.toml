@@ -30,11 +30,9 @@ serde_json = "1"
 clap = { version = "4", features = ["derive", "env"] }
 clap_complete = "4"
 ureq = { version = "2", features = ["tls", "native-certs"] }
-# unstable-rendered-line-info: Paragraph::line_count, the renderer's own
-# word-wrap arithmetic — the scroll clamp of the report panel must count
-# rows the way the wrapper breaks them, or a tail becomes unreachable.
-# "Unstable" is ratatui's API-stability marker, not a correctness one;
-# a rename upstream fails this build loudly at the next bump.
+# unstable-rendered-line-info: Paragraph::line_count — the report panel's
+# scroll clamp must count rows the way the wrapper breaks them. "Unstable"
+# is ratatui's API-stability marker; a rename fails this build loudly.
 ratatui = { version = "0.30.2", optional = true, default-features = false, features = ["crossterm", "unstable-rendered-line-info"] }
 
 [profile.release]

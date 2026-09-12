@@ -1,21 +1,13 @@
 //! Machine-readable output for `list --json` and `checkupdate --json`.
 //!
-//! This is a contract. A script written against it today must keep
-//! working. Every document carries `schema`. Existing fields are never
-//! renamed, removed, retyped or given new semantics without a schema
-//! bump. New fields may be added within the same schema version;
-//! consumers must ignore fields they do not know. JSON object member
-//! order is not part of the schema — JSON gives a consumer no semantics
-//! for it, and a script that greps instead of parsing is not owed
-//! compatibility.
+//! A contract: every document carries `schema`; existing fields are
+//! never renamed, removed, retyped or re-semanticized without a bump;
+//! new fields may be added within a version and consumers must ignore
+//! unknown ones. Member order is not part of the schema. Golden tests
+//! pin the emitted representation so any change is deliberate.
 //!
-//! Golden tests pin the currently emitted representation so that any
-//! change to it is deliberate: adding a field edits the golden and keeps
-//! the schema number; changing an existing field edits the golden and
-//! bumps it.
-//!
-//! On stdout: the JSON document and nothing else. Warnings stay on
-//! stderr, exit codes are the text mode's.
+//! On stdout: the document and nothing else; warnings on stderr, exit
+//! codes the text mode's.
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -51,9 +43,8 @@ pub struct ListCrate {
     /// The newest version the last check found; `null` when `status` is
     /// `unknown` — absent knowledge, not an empty version.
     pub latest: Option<Version>,
-    /// Other known lbin prefixes carrying this crate. Additive and
-    /// skipped when empty, so schema 1 consumers keep parsing untouched
-    /// documents; anyone who wants it, asks for it by name.
+    /// Other known lbin prefixes carrying this crate; additive, skipped
+    /// when empty — schema 1 consumers keep parsing untouched documents.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub also_in: Vec<AlsoInJson>,
 }
@@ -65,9 +56,8 @@ pub struct AlsoInJson {
     pub version: String,
 }
 
-/// The three states of `report::Status`, plus the one it expresses as
-/// `None`, named explicitly so a script never has to infer "unknown"
-/// from a missing field.
+/// `report::Status`'s three states plus its `None`, named explicitly
+/// so a script never infers "unknown" from a missing field.
 #[derive(Serialize, Clone, Copy, PartialEq, Eq, Debug)]
 #[serde(rename_all = "snake_case")]
 pub enum ListStatus {
@@ -142,11 +132,8 @@ impl ListCrate {
     /// shared by JSON views of manifest state, so no two views can
     /// drift in how they read the same record.
     fn annotated(name: &str, entry: &crate::manifest::Entry, report: Option<&Report>) -> Self {
-        // `latest` is what the check found, taken from the record
-        // itself — not `current` echoed back for an up-to-date
-        // crate, which would be wrong whenever the installed
-        // version has been yanked since and the newest live one
-        // is older.
+        // `latest` is what the check found — not `current` echoed back,
+        // which would be wrong when the installed version was yanked since.
         let (status, latest) = Version::parse(&entry.version)
             .ok()
             .and_then(|current| report?.checked_for(name, &current))
@@ -171,10 +158,9 @@ impl ListCrate {
     }
 }
 
-/// `pinned [--check] --json`: the pinned subset of the manifest, each
-/// entry in exactly the `list --json` per-crate shape — a consumer that
-/// parses one parses the other. `pinned` is carried even though it is
-/// always `true` here: uniformity is the point, not economy.
+/// `pinned [--check] --json`: the pinned subset in exactly the
+/// `list --json` per-crate shape; `pinned` carried though always true
+/// — uniformity is the point.
 #[derive(Serialize)]
 pub struct PinnedOutput {
     pub schema: u32,
@@ -193,10 +179,8 @@ impl PinnedOutput {
         report: Option<&Report>,
         also: &std::collections::BTreeMap<String, Vec<crate::prefixes::AlsoIn>>,
     ) -> Self {
-        // The same annotation path as ListOutput, deliberately: the
-        // documented invariant is "pinned --json is list --json filtered
-        // to pinned == true, entry for entry", and an entry that gains
-        // also_in in one document and not the other is two entries.
+        // The same annotation path as ListOutput: the documented invariant is
+        // entry-for-entry equality on the pinned subset.
         let crates = manifest
             .crates
             .iter()
@@ -299,10 +283,9 @@ mod tests {
         }
     }
 
-    /// The representation as currently emitted, byte for byte, so that a
-    /// change to it is made on purpose. Editing this test is expected
-    /// when a field is added; it is a schema bump only when an existing
-    /// field changes (see the module doc).
+    /// The representation as emitted, byte for byte: editing this test is
+    /// expected when a field is added; a schema bump only when an existing
+    /// field changes.
     #[test]
     fn list_output_golden() {
         let out = ListOutput::build(
@@ -445,11 +428,9 @@ mod tests {
 
     #[test]
     fn pinned_output_is_the_pinned_subset_of_list() {
-        // The invariant a consumer may rely on: `pinned --json` is
-        // `list --json` filtered to `pinned == true`, entry for entry.
-        // A non-empty map, and one that touches a pinned crate: an
-        // invariant test fed an empty map would stay green while
-        // pinned --json silently lost the annotation list --json has.
+        // The invariant a consumer may rely on, fed a non-empty map touching
+        // a pinned crate — an empty one would stay green while the annotation
+        // silently vanished.
         let mut also = std::collections::BTreeMap::new();
         also.insert(
             "bat".to_owned(),
@@ -496,11 +477,9 @@ mod tests {
 
     #[test]
     fn also_in_is_additive_and_absent_when_empty() {
-        // Schema stays 1: the field is skipped entirely for a crate
-        // installed nowhere else, so untouched documents are
-        // byte-compatible with pre-0.8 consumers; when present it names
-        // prefix and version, because version skew is what the reader
-        // wants to notice.
+        // Schema stays 1: skipped entirely for a crate installed nowhere
+        // else, so untouched documents stay byte-compatible; when present it
+        // names prefix and version — skew is what the reader wants to notice.
         let empty = ListOutput::build(
             PathBuf::from("/p"),
             &manifest(),

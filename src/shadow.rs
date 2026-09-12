@@ -1,43 +1,27 @@
 //! Warn when a binary about to be installed shares its name with one
-//! already on `PATH` outside the prefix — typically a distribution
-//! package in `/usr/bin`.
+//! already on `PATH` outside the prefix — typically a distro package.
 //!
-//! This is a warning, never a refusal. The person installing may know
-//! exactly what they are doing (a newer version than the distro ships is
-//! the usual reason to reach for cargo-lbin at all); what they may not
-//! know is where the two copies stand in `PATH`, because that — not
-//! freshness — is what decides which one a bare name reaches. So the
-//! warning says three things: which existing file has the name, who
-//! owns it if a package manager will say, and which of the two
-//! directories comes first in `PATH`. Directory order is all it claims.
-//! Which file the current user can actually execute — a root-owned
-//! `0100`, an ACL, a shell's command hash — is not determined here, and
-//! the wording is kept to what is: filesystem says a regular file with
-//! some execute bit exists, `PATH` says which location is earlier, the
-//! package manager says who owns it. Nothing simulates a shell.
+//! A warning, never a refusal: the person may know exactly what they
+//! are doing; what they may not know is where the two copies stand in
+//! `PATH`, which — not freshness — decides what a bare name reaches.
+//! The warning claims directory order and nothing more: no `access(2)`
+//! simulation, no shell.
 //!
-//! Ownership is asked of whichever package manager is present — pacman,
-//! rpm, dpkg — by absolute path, never by `PATH` lookup: this tool puts
-//! binaries into a directory that usually precedes `/usr/bin`, so a
-//! managed crate named `pacman` would otherwise be the thing asked. The
-//! file's path is passed as a single argument, no shell involved. Any
-//! failure there degrades to "owner unknown"; the shadowing fact itself
-//! needs nothing but the filesystem.
+//! Ownership is asked of whichever package manager is present, by
+//! absolute path — never `PATH` lookup, or a managed crate named
+//! `pacman` would be the thing asked. Any failure degrades to "owner
+//! unknown".
 //!
-//! Everything printed here came from outside — a path from `PATH`, a
-//! line from a package manager — and goes to a terminal. The same rule
-//! as for crates.io data applies at this boundary: data is data, control
-//! characters are replaced before anything reaches stderr.
+//! Everything printed here came from outside and goes to a terminal:
+//! control characters are replaced before anything reaches stderr.
 
 use std::ffi::OsStr;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
-/// Where `<prefix>/bin` stands relative to the existing file's
-/// directory in `PATH`. Three states, because "the prefix is not
-/// earlier" has two distinct causes with two distinct messages: it
-/// comes later, or it is not on `PATH` at all.
+/// Where `<prefix>/bin` stands in `PATH`. Three states: "not earlier"
+/// has two causes with two messages — later, or not on `PATH` at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
     /// `<prefix>/bin` precedes the existing file's directory.
@@ -57,26 +41,19 @@ pub struct Shadow {
     pub outcome: Outcome,
 }
 
-/// A regular file with an execute bit for someone. A plain file of the
-/// right name is not a program — `is_file()` alone would stop the scan
-/// on a `0644` `rg` in an early `PATH` directory. Whether the *current
-/// user* may execute it (a root-owned `0100`, an ACL) is deliberately
-/// not checked: that would need `access(2)`, and the warning claims
-/// only directory order, which this test is enough to support.
-/// Symlinks are followed.
+/// A regular file with an execute bit for someone — `is_file()` alone
+/// would stop the scan on a 0644 `rg`. Whether the *current user* may
+/// execute it is deliberately unchecked: the warning claims only
+/// directory order. Symlinks are followed.
 pub fn is_executable(path: &Path) -> bool {
     path.metadata()
         .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
 }
 
-/// Anchor a `PATH` entry the way a shell resolves it: an empty entry is
-/// the current directory, a relative one is relative to it. Without
-/// this, `--prefix local` and a `PATH` containing `$PWD/local/bin` would
-/// not recognize each other as the same directory. Normalization is
-/// lexical — `.` and `..` folded, separators collapsed — and does not
-/// consult the filesystem, so a symlink on the way can still make two
-/// spellings of one directory look different; the cost of that is a
-/// warning too many or too few, never a wrong action.
+/// Anchor a `PATH` entry the way a shell resolves it: empty = cwd,
+/// relative = relative to it. Normalization is lexical — a symlink can
+/// still make two spellings differ; the cost is a warning too many or
+/// too few, never a wrong action.
 fn anchor(entry: PathBuf, cwd: &Path) -> PathBuf {
     let entry = if entry.as_os_str().is_empty() {
         cwd.to_path_buf()
@@ -99,11 +76,9 @@ fn anchor(entry: PathBuf, cwd: &Path) -> PathBuf {
     out
 }
 
-/// Scan `PATH` (as given) for files named like `bins`, ignoring
-/// `prefix_bin` itself and reporting only the first matching candidate
-/// per name in `PATH` order. `cwd` anchors relative entries; `exists`
-/// (`is_executable` in production) is injected so the scan is testable
-/// without a filesystem.
+/// Scan `PATH` for files named like `bins`, ignoring `prefix_bin`,
+/// first match per name in `PATH` order; `exists` injected so the scan
+/// is testable without a filesystem.
 pub fn find_shadows(
     path_var: &OsStr,
     prefix_bin: &Path,
@@ -136,9 +111,8 @@ pub fn find_shadows(
         .collect()
 }
 
-/// The package owning `path`, as described by the first package manager
-/// present that claims it. First line of the tool's output, trimmed;
-/// the exact format is the tool's, quoted rather than parsed.
+/// The package owning `path`, per the first present manager that
+/// claims it; first output line, trimmed, quoted rather than parsed.
 pub fn owner_of(path: &Path) -> Option<String> {
     // Absolute paths: see the module doc.
     let queries: [(&str, &[&str]); 3] = [
@@ -152,10 +126,8 @@ pub fn owner_of(path: &Path) -> Option<String> {
             continue;
         };
         if !output.status.success() {
-            // This tool does not claim the file (or errored). Ask the
-            // next one: a stray `/usr/bin/pacman` on a Fedora box must
-            // not stop `rpm -qf` from answering. Normal systems still
-            // make one query — they have one manager.
+            // Not claimed (or errored): ask the next one — a stray
+            // /usr/bin/pacman on a Fedora box must not stop `rpm -qf`.
             continue;
         }
         let line = String::from_utf8_lossy(&output.stdout)
@@ -172,11 +144,9 @@ pub fn owner_of(path: &Path) -> Option<String> {
     None
 }
 
-/// Text from outside the program, made safe for a terminal: control
-/// characters replaced with spaces, whitespace collapsed. The same rule
-/// `api` applies to crates.io responses; kept local because this module
-/// and that one are the two boundaries, and each should be readable on
-/// its own.
+/// Outside text made terminal-safe: control chars to spaces,
+/// whitespace collapsed. Kept local: this module and `api` are the two
+/// boundaries, each readable alone.
 fn terminal_text(text: &str) -> String {
     text.chars()
         .map(|c| if c.is_control() { ' ' } else { c })
@@ -186,9 +156,8 @@ fn terminal_text(text: &str) -> String {
         .join(" ")
 }
 
-/// One warning line per shadow, ready for stderr. Every external value
-/// — the path from `PATH`, the owner line from the package manager, the
-/// binary name from cargo — passes through `terminal_text`.
+/// One warning line per shadow; every external value passes through
+/// `terminal_text`.
 pub fn describe(shadow: &Shadow, prefix_bin: &Path, owner: Option<&str>) -> String {
     let prefix_bin = terminal_text(&prefix_bin.to_string_lossy());
     let existing_dir = shadow

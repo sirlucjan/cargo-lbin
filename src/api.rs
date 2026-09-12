@@ -1,20 +1,13 @@
-//! Minimal crates.io *API* client — the search endpoint only.
+//! Minimal crates.io *API* client — the search endpoint only. The
+//! sparse index answers "what versions does X have"; "what is there
+//! like X" is the API's, for `search` alone — a preview for choosing a
+//! name; `info` is where a name gets looked at properly.
 //!
-//! The sparse index (see `index`) is one file per crate under a
-//! deterministic path; it can answer "what versions does X have" but not
-//! "what is there like X". That second question is the API's, and this
-//! module asks it, for `search` alone. Everything version-related stays
-//! with the index: what the API reports here is a preview for choosing a
-//! name, and `info` is where a name gets looked at properly.
-//!
-//! crates.io asks API clients for a meaningful User-Agent (shared with the
-//! index client) and at most one request per second. The second rule is
-//! enforced here, not left to callers: the CLI makes one request per
-//! process, but the TUI can issue several searches in one session as
-//! fast as they are typed, and the policy belongs to the client of the
-//! service, not to everyone who happens to call it. A request that would
-//! come too soon after the previous one waits for the remainder of the
-//! second first — on the calling thread, which in the TUI is the worker.
+//! crates.io asks for a meaningful User-Agent and at most one request
+//! per second — enforced here, not left to callers: the TUI can issue
+//! searches as fast as they are typed, and the policy belongs to the
+//! client of the service. The wait happens on the calling thread (the
+//! TUI's worker).
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
@@ -32,22 +25,18 @@ const API_INTERVAL: Duration = Duration::from_secs(1);
 /// When the last API request left this process; `None` before the first.
 static LAST_REQUEST: Mutex<Option<Instant>> = Mutex::new(None);
 
-/// How long a request starting at `now` must wait to honour the interval
-/// after the previous one. Pure: it answers the question and records
-/// nothing, because what gets recorded must be when the request actually
-/// left, and only the caller knows that.
+/// How long a request starting at `now` must wait. Pure: only the
+/// caller knows when the request actually left.
 fn wait_for_slot(last: Option<Instant>, now: Instant) -> Duration {
     last.map_or(Duration::ZERO, |prev| {
         API_INTERVAL.saturating_sub(now.saturating_duration_since(prev))
     })
 }
 
-/// Blocks until this process may send its next API request. The lock is
-/// held across the sleep so a second caller queues behind the first
-/// rather than computing its own wait from a stale timestamp. The
-/// timestamp is taken *after* the sleep: recording the planned wake-up
-/// instead would let a late wake-up (the scheduler promises nothing)
-/// shorten the gap to the request after it.
+/// Blocks until the next API request may go. The lock is held across
+/// the sleep so a second caller queues rather than computing from a
+/// stale timestamp; the timestamp is taken *after* the sleep — a late
+/// wake-up must not shorten the next gap.
 fn throttle() {
     let mut last = LAST_REQUEST.lock().unwrap_or_else(PoisonError::into_inner);
     let wait = wait_for_slot(*last, Instant::now());
@@ -61,10 +50,9 @@ fn throttle() {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Hit {
     pub name: String,
-    /// Newest stable version if there is one, else what crates.io would
-    /// display, else newest of any kind — the same preference `info`
-    /// shows, so the two agree at a glance. `?` if the response carried
-    /// no usable version at all.
+    /// Newest stable, else what crates.io would display, else newest of
+    /// any kind — `info`'s preference, so the two agree; `?` if nothing
+    /// usable.
     pub version: String,
     pub description: String,
 }
@@ -74,10 +62,9 @@ struct SearchBody {
     crates: Vec<CrateEntry>,
 }
 
-/// Only `name` is required of the response. crates.io marks
-/// `max_version` and `max_stable_version` deprecated and has added
-/// `default_version`; any of the three may disappear or arrive `null`,
-/// and a display-only field must not be able to take `search` down.
+/// Only `name` is required: crates.io deprecates and adds version
+/// fields over time, and a display-only field must not take `search`
+/// down.
 #[derive(Deserialize)]
 struct CrateEntry {
     name: String,
@@ -92,9 +79,8 @@ struct CrateEntry {
 }
 
 impl CrateEntry {
-    /// Newest stable if reported, else the version crates.io itself
-    /// would display, else the legacy "newest of any kind", else a
-    /// visible placeholder — never a failed parse.
+    /// Newest stable, else crates.io's display version, else the legacy
+    /// newest, else a visible placeholder — never a failed parse.
     fn shown_version(&self) -> String {
         [
             &self.max_stable_version,
@@ -109,10 +95,9 @@ impl CrateEntry {
     }
 }
 
-/// Ask crates.io for crates matching `query`, at most `limit` of them, in
-/// the relevance order crates.io chose. "At most" is enforced locally:
-/// `per_page` is a request, and a caller sizing a panel or numbering
-/// picks needs a bound the server cannot exceed.
+/// Search crates.io, at most `limit` hits in its relevance order —
+/// enforced locally: `per_page` is a request, and panel sizing needs a
+/// bound the server cannot exceed.
 pub fn search(query: &str, limit: usize) -> Result<Vec<Hit>> {
     if query.trim().is_empty() {
         bail!("empty search query");
@@ -132,10 +117,9 @@ pub fn search(query: &str, limit: usize) -> Result<Vec<Hit>> {
     Ok(hits)
 }
 
-/// Registry text on top of the shared rule (`text::sanitize`): controls
-/// become spaces there; here whitespace additionally collapses, because
-/// a crate description is prose. Build output must NOT pass through
-/// this one — rustc's indentation is meaning, not noise.
+/// Registry text on top of `text::sanitize`: whitespace additionally
+/// collapses, because a description is prose. Build output must NOT
+/// pass through this — rustc's indentation is meaning.
 fn sanitize_text(text: &str) -> String {
     crate::text::sanitize(text)
         .split_whitespace()
@@ -143,12 +127,10 @@ fn sanitize_text(text: &str) -> String {
         .join(" ")
 }
 
-/// Sanitizing protects the terminal; it does not make a string a crate
-/// name. A hit's name is later typed into the TUI's install line on a
-/// digit pick, where `foo --locked` would parse as a name and a flag, so
-/// every name is held to the same rule as a name the user typed. The
-/// API should never send such a thing — and the manifest should never
-/// contain one either, which has not stopped `manifest` from checking.
+/// Sanitizing does not make a string a crate name: a hit's name is
+/// later typed into the install line on a digit pick, where
+/// `foo --locked` would parse as name-plus-flag — so every name is
+/// held to the typed-name rule.
 fn parse_search_body(body: &str) -> Result<Vec<Hit>> {
     let parsed: SearchBody =
         serde_json::from_str(body).context("malformed crates.io search response")?;
@@ -237,9 +219,8 @@ mod tests {
 
     #[test]
     fn name_must_be_a_single_crate_name() {
-        // Not command injection — nothing runs a shell — but a name that
-        // parses as two install tokens would change what the TUI's
-        // install line means after a digit pick.
+        // Not command injection (nothing runs a shell), but a name parsing as
+        // two install tokens would change what the install line means.
         for name in ["foo --locked", "foo bar", "../foo", ""] {
             let body = format!(r#"{{"crates": [{{"name": "{name}", "max_version": "1.0.0"}}]}}"#);
             assert!(parse_search_body(&body).is_err(), "{name:?}");
@@ -260,8 +241,8 @@ mod tests {
             wait_for_slot(Some(t0), t0 + Duration::from_secs(5)),
             Duration::ZERO
         );
-        // A previous timestamp in the future (clock oddities) is treated
-        // as "just now", never as an underflow.
+        // A future timestamp (clock oddities) is "just now", never an
+        // underflow.
         assert_eq!(wait_for_slot(Some(t1), t0), API_INTERVAL);
     }
 

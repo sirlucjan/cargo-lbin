@@ -1,31 +1,23 @@
-//! Privilege handling.
+//! Privilege handling: build as the user, escalate only for file
+//! placement — sudo is prepended only when the actual destination
+//! directory is not writable, decided per destination, not per
+//! prefix.
 //!
-//! The rule: build as the user, escalate only for file placement. sudo is
-//! prepended only when the actual destination directory is not writable, so
-//! tests and user-owned prefixes (`--prefix ~/.local`) never touch sudo at
-//! all — and a prefix with mixed ownership (writable `bin/`, root-owned
-//! `share/`) gets the right answer per destination, not per prefix.
+//! Two hardening rules throughout, because build scripts run as the
+//! user first and must not steer this:
 //!
-//! Two hardening rules apply throughout, because crate build scripts run as
-//! the user before any of this executes and must not be able to steer it:
-//!
-//! 1. Nothing on the privileged path is resolved through `$PATH`. A build
-//!    script can drop a fake `sudo` into `~/.local/bin` that prints a
-//!    password prompt; `/usr/bin/sudo` it cannot replace. All tools are
-//!    invoked by absolute path, and restorecon is looked up only in trusted
+//! 1. Nothing privileged resolves through `$PATH` — a build script can
+//!    drop a fake `sudo` into `~/.local/bin`; `/usr/bin/sudo` it
+//!    cannot replace. Absolute paths only; restorecon from trusted
 //!    directories.
 //!
-//! 2. Staged binaries are never handed to root by pathname. The stage is
-//!    user-controlled, so between our checks and `sudo install` a leftover
-//!    process could swap `stage/bin/foo` for a symlink to `/etc/shadow` —
-//!    and GNU install dereferences symlinks, making root read the target
-//!    for the attacker. Instead each source is opened by the user with
-//!    `O_NOFOLLOW`, verified via fstat on the descriptor (regular file,
-//!    owned by us), and root receives `/proc/<our-pid>/fd/<n>`: it copies
-//!    the inode we vetted, not whatever the pathname resolves to later. A
-//!    malicious crate can still ship a malicious binary — we are installing
-//!    its program, after all — but it cannot use cargo-lbin as a confused deputy
-//!    to exfiltrate root-only files.
+//! 2. Staged binaries are never handed to root by pathname: the stage
+//!    is user-controlled, and GNU install dereferences symlinks. Each
+//!    source is opened with `O_NOFOLLOW`, verified via fstat, and root
+//!    receives `/proc/<pid>/fd/<n>` — the vetted inode, not whatever
+//!    the pathname resolves to later. A malicious crate can still ship
+//!    a malicious binary, but not use cargo-lbin as a confused deputy
+//!    to read root-only files.
 
 use anyhow::{Context, Result, bail};
 use std::ffi::OsStr;
@@ -49,22 +41,15 @@ const RESTORECON_CANDIDATES: &[&str] = &[
     "/sbin/restorecon",
 ];
 
-/// The one prefix for which escalation is allowed. Under `/usr/local` every
-/// path component is root-owned, so an unprivileged build script cannot swap
-/// a parent directory for a symlink between our writability check and root's
-/// `install`. Any other prefix that needs sudo is refused: its parents may
-/// be user-controlled, reopening the destination-side TOCTOU that pinning
-/// the source fd does not cover. Writable prefixes (`~/.local`, a
-/// user-owned `/opt/foo`) never escalate and are always fine.
+/// The one prefix escalation is allowed for. Under `/usr/local` every
+/// component is root-owned, so a build script cannot swap a parent for
+/// a symlink between our check and root's `install`; any other prefix
+/// needing sudo is refused — its parents may be user-controlled.
 const CANONICAL_PREFIX: &str = "/usr/local";
 
-/// Whether sudo may be used at all for a given operation. Derived once from
-/// the prefix and threaded through every privileged call, so escalation is a
-/// capability a call site must be handed rather than a runtime decision it
-/// re-derives (and could re-derive differently if a user-controlled prefix
-/// component changes between checks). The invariant is auditable at a
-/// glance: `/usr/local` may escalate, everything else never does.
-/// May this operation use sudo at all? One axis of `Policy`.
+/// May this operation use sudo at all? One axis of `Policy`, derived
+/// once from the prefix and threaded through — a capability a call
+/// site is handed, never a decision it re-derives.
 #[derive(Clone, Copy)]
 pub enum Sudo {
     /// Permitted where the destination is not user-writable.
@@ -73,27 +58,22 @@ pub enum Sudo {
     Forbidden,
 }
 
-/// Who owns the terminal while subprocesses run? The other axis — and
-/// deliberately independent of `Sudo`: an unprivileged `/usr/bin/mv`
-/// failing under a TUI corrupts the screen exactly as thoroughly as a
-/// privileged one, and a prefix that forbids sudo entirely can still be
-/// driven from a frontend that owns the screen.
+/// Who owns the terminal — deliberately independent of `Sudo`: an
+/// unprivileged `mv` failing under a TUI corrupts the screen exactly
+/// as thoroughly as a privileged one.
 #[derive(Clone, Copy)]
 pub enum Screen {
     /// The caller's terminal: children inherit stdio, sudo may prompt.
     Inherited,
-    /// A frontend owns the screen: every child is captured and its words
-    /// travel in errors instead of landing beneath the UI, and sudo runs
-    /// `-n` — a prompt would hang invisibly, so needing a password is a
-    /// loud diagnosis instead of a question. `-v` beforehand is a
-    /// convenience, never a proof (`timestamp_timeout=0`, per-command
-    /// policy), and this is what turns a wanted password into an error.
+    /// A frontend owns the screen: every child is captured, its words
+    /// travel in errors, and sudo runs `-n` — needing a password is a loud
+    /// diagnosis, not a prompt hung invisibly. `-v` beforehand is a
+    /// convenience, never a proof.
     Owned,
 }
 
 /// What a privileged call site is handed: both decisions, made once at
-/// the operation's edge and threaded through, so no call site re-derives
-/// either — and neither axis can silently erase the other.
+/// the operation's edge — neither axis can silently erase the other.
 #[derive(Clone, Copy)]
 pub struct Policy {
     pub sudo: Sudo,
@@ -115,9 +95,8 @@ impl Policy {
         }
     }
 
-    /// The same sudo decision, under a frontend that owns the screen.
-    /// Only a captured frontend calls this, so a CLI-only build never
-    /// does.
+    /// The same sudo decision under a screen-owning frontend; a CLI-only
+    /// build never calls this.
     #[cfg_attr(not(feature = "tui"), allow(dead_code))]
     pub fn screen_owned(self) -> Self {
         Self {
@@ -126,17 +105,15 @@ impl Policy {
         }
     }
 
-    /// Public probe with the same semantics as the internal decision:
-    /// commands call it before starting a long build so a forbidden
-    /// destination fails in milliseconds, not minutes.
+    /// Public probe with the internal decision's semantics: a forbidden
+    /// destination fails in milliseconds, not after a build.
     pub fn probe_destination(self, dir: &Path) -> Result<bool> {
         self.escalate_for(dir)
     }
 
-    /// Decide whether to prepend sudo for a write into `dir`, or fail.
-    /// Under `Forbidden`, a non-writable directory is refused rather than
-    /// escalated — this is what actually stops a privileged custom prefix,
-    /// at every call site, not just at a one-time pre-check.
+    /// Prepend sudo for a write into `dir`, or fail: under `Forbidden` a
+    /// non-writable directory is refused — this is what actually stops a
+    /// privileged custom prefix, at every call site.
     fn escalate_for(self, dir: &Path) -> Result<bool> {
         let needs = needs_privilege(dir);
         match (self.sudo, needs) {
@@ -152,28 +129,22 @@ impl Policy {
     }
 }
 
-/// How many candidate probe names to try before giving up. Exhausting them
-/// takes deliberate squatting; the failure direction is conservative
-/// ("not writable"), never destructive.
+/// Probe names tried before giving up; the failure direction is
+/// conservative ("not writable"), never destructive.
 const PROBE_ATTEMPTS: u32 = 8;
 
-/// Can the current user create files under `dir` (creating it if missing)?
-///
-/// The create-if-missing probe is deliberate: it matches what `install -D`
-/// would do, and if the user can create the directory themselves, the
-/// subsequent write should also happen as the user.
+/// Can the user create files under `dir` (creating it if missing)?
+/// Create-if-missing matches `install -D`: if the user can create the
+/// directory, the write should also happen as the user.
 fn dir_writable(dir: &Path) -> bool {
     if fs::create_dir_all(dir).is_err() {
         return false;
     }
-    // Exclusive create: `fs::write` would truncate an existing file of the
-    // probe's name — or follow a symlink planted under it — and a probe
-    // must never destroy what it finds. `create_new` is `O_CREAT|O_EXCL`,
-    // which refuses anything that already exists, symlinks (even dangling
-    // ones) included. The PID plus a retry suffix keeps a stale probe left
-    // by a crashed run from turning into a false "destination requires
-    // sudo": `AlreadyExists` proves nothing about writability, so try the
-    // next name; any other error is the actual answer.
+    // Exclusive create: `fs::write` would truncate an existing file or
+    // follow a planted symlink; `create_new` (O_CREAT|O_EXCL) refuses
+    // both. PID + retry suffix keeps a stale probe from a crashed run
+    // from proving anything: AlreadyExists says nothing about
+    // writability, so try the next name.
     let pid = std::process::id();
     for attempt in 0..PROBE_ATTEMPTS {
         let probe = dir.join(format!(".cargo-lbin-write-probe.{pid}.{attempt}"));
@@ -196,34 +167,14 @@ pub fn needs_privilege(dir: &Path) -> bool {
     !dir_writable(dir)
 }
 
-/// Validate sudo credentials *before* a long operation, so the initial
-/// password prompt lands at a predictable moment — not somewhere after a
-/// multi-minute build, when the user has long looked away. sudo may still
-/// ask again later if its credential timestamp expires in the meantime
-/// (a long build, `timestamp_timeout=0`, per-TTY policy); that is sudo's
-/// call to make, and deliberately not worked around here.
-///
-/// `escalate` is the caller's union over every privileged write ahead
-/// (binaries, state, lock): when none will use sudo, nothing here runs
-/// at all. Otherwise `sudo -n -v` asks
-/// noninteractively whether the credential timestamp is still fresh —
-/// `-v` because the question is the timestamp itself, not authorization
-/// for any particular command; if it is fresh, there is nothing to say
-/// and no prompt to show. Only when sudo would prompt is the reason
-/// announced, and `sudo -v` then owns the prompt on the inherited
-/// terminal — echo, retries, PAM and the timestamp are sudo's business.
-/// cargo-lbin never reads, buffers or forwards the password; that is a
-/// design rule, not an implementation detail.
-///
-/// Preauthorization is a UX convenience, not proof of authorization: a
-/// command-specific sudoers policy can still treat the later privileged
-/// calls differently than `-v`. Those calls authorize on their own
-/// terms either way; this merely times the common case's prompt well.
-/// Is sudo's credential timestamp fresh enough that `sudo` would not
-/// prompt right now? `-n -v` asks exactly that, noninteractively: the
-/// question is the timestamp itself, not authorization for any
-/// particular command. A frontend uses this to decide whether it must
-/// hand the terminal to sudo before a privileged step.
+/// Validate sudo credentials *before* a long operation, so the prompt
+/// lands at a predictable moment; sudo may still re-ask later — its
+/// call, deliberately not worked around. `sudo -n -v` asks whether the
+/// timestamp is fresh (the question is the timestamp, not any
+/// command); only when sudo would prompt is the reason announced, and
+/// `sudo -v` then owns the prompt — cargo-lbin never reads, buffers or
+/// forwards the password, a design rule. Preauthorization is UX, not
+/// proof: the later calls authorize on their own terms.
 pub fn credentials_fresh() -> Result<bool> {
     Ok(Command::new(SUDO)
         .arg("-n")
@@ -243,9 +194,9 @@ pub fn preauthorize(prefix: &Path, escalate: bool) -> Result<()> {
     if credentials_fresh()? {
         return Ok(());
     }
-    // Named by prefix, not by bin: the privileged writes may be the
-    // binaries, the state directory, or the lock file — "into .../bin"
-    // would state a false reason whenever it is one of the latter two.
+    // Named by prefix, not bin: the writes may be binaries, state or the
+    // lock — "into .../bin" would state a false reason for the latter
+    // two.
     eprintln!(
         "administrative privileges are required to install under {}",
         prefix.display()
@@ -272,13 +223,9 @@ fn escalate_for_paths(policy: Policy, paths: &[&Path]) -> Result<bool> {
 }
 
 /// Run `program args...` by absolute path, prepending `/usr/bin/sudo`
-/// when escalation is decided. On an inherited terminal the child gets
-/// stdio and sudo may prompt. Under an owned screen every child —
-/// privileged or not — is captured, with its output folded into the
-/// error on failure: an unprivileged `mv` complaining directly onto a
-/// ratatui frame corrupts it exactly as thoroughly as sudo would, and
-/// sudo additionally runs `-n` so a wanted password is a diagnosis, not
-/// an invisible prompt.
+/// when decided. Inherited terminal: child gets stdio, sudo may
+/// prompt. Owned screen: every child captured, output folded into the
+/// error, sudo runs `-n`.
 fn run(policy: Policy, escalate: bool, program: &str, args: &[&OsStr]) -> Result<()> {
     let spawned = if escalate {
         format!("{SUDO} {program}")
@@ -301,8 +248,8 @@ fn run(policy: Policy, escalate: bool, program: &str, args: &[&OsStr]) -> Result
             .output()
             .with_context(|| format!("failed to spawn {spawned}"))?;
         if !output.status.success() {
-            // The same rule as every external string headed for a Span:
-            // this text ends in a BuildReport.
+            // The same rule as every external string headed for a Span: this text
+            // ends in a BuildReport.
             let words = crate::text::sanitize(&String::from_utf8_lossy(&output.stderr));
             let words = words.trim();
             if words.is_empty() {
@@ -321,20 +268,18 @@ fn run(policy: Policy, escalate: bool, program: &str, args: &[&OsStr]) -> Result
     Ok(())
 }
 
-/// A staged source file opened and verified by the user, presented to
-/// privileged `install` as a `/proc` fd path so the vetted inode — not a
-/// swappable pathname — is what root copies. The handle must stay alive
-/// until the copy is done; dropping it invalidates the proc path.
+/// A staged source opened and verified by the user, presented to
+/// privileged `install` as a `/proc` fd path — root copies the vetted
+/// inode, not a swappable pathname. The handle must outlive the copy.
 #[derive(Debug)]
 pub struct VerifiedSource {
     file: File,
 }
 
 impl VerifiedSource {
-    /// Open with `O_NOFOLLOW` (a symlink as the final component fails) and
-    /// verify on the descriptor itself that this is a regular file owned by
-    /// the current user. Directory components are resolved as the invoking
-    /// user, so a symlinked parent cannot grant access the user lacks.
+    /// Open with `O_NOFOLLOW` and verify on the descriptor: regular file,
+    /// owned by us. Parents resolve as the invoking user, so a symlinked
+    /// parent grants nothing the user lacks.
     pub fn open(path: &Path) -> Result<Self> {
         let file = OpenOptions::new()
             .read(true)
@@ -370,18 +315,13 @@ impl VerifiedSource {
     }
 }
 
-/// Trusted generated data (the manifest) handed to root as an immutable
-/// buffer: an anonymous memfd with write/grow/shrink seals. This is a
-/// deliberately different threat model from `VerifiedSource`: for staged
-/// binaries pinning the *inode* suffices, because the crate controls the
-/// content anyway — swapping EVIL1 for EVIL2 gains it nothing. The
-/// manifest is cargo-lbin's own trusted state, and an fd-pinned inode in the
-/// cache can still be opened by pathname and rewritten in place by any
-/// leftover same-UID build process. A sealed memfd pins the *bytes*:
-/// after `F_SEAL_WRITE` no process — same UID included — can alter what
-/// root will copy, and there is no pathname in the filesystem to find in
-/// the first place. The invariant becomes "bytes serialized by cargo-lbin ==
-/// bytes copied by root", not merely "inode opened == inode copied".
+/// Trusted generated data (the manifest) handed to root as a sealed
+/// memfd. A different threat model from `VerifiedSource`: staged
+/// binaries only need the *inode* pinned (the crate controls the
+/// content anyway), while the manifest is our own trusted state and a
+/// cached inode could be rewritten in place by any same-UID process.
+/// The seal pins the *bytes*: after `F_SEAL_WRITE` nobody can alter
+/// what root will copy, and there is no pathname to find.
 #[derive(Debug)]
 pub struct SealedSource {
     file: File,
@@ -414,13 +354,10 @@ impl SealedSource {
         if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_ADD_SEALS, seals) } != 0 {
             return Err(std::io::Error::last_os_error()).context("sealing manifest buffer");
         }
-        // The memfd is reachable via /proc/<pid>/fd from the moment of
-        // memfd_create — MFD_CLOEXEC governs fd inheritance across exec,
-        // not procfs opens — so a same-UID process could race a write in
-        // between our write and the seal. Read the now-frozen content back
-        // and compare: whatever happened before F_SEAL_WRITE, this check
-        // inspects the final immutable state, so a pass genuinely means
-        // "bytes serialized by cargo-lbin == bytes root will copy".
+        // The memfd is reachable via /proc from creation (MFD_CLOEXEC governs
+        // exec, not procfs), so a same-UID write could race ours. Read the
+        // now-frozen content back and compare: a pass inspects the final
+        // sealed state — bytes serialized == bytes root copies.
         {
             use std::os::unix::fs::FileExt;
             let len = file
@@ -449,9 +386,9 @@ impl SealedSource {
     }
 }
 
-/// Shared placement: hand privileged `install` a `/proc` fd path. One
-/// invocation per file: with a `/proc` fd path, `install -t` would name the
-/// destination after the fd number, so the destination is always explicit.
+/// Shared placement: privileged `install`, one invocation per file —
+/// with a `/proc` fd path, `install -t` would name the destination
+/// after the fd number.
 fn install_from_proc(policy: Policy, proc_path: &Path, dest: &Path, mode: &str) -> Result<()> {
     let parent = dest
         .parent()
@@ -466,13 +403,10 @@ fn install_from_proc(policy: Policy, proc_path: &Path, dest: &Path, mode: &str) 
     )
 }
 
-/// Place a verified staged source (inode-pinned) at `dest`, atomically.
-/// Like the manifest: install into a hidden temp in the same directory,
-/// then `mv -fT` (a same-filesystem rename). A crash mid-update leaves the
-/// previous working binary intact rather than a half-written one. The
-/// destination directory is root-owned for the canonical prefix (the only
-/// one for which `policy` permits escalation), so the temp cannot be
-/// tampered with.
+/// Place a verified source at `dest` atomically: hidden same-dir temp,
+/// then `mv -fT` (same-fs rename) — a crash mid-update leaves the
+/// previous binary intact. The directory is root-owned for the one
+/// escalating prefix, so the temp cannot be tampered with.
 pub fn install_verified(
     policy: Policy,
     src: &VerifiedSource,
@@ -482,12 +416,10 @@ pub fn install_verified(
     install_atomic(policy, &src.proc_path(), dest, mode)
 }
 
-/// Shared atomic placement: install `proc_path` to a same-dir temp, rename
-/// over `dest`. On rename failure the temp is best-effort removed.
-///
-/// `place_and_commit`'s rollback leans on this atomicity: a failed
-/// placement leaves the destination untouched, so the set of successfully
-/// placed new names equals the set of new names present on disk.
+/// Shared atomic placement: install to a same-dir temp, rename over
+/// `dest`; on rename failure the temp is best-effort removed.
+/// `place_and_commit`'s rollback leans on this: a failed placement
+/// leaves the destination untouched.
 fn install_atomic(policy: Policy, proc_path: &Path, dest: &Path, mode: &str) -> Result<()> {
     let parent = dest
         .parent()
@@ -521,13 +453,9 @@ fn install_atomic(policy: Policy, proc_path: &Path, dest: &Path, mode: &str) -> 
     moved
 }
 
-/// Place sealed generated data (byte-pinned) at `dest`, atomically.
-///
-/// GNU `install` over an existing destination keeps the inode and
-/// truncate-and-copies in place, so a crash mid-copy would leave half a
-/// manifest. `install_atomic` installs into a temp in the same directory
-/// and `mv -fT`s it into place, a same-filesystem `rename(2)`: crash before
-/// the rename leaves the old manifest whole, crash after leaves the new one.
+/// Place sealed data at `dest` atomically: GNU `install` over an
+/// existing file truncate-and-copies in place, so a crash would leave
+/// half a manifest; temp + `mv -fT` leaves whole old or whole new.
 pub fn install_sealed(policy: Policy, src: &SealedSource, dest: &Path, mode: &str) -> Result<()> {
     install_atomic(policy, &src.proc_path(), dest, mode)
 }
@@ -543,12 +471,10 @@ pub fn remove_files(policy: Policy, paths: &[&Path]) -> Result<()> {
     run(policy, escalate, RM, &args)
 }
 
-/// Create the state lock file, escalating if needed. Deliberately
-/// `mkdir -p` + `touch` rather than `install`: both are idempotent, and
-/// touch on an existing file updates timestamps but preserves the inode.
-/// That matters — `install` unlinks and recreates, so a process holding a
-/// flock on the old inode and one locking the new file would both "hold
-/// the lock" while excluding nobody.
+/// Create the state lock file. `mkdir -p` + `touch`, not `install`:
+/// touch preserves the inode — `install` unlinks and recreates, and
+/// two processes flocking old and new inodes would both "hold the
+/// lock" while excluding nobody.
 pub fn ensure_lock_file(policy: Policy, path: &Path) -> Result<()> {
     let parent = path.parent().context("lock path has no parent directory")?;
     let escalate = policy.escalate_for(parent)?;
@@ -559,10 +485,9 @@ pub fn ensure_lock_file(policy: Policy, path: &Path) -> Result<()> {
         &["-p".as_ref(), parent.as_os_str()],
     )?;
     run(policy, escalate, TOUCH, &[path.as_os_str()])?;
-    // Explicit modes: mkdir/touch inherit the caller's umask, and a user
-    // with umask 077 would otherwise mint a 0700 state dir and 0600 lock
-    // that every other user's `cargo-lbin list` cannot even open. chmod on an
-    // existing file preserves the inode, so flock correctness is intact.
+    // Explicit modes: umask 077 would otherwise mint a state dir other
+    // users' `list` cannot open; chmod preserves the inode, so flock
+    // correctness is intact.
     run(
         policy,
         escalate,
@@ -578,9 +503,7 @@ pub fn ensure_lock_file(policy: Policy, path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Best-effort `SELinux` relabel (matters on Fedora, absent and harmless on
-/// Arch). Failures are deliberately ignored: on most systems restorecon
-/// either does not exist or is a no-op for `bin_t`.
+/// Best-effort SELinux relabel (Fedora; absent and harmless on Arch).
 pub fn restorecon(policy: Policy, paths: &[&Path]) {
     let Some(program) = RESTORECON_CANDIDATES
         .iter()
@@ -591,8 +514,8 @@ pub fn restorecon(policy: Policy, paths: &[&Path]) {
     if paths.is_empty() {
         return;
     }
-    // Best effort throughout: a Forbidden policy that would need escalation
-    // simply skips the relabel rather than erroring.
+    // Best effort throughout: Forbidden-needing-escalation skips rather
+    // than errors.
     let Ok(escalate) = escalate_for_paths(policy, paths) else {
         return;
     };
@@ -612,14 +535,12 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let pid = std::process::id();
 
-        // Squat the first candidate with real content: the probe must
-        // neither truncate it nor let it flip the verdict — the retry
-        // suffix sidesteps the name.
+        // Squat the first candidate with real content: the retry suffix
+        // sidesteps the name without truncating it.
         let squatted = dir.join(format!(".cargo-lbin-write-probe.{pid}.0"));
         fs::write(&squatted, b"precious").unwrap();
-        // Squat the second with a symlink to a real file: the old
-        // `fs::write` probe would have followed it and truncated the
-        // target; `create_new` refuses to open it at all.
+        // Squat the second with a symlink: the old `fs::write` probe would
+        // have followed and truncated the target; `create_new` refuses.
         let target = dir.join("symlink-target");
         fs::write(&target, b"target-content").unwrap();
         let link = dir.join(format!(".cargo-lbin-write-probe.{pid}.1"));
@@ -727,9 +648,8 @@ mod tests {
 
     #[test]
     fn forbidden_policy_blocks_lock_escalation() {
-        // The exact hole from review: a custom prefix whose share/cargo-lbin is
-        // not writable must not escalate when preparing the lock — it must
-        // error, before any sudo is spawned.
+        // The exact hole from review: a custom prefix whose share/ is not
+        // writable must error preparing the lock, before any sudo spawns.
         let hostile = Path::new("/proc/cargo-lbin-nonexistent-lock/share/cargo-lbin/lock");
         if needs_privilege(hostile.parent().unwrap()) {
             let err = ensure_lock_file(
@@ -751,9 +671,8 @@ mod tests {
         let dir = std::env::temp_dir().join("cargo-lbin-test-umask");
         let _ = fs::remove_dir_all(&dir);
         let state = dir.join("share/cargo-lbin");
-        // Pre-create at hostile modes (as a umask-077 environment would),
-        // without touching the process-global umask — cargo runs tests in
-        // parallel and that mutation could bleed into a concurrent test.
+        // Pre-create at hostile modes without touching the process-global
+        // umask — tests run in parallel and that mutation would bleed.
         fs::create_dir_all(&state).unwrap();
         fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
         let lock = state.join("lock");
@@ -783,13 +702,11 @@ mod tests {
     fn sealed_source_is_immutable_even_for_owner() {
         use std::io::Write;
         let sealed = SealedSource::from_bytes(b"TRUSTED").unwrap();
-        // The exact attack: a same-UID process opens the fd path for
-        // writing and tries to rewrite the content in place. The write
-        // seal must stop it — ownership is irrelevant at this layer.
+        // The exact attack: a same-UID process opens the fd path and rewrites
+        // in place; the write seal must stop it.
         let reopened = OpenOptions::new().write(true).open(sealed.proc_path());
         let mutated = match reopened {
-            // Kernel may refuse at open (O_TRUNC-less write open can
-            // succeed) or at write; either way no byte may change.
+            // Kernel may refuse at open or at write; either way no byte changes.
             Ok(mut f) => f.write_all(b"FORGED!").is_ok(),
             Err(_) => false,
         };

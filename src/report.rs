@@ -1,23 +1,15 @@
-//! Persisted result of the last `checkupdate`.
+//! Persisted result of the last `checkupdate` — the one command that
+//! queries the network; `list` annotates from it, nothing else
+//! refreshes it. A cache in the strict sense: losing it costs one
+//! `checkupdate`.
 //!
-//! cargo-lbin never queries the network on its own; `checkupdate` is the one
-//! read-only command that does, and this file is how its answer survives
-//! until the user asks again. `list` annotates from it, and nothing else
-//! ever refreshes it. It is a cache in the strict sense: losing it costs
-//! one `checkupdate`, nothing more.
+//! A full snapshot, not just the outdated crates: a reader must tell
+//! "checked and current" from "not checked at all", and both look
+//! alike as absence from an outdated-only list.
 //!
-//! The report is a full snapshot — every crate that was checked, with the
-//! version it was checked against and the newest version found — not just
-//! the outdated ones. A reader must be able to tell "checked and current"
-//! from "not checked at all" (installed after the check, or the manifest
-//! changed); both would look alike as a mere absence from an outdated
-//! list, and a TUI drawing a checkmark for the second case would be lying.
-//!
-//! Lives under the user's cache directory, keyed by prefix: the same user
-//! may manage `/usr/local` and `~/.local` side by side, and one prefix's
-//! answer must never be shown for the other. The file records the prefix
-//! it belongs to, so a key collision degrades to "no report" rather than a
-//! wrong one.
+//! Keyed by prefix under the user's cache dir; the file records its
+//! prefix, so a key collision degrades to "no report", never a wrong
+//! one.
 
 use anyhow::{Context, Result};
 use semver::Version;
@@ -59,17 +51,11 @@ pub struct Report {
     pub crates: Vec<Checked>,
 }
 
-/// The identity of a prefix for cache purposes.
-///
-/// A relative `--prefix` is anchored in the current directory first:
-/// `--prefix local` run from two different directories names two different
-/// trees, and hashing the bare `local` would hand the second one the
-/// first one's report. Anchoring is lexical, not `canonicalize()` — the
-/// prefix may not exist yet, and symlink semantics are not this cache's
-/// business. Two spellings of one tree (via `..` or a symlink) therefore
-/// get two keys, which costs a cache miss and never a wrong hit.
-/// Trailing slashes and `.` components are dropped so they do not split
-/// one prefix into several keys.
+/// The identity of a prefix for cache purposes: a relative `--prefix`
+/// is anchored in the cwd first — hashing bare `local` would hand one
+/// directory's report to another. Lexical, not `canonicalize()`: the
+/// prefix may not exist yet; two spellings of one tree cost a cache
+/// miss, never a wrong hit.
 pub fn identity(prefix: &Path) -> Result<PathBuf> {
     let anchored = if prefix.is_absolute() {
         prefix.to_path_buf()
@@ -81,9 +67,8 @@ pub fn identity(prefix: &Path) -> Result<PathBuf> {
     Ok(anchored.components().collect())
 }
 
-/// FNV-1a over the prefix identity. Written out rather than taken from
-/// `DefaultHasher`, whose output is explicitly not stable across Rust
-/// releases — a cache key must not change with the toolchain.
+/// FNV-1a written out: `DefaultHasher` is not stable across Rust
+/// releases, and a cache key must not change with the toolchain.
 fn key(identity: &Path) -> String {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for byte in identity.as_os_str().as_encoded_bytes() {
@@ -132,12 +117,9 @@ impl Report {
         Ok(Some(report))
     }
 
-    /// Same-directory temp + rename, so a crash mid-write leaves the old
-    /// report whole. The temp name carries the PID: two concurrent
-    /// `checkupdate` runs against one prefix must not write into each
-    /// other's temp file — the rename then simply lets the later one win,
-    /// which is fine for a cache. No privilege is ever involved: the cache
-    /// directory is the user's own.
+    /// Same-dir temp + rename: a crash leaves the old report whole; the
+    /// PID in the temp name keeps concurrent runs out of each other's
+    /// file — the later rename wins, fine for a cache.
     pub fn store(&self, cache: &Path) -> Result<()> {
         // `self.prefix` is already an identity (absolute), so re-deriving
         // it is a no-op rather than a second anchoring.
@@ -166,10 +148,8 @@ impl Report {
         Duration::from_secs(now.saturating_sub(self.checked_at))
     }
 
-    /// What the report says about `name` as installed *now*: `None` when it
-    /// was not checked at all, or was checked against a different version
-    /// (installed or updated since). A report taken before an update says
-    /// nothing about the version that replaced it — and nothing is what
+    /// What the report says about `name` as installed *now*: `None` when
+    /// unchecked or checked against a different version — nothing is what
     /// the caller must show, not a stale checkmark.
     pub fn status_for(&self, name: &str, current: &Version) -> Option<Status<'_>> {
         let checked = self.checked_for(name, current)?;
@@ -180,12 +160,9 @@ impl Report {
         })
     }
 
-    /// The record for `name` as installed *now*, with the same "checked
-    /// against this exact version" rule as `status_for`. For callers that
-    /// need what the check found even when nothing is newer: `latest` is
-    /// not always `current` for an up-to-date crate — an installed version
-    /// yanked since has a lower `latest`, and reporting `current` in its
-    /// place would misstate what the check saw.
+    /// The record for `name` as installed now, same exact-version rule as
+    /// `status_for`: `latest` is not always `current` for an up-to-date
+    /// crate (an installed version yanked since has a lower `latest`).
     pub fn checked_for(&self, name: &str, current: &Version) -> Option<&Checked> {
         self.crates
             .iter()
@@ -193,8 +170,8 @@ impl Report {
     }
 }
 
-/// Coarse relative age for a status line. Precision beyond this would
-/// suggest a freshness the report does not have.
+/// Coarse relative age; more precision would suggest freshness the
+/// report does not have.
 pub fn describe_age(age: Duration) -> String {
     let secs = age.as_secs();
     match secs {

@@ -1,18 +1,13 @@
-//! Cross-prefix awareness: which *other* lbin-managed prefixes carry a
-//! crate that is installed here. The list of prefixes is finite and
-//! closed — the canonical `/usr/local` and the user's `~/.local` — and
-//! only lbin's own manifests are consulted: this is not a PATH scanner
-//! (the shadow module owns that question) but a "you also installed
-//! this over there" reminder, and only lbin state can answer it.
+//! Cross-prefix awareness: which *other* lbin prefixes carry a crate
+//! installed here. The set is finite and closed (`/usr/local`,
+//! `~/.local`) and only lbin's own manifests are consulted — a
+//! reminder, not a PATH scanner.
 //!
-//! Foreign manifests are read WITHOUT any lock, deliberately. The
-//! manifest is placed by atomic rename (`install_atomic`), so a
-//! lockless read yields a complete old document or a complete new one,
-//! never a torn one — and taking even a shared flock on a foreign
-//! prefix could park this process behind someone's ten-minute exclusive
-//! build there. An annotation must never wait; the worst a lockless
-//! read can be is one rename out of date, which is exactly as stale as
-//! any listing is the moment it is printed.
+//! Foreign manifests are read WITHOUT any lock, deliberately: atomic
+//! rename means a lockless read is a complete old or new document,
+//! never torn — and a shared flock on a foreign prefix could park this
+//! process behind someone's ten-minute build. An annotation must never
+//! wait; the worst case is one rename out of date.
 
 use crate::manifest::Manifest;
 
@@ -27,12 +22,9 @@ pub struct AlsoIn {
     pub version: String,
 }
 
-/// The closed set of prefixes lbin knows about, minus the current one.
-/// Comparison is lexical on the resolved paths: both candidates are
-/// absolute and canonical by construction, and the current prefix is
-/// what the person actually addressed — a symlinked spelling of the
-/// same place showing up as "also in" is a cosmetic duplicate, not a
-/// correctness problem worth a filesystem round-trip per candidate.
+/// The closed set minus the current prefix. Comparison is lexical:
+/// both candidates are canonical by construction, and a symlinked
+/// duplicate is cosmetic, not worth a filesystem round-trip.
 pub fn known_others(current: &Path) -> Vec<PathBuf> {
     let mut candidates = vec![PathBuf::from("/usr/local")];
     #[allow(deprecated)] // un-deprecated in std; attribute for older toolchain docs
@@ -43,21 +35,16 @@ pub fn known_others(current: &Path) -> Vec<PathBuf> {
     candidates
 }
 
-/// For every crate name, the other prefixes that carry it. Prefixes
-/// whose manifest does not exist contribute nothing (most systems use
-/// one prefix, and silence is the right answer); an unreadable or
-/// corrupt foreign manifest is skipped too — a listing must not fail
-/// over a prefix it was not even asked about, and the authoritative
-/// error will greet the person the moment they address that prefix
-/// directly.
+/// For every crate, the other prefixes carrying it. Missing manifests
+/// contribute nothing; unreadable or corrupt ones are skipped — a
+/// listing must not fail over a prefix it was not asked about.
 pub fn also_installed(current: &Path) -> BTreeMap<String, Vec<AlsoIn>> {
     also_installed_from(known_others(current))
 }
 
-/// The loader behind `also_installed`, over any set of prefixes — split
-/// out so a test can feed it a temp prefix the closed set will never
-/// contain and exercise the real function, not a hand-copied twin of
-/// it that stays green while the original rots.
+/// The loader behind `also_installed`, over any prefix set — split out
+/// so tests exercise the real function on temp prefixes, not a twin
+/// that stays green while the original rots.
 fn also_installed_from(others: impl IntoIterator<Item = PathBuf>) -> BTreeMap<String, Vec<AlsoIn>> {
     let mut map: BTreeMap<String, Vec<AlsoIn>> = BTreeMap::new();
     for other in others {
@@ -83,11 +70,9 @@ pub fn describe(entries: &[AlsoIn]) -> String {
     for a in entries {
         let _ = write!(out, " [also in {} @{}]", a.prefix.display(), a.version);
     }
-    // The human form goes to the terminal and to a Span, and the prefix
-    // comes ultimately from the environment — a pathname may hold ESC as
-    // legally as `a`, so the 0.7.0 rule applies here like everywhere.
-    // The JSON side stays untouched on purpose: the serializer escapes,
-    // and a consumer deserves the true path.
+    // The human form goes to a terminal/Span and the prefix comes from
+    // the environment — the 0.7.0 rule applies. JSON stays untouched: the
+    // serializer escapes, and a consumer deserves the true path.
     crate::text::sanitize(&out)
 }
 

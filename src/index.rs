@@ -23,16 +23,10 @@ struct IndexLine {
     yanked: bool,
 }
 
-/// Relative path of a crate's file in the sparse index.
-///
-/// Scheme (per the crates.io index RFC): 1- and 2-character names live under
-/// `1/` and `2/`, 3-character names under `3/<first char>/`, everything else
-/// under `<first two>/<next two>/`. Paths are lowercase.
-///
-/// Callers pass names validated to be ASCII, so the slices below always hit
-/// character boundaries. Belt and suspenders: `get()` instead of indexing,
-/// so even a layering violation with a multibyte name degrades to a path
-/// that 404s cleanly rather than panicking mid-slice.
+/// Relative path of a crate's file in the sparse index (per the RFC:
+/// `1/`, `2/`, `3/<c>/`, `<ab>/<cd>/`; lowercase). Names arrive
+/// ASCII-validated; `get()` instead of indexing so a layering
+/// violation degrades to a clean 404, not a mid-slice panic.
 pub fn index_path(name: &str) -> String {
     let lower = name.to_lowercase();
     match lower.len() {
@@ -57,10 +51,9 @@ pub struct Release {
     pub yanked: bool,
 }
 
-/// Fetch all published, non-yanked versions of `name` from the sparse index.
-/// An unknown crate is an error here: for `checkupdate` and `update`, a
-/// manifest entry the index has never heard of is a problem to report,
-/// not a state to describe.
+/// All published, non-yanked versions of `name`. An unknown crate is
+/// an error: a manifest entry the index never heard of is a problem to
+/// report.
 pub fn published_versions(name: &str) -> Result<Vec<Version>> {
     let releases = releases(name)?.ok_or_else(|| not_found(name))?;
     non_yanked(name, releases)
@@ -72,10 +65,8 @@ pub fn not_found(name: &str) -> anyhow::Error {
     anyhow::anyhow!("crate `{name}` not found on crates.io")
 }
 
-/// Fetch every release of `name`, yanked ones included. `Ok(None)` means
-/// the index has no such crate — an answer, distinct from a failed
-/// request — so a caller that asked by name can do something useful
-/// with "no", such as suggest what the user might have meant.
+/// Every release, yanked included. `Ok(None)` = the index has no such
+/// crate — an answer, distinct from a failed request.
 pub fn releases(name: &str) -> Result<Option<Vec<Release>>> {
     let url = format!("{INDEX_BASE}/{}", index_path(name));
     let response = match ureq::get(&url).set("User-Agent", USER_AGENT).call() {
@@ -118,14 +109,10 @@ fn non_yanked(name: &str, releases: Vec<Release>) -> Result<Vec<Version>> {
     Ok(versions)
 }
 
-/// What `search` shows about a crate's published history.
-///
-/// This is history, not eligibility: the newest releases are reported
-/// whether or not they were yanked, and carry the flag so the reader sees
-/// "1.1.0 \[yanked\]" rather than being told 1.0.0 is the latest — that would
-/// hide the yank, which is the single most useful thing to know about it.
-/// Whether the *installed* copy can move anywhere is a separate question
-/// answered from the non-yanked subset, by the same rules `update` uses.
+/// What `search` shows of published history — history, not
+/// eligibility: newest releases are reported with their yanked flag
+/// (hiding the yank would hide the most useful fact); whether the
+/// installed copy can move is answered from the non-yanked subset.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Summary {
     /// Newest stable release ever published, yanked or not.
@@ -162,12 +149,9 @@ pub fn summarize(releases: &[Release]) -> Summary {
 }
 
 /// Versions a `downgrade` from `current` may pick: published, not
-/// yanked, older than `current`, newest first — and pre-releases only
-/// if `current` is itself one, the release-relevance policy
-/// `latest_relevant` applies upward, applied here to the versions
-/// below. (Not a symmetry: from a pre-release one may step down to a
-/// stable, and from that stable `update` no longer considers
-/// pre-releases, so the way back is not offered.)
+/// yanked, older, newest first — pre-releases only if `current` is one
+/// (`latest_relevant`'s policy applied downward; the way back from
+/// stable is deliberately not offered).
 pub fn downgrade_candidates(releases: &[Release], current: &Version) -> Vec<Version> {
     let allow_pre = !current.pre.is_empty();
     let mut out: Vec<Version> = releases
@@ -209,10 +193,9 @@ mod tests {
 
     #[test]
     fn multibyte_names_never_panic() {
-        // Validation upstream guarantees ASCII, but a layering violation
-        // must degrade to a clean 404 path, not a byte-boundary panic.
-        // 'ż' is 2 bytes (boundary at 2 happens to hold), '€' is 3 bytes
-        // (boundary at 2 does not).
+        // Upstream guarantees ASCII, but a layering violation must degrade to
+        // a clean 404: 'ż' is 2 bytes (boundary holds), '€' is 3 (it does
+        // not).
         let _ = index_path("żółć");
         let _ = index_path("€uro");
         let _ = index_path("€ab");

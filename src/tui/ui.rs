@@ -12,11 +12,9 @@ use super::{App, Filter, InputPurpose, MessageKind, RowStatus};
 use crate::report::describe_age;
 
 pub fn draw(frame: &mut Frame, app: &App) {
-    // The build gauge gets its own framed, transient panel, laid out
-    // only while a build runs: on success the rows return to the list,
-    // on failure the sticky report panel takes over — and the footer
-    // stays free for messages, which the old arrangement hid behind the
-    // gauge for the whole build.
+    // The gauge gets its own framed transient panel: the footer stays
+    // free for messages, which the old arrangement hid for the whole
+    // build.
     if let Some(gauge) = app.build_progress() {
         let [header, list, details, build, footer] = Layout::new(
             Direction::Vertical,
@@ -39,10 +37,9 @@ pub fn draw(frame: &mut Frame, app: &App) {
         }
         return;
     }
-    // A pinned report gets more rows than the resting details pane: the
-    // findings are the thing being read, and the list can spare the
-    // space until Esc. Bounded by what the terminal has, floored at the
-    // resting height, and still scrollable past either bound.
+    // A pinned report gets more rows than the resting pane: the findings
+    // are the thing being read. Bounded by the terminal, floored at the
+    // resting height, still scrollable past either.
     let details_h = if app.build_report.is_some() {
         frame.area().height.saturating_sub(11).clamp(8, 16)
     } else {
@@ -70,17 +67,14 @@ pub fn draw(frame: &mut Frame, app: &App) {
     }
 }
 
-/// A framed, labeled box — the tty's verdict over the frameless line
-/// that shipped first: on a real terminal one yellow row blended into
-/// the footer, and a build deserves to be unmissable while it runs.
-/// Deliberately a status line inside, never a progress bar: cargo
-/// knows what it has started, not what remains, so a count of started
-/// units is the truth and any percentage would be an invention.
+/// A framed, labeled box — one yellow frameless row blended into the
+/// footer, and a build deserves to be unmissable. A status line, never
+/// a progress bar: cargo knows what it started, not what remains, so
+/// a percentage would be an invention.
 fn draw_gauge(frame: &mut Frame, gauge: &str, title: &str, area: Rect) {
-    // The title follows the job: the panel's shape is shared with
-    // verify on purpose (one mechanism, so the two cannot drift), but a
-    // frame that says Build over a running audit would be the shape
-    // promising the wrong operation.
+    // The title follows the job: the shape is shared with verify (one
+    // mechanism), but a frame saying Build over an audit would promise
+    // the wrong operation.
     let block = Block::default()
         .borders(Borders::ALL)
         .title(title.to_owned());
@@ -213,14 +207,10 @@ fn draw_report(frame: &mut Frame, report: &crate::tui::BuildReport, scroll: u16,
             .iter()
             .map(|l| Line::from(Span::raw(l.clone()))),
     );
-    // The scroll clamp, computed here because only the draw knows the
-    // wrap width — and computed by the renderer's own word wrapper
-    // (`Paragraph::line_count`), because any arithmetic stand-in lies
-    // eventually: width-division undercounts exactly when word wrap
-    // breaks earlier than character wrap would, and an undercounted
-    // height is a tail the reader cannot reach. The stored offset is
-    // clamped for display rather than mutated, so a held key cannot
-    // scroll the reader into blank space.
+    // The scroll clamp, computed here by the renderer's own word wrapper
+    // (`Paragraph::line_count`): any arithmetic stand-in undercounts
+    // exactly when word wrap breaks early, and an undercounted height is
+    // a tail the reader cannot reach. Clamped for display, not mutated.
     let inner_w = area.width.saturating_sub(2).max(1);
     let inner_h = area.height.saturating_sub(2).max(1);
     let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
@@ -234,15 +224,13 @@ fn draw_report(frame: &mut Frame, report: &crate::tui::BuildReport, scroll: u16,
         } else {
             " Esc/Enter dismisses "
         });
-    // Wrapped: the log path is one of the two most important lines
-    // here, and a panel that truncates it defeats its own purpose.
+    // Wrapped: a panel that truncates the log path defeats its purpose.
     frame.render_widget(paragraph.block(block).scroll((effective, 0)), area);
 }
 
 fn draw_details(frame: &mut Frame, app: &App, area: Rect) {
-    // A build's report owns the panel until dismissed: a failure's tail
-    // and log path, or a success's warnings — either must survive longer
-    // than one keypress.
+    // A build's report owns the panel until dismissed: either kind must
+    // survive longer than one keypress.
     if let Some(report) = &app.build_report {
         draw_report(frame, report, app.report_scroll, area);
         return;
@@ -251,8 +239,8 @@ fn draw_details(frame: &mut Frame, app: &App, area: Rect) {
     // one piece of information here that did not come from the manifest.
     if let Some(search) = &app.search_result {
         let name_w = search.hits.iter().map(|h| h.name.len()).max().unwrap_or(0);
-        // `api::search` bounds the hit count locally, so the panel's
-        // numbering and the footer's "1-n" describe the same list.
+        // `api::search` bounds the hits, so the numbering and the footer
+        // describe the same list.
         let lines: Vec<Line> = search
             .hits
             .iter()
@@ -356,10 +344,8 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         // is locked — and it renames `r` to what `r` now does.
         " manifest unavailable · v verify · r retry load · B other prefix · ? help · q quit"
     } else if app.build_running() {
-        // Deliberately uncategorical: past the placement door `c`
-        // answers TooLate and Ctrl-C only arms quit-after — the hint
-        // describes the controls, and the truthful per-press outcome is
-        // the runtime message's job (which is typed and never lies).
+        // Deliberately uncategorical: the hint describes the controls; the
+        // truthful per-press outcome is the runtime message's job.
         " ↑/↓ select · c cancel/escalate · Ctrl-C cancel/quit"
     } else {
         " ↑/↓ select · Tab filter · Enter/u update · U update all · i install · x remove · \
@@ -374,12 +360,10 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         Some(age) => format!("checked {}", describe_age(age)),
         None => "never checked".to_owned(),
     };
-    // "0 updates" alone would read as "all current"; the unknown count
-    // keeps the footer as honest as the status column. And in the
-    // degraded state the whole line is one honest sentence instead:
-    // "0 packages · never checked" over a manifest that refused to load
-    // would be the same invented zero VerifyReport's Option<usize>
-    // exists to forbid — the count is not zero, it is unknown.
+    // "0 updates" alone would read as "all current". In the degraded
+    // state the whole line is one honest sentence — "0 packages" over a
+    // manifest that refused to load would be the invented zero
+    // VerifyReport's Option forbids: not zero, unknown.
     let (status, status_color) = if app.manifest_error.is_some() {
         (
             " managed crate count unavailable — the manifest did not load".to_owned(),
@@ -391,9 +375,8 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
             app.total(),
             app.updates_available()
         );
-        // The pinned backlog is deliberately absent from the updates count
-        // (it is not something `U` will do), so it must be voiced here: a
-        // held-back update stays loud, it just moved homes.
+        // The pinned backlog is absent from the updates count (not something
+        // `U` will do), so it is voiced here.
         match (app.pinned_count(), app.pinned_outdated()) {
             (0, _) => {}
             (p, 0) => {
@@ -444,12 +427,9 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     } else if app.build_progress().is_none()
         && let Some(label) = app.busy()
     {
-        // The Build panel owns build status; a footer that also said
-        // "building foo…" would say the same thing twice. Skipping the
-        // generic label here is also what lets the message branch below
-        // fire during a build — "a build is running; c cancels it"
-        // must show exactly while the gauge is up, and before this skip
-        // the busy label sat in front of it for the whole build.
+        // The Build panel owns build status; skipping the generic label here
+        // is also what lets "a build is running; c cancels it" show while
+        // the gauge is up.
         let line = Span::styled(format!(" {label}"), Style::default().fg(Color::Cyan));
         frame.render_widget(Paragraph::new(line), line_area);
     } else if let Some(message) = &app.message {
@@ -464,12 +444,10 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
-    // The degraded help is its own short page, not the normal one
-    // grayed out: help is one of the few keys the degraded gate lets
-    // through, and the one function still standing must not hand out
-    // instructions for doors the gate just locked — worst of all `r`,
-    // which the footer calls "retry load" while the normal page calls
-    // it "check crates.io". Five keys work; the page lists five keys.
+    // The degraded help is its own short page, not the normal one grayed
+    // out: the one function still standing must not hand out
+    // instructions for locked doors — worst of all `r`, renamed by the
+    // footer. Five keys work; the page lists five.
     if app.manifest_error.is_some() {
         let lines = [
             "v           verify: audit the broken managed state",

@@ -36,13 +36,10 @@ struct InstallInfo {
     bins: Vec<String>,
 }
 
-/// What tests may substitute for `cargo`: an absolute path to a fake,
-/// read by `command` under cfg(test). A plain synchronized value instead
-/// of mutating `$PATH` — the environment is process-global and other
-/// test threads read it concurrently, which is exactly the unsafety
-/// `std::env::set_var` was made unsafe to spotlight. Plain cfg(test):
-/// the harness serves the terminal pipeline (migrate) as much as the
-/// captured one, so it must exist with the tui feature off.
+/// What tests may substitute for `cargo`: a synchronized value, not a
+/// `$PATH` mutation — the environment is process-global, exactly the
+/// unsafety `set_var` spotlights. Plain cfg(test): the harness must
+/// exist with the tui feature off.
 #[cfg(test)]
 static CARGO_PROGRAM: std::sync::RwLock<Option<PathBuf>> = std::sync::RwLock::new(None);
 
@@ -51,12 +48,10 @@ static CARGO_PROGRAM: std::sync::RwLock<Option<PathBuf>> = std::sync::RwLock::ne
 #[cfg(test)]
 static FAKE_CARGO_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// RAII around the fake: holds the serialization lock, installs the
-/// override, and clears it on drop, panics included. The guarantee is
-/// exactly as strong as the mutex's reach — tests that spawn cargo
-/// without taking this guard would still see an active override; today
-/// no such test exists, and this comment is where that assumption is
-/// written down.
+/// RAII around the fake: lock, install, clear on drop (panics
+/// included). Exactly as strong as the mutex's reach — a test spawning
+/// cargo without the guard would see an active override; none exists,
+/// and this is where that assumption is written down.
 #[cfg(test)]
 pub(crate) struct FakeCargo {
     _serial: std::sync::MutexGuard<'static, ()>,
@@ -97,9 +92,8 @@ fn command(name: &str, version: Option<&Version>, locked: bool, stage: &Path) ->
     if locked {
         cmd.arg("--locked");
     }
-    // Cargo otherwise tells the user to add the temporary stage/bin to PATH.
-    // Append it for the child process so Cargo suppresses that misleading
-    // warning without changing command resolution.
+    // Append stage/bin to the child's PATH so cargo suppresses its
+    // misleading add-to-PATH warning; resolution is unchanged.
     if let Some(path) = std::env::var_os("PATH") {
         let mut dirs: Vec<PathBuf> = std::env::split_paths(&path).collect();
         dirs.push(stage.join("bin"));
@@ -110,11 +104,10 @@ fn command(name: &str, version: Option<&Version>, locked: bool, stage: &Path) ->
     cmd
 }
 
-/// Build `name` from crates.io into the stage root — at exactly
-/// `version` if one is given, else the newest cargo picks. The exact
-/// form is spelled out (`--version =1.2.3`) rather than relying on
-/// cargo treating a bare version as exact: the intent should be in the
-/// command line, not in a default.
+/// Build `name` into the stage — exactly `version` when given,
+/// otherwise the newest version cargo picks. The exact form is spelled
+/// (`--version =1.2.3`): the intent belongs in the command line, not a
+/// default.
 pub fn build(name: &str, version: Option<&Version>, locked: bool, stage: &Path) -> Result<Built> {
     fs::create_dir_all(stage).with_context(|| format!("creating {}", stage.display()))?;
     // Compiler output goes straight to the terminal; the user should see the
@@ -128,15 +121,10 @@ pub fn build(name: &str, version: Option<&Version>, locked: bool, stage: &Path) 
     verified_info(name, version, stage)
 }
 
-/// Wait up to one tick for the kernel side of the pipe to become
-/// readable (or hung up). `Ok(true)` means "read now"; `Ok(false)` is a
-/// quiet tick for the read loop's cancel check — including EINTR, which
-/// interrupted the wait without producing data: nothing read, nothing
-/// lost, and the tick's bounded latency is precisely the property the
-/// poll exists for, so a signal must not become a license to block. A
-/// real poll error is an error: it goes down the same teardown as a
-/// read error, not into a blocking read that would wedge on the very
-/// pipe poll just failed to ask about.
+/// Wait up to one tick for the pipe: `Ok(true)` read now, `Ok(false)`
+/// a quiet tick for the cancel check — EINTR included: nothing read,
+/// nothing lost, and a signal must not become a license to block. A
+/// real poll error takes the teardown path, never a blocking read.
 #[cfg(feature = "tui")]
 fn poll_readable(fd: std::os::fd::RawFd) -> std::io::Result<bool> {
     let mut pfd = libc::pollfd {
@@ -161,19 +149,13 @@ fn poll_readable(fd: std::os::fd::RawFd) -> std::io::Result<bool> {
     }
 }
 
-/// The captured build's read loop, EOF to EOF. EOF is the exit — and
-/// EOF is withheld for as long as *any* group member keeps the
-/// inherited stderr open. A TERM-ignoring child would otherwise wedge a
-/// cancellation in a perfect circle: the sweep waits for the reap, the
-/// reap waits for EOF, EOF waits for the stray, the stray waits for the
-/// sweep. So the blocking read is fronted by a bounded poll, and on
-/// quiet ticks the loop checks for exactly that circle: a cancel in
-/// flight with the leader already gone means the survivors' supervisor
-/// is dead, no further grace is owed, and the remainder of the group is
-/// swept with SIGKILL here — the strays die, EOF arrives, the loop ends.
-/// `try_wait` reaps the leader when it answers; `Child` caches the
-/// status, so the caller's `wait()` still returns it. A read error ends
-/// the loop and is returned; the caller owns the teardown.
+/// The captured read loop, EOF to EOF — and EOF is withheld while
+/// *any* group member holds the inherited stderr. A TERM-ignoring
+/// child would wedge a cancellation in a circle (sweep waits for reap,
+/// reap for EOF, EOF for the stray), so the blocking read is fronted
+/// by a bounded poll, and a quiet tick with a cancel in flight and the
+/// leader gone sweeps the survivors with SIGKILL. `try_wait` reaps the
+/// leader; `Child` caches the status for the caller's `wait()`.
 #[cfg(feature = "tui")]
 fn drain_stderr(
     reader: &mut std::io::BufReader<std::process::ChildStderr>,
@@ -196,11 +178,9 @@ fn drain_stderr(
                 }
             }
         }
-        // The poll asks the kernel — but `read_until` serves from the
-        // BufReader first, and one kernel read can park several lines in
-        // that buffer. Polling an already-drained pipe while buffered
-        // lines wait would hold them hostage to cargo's next write; the
-        // buffer is consulted first, and only an empty one earns a tick.
+        // `read_until` serves from the BufReader first: polling a drained
+        // pipe while buffered lines wait would hold them hostage to cargo's
+        // next write — only an empty buffer earns a tick.
         if reader.buffer().is_empty() {
             match poll_readable(std::os::fd::AsRawFd::as_raw_fd(reader.get_ref())) {
                 Ok(true) => {}
@@ -228,20 +208,14 @@ fn drain_stderr(
     }
 }
 
-/// `build` for a frontend that owns the screen: cargo's stderr is piped
-/// (which makes cargo drop its own progress bar) and forwarded line by
-/// line to `on_line`; nothing reaches the terminal. Plain text is
-/// enforced, not assumed: cargo's own coloring is disabled outright and
-/// every line is control-character sanitized, because a build script or
-/// linker answers to neither cargo nor `CARGO_TERM_COLOR`. stdout is discarded — `cargo install` speaks on
-/// stderr, and a stray stdout write must not corrupt an alternate
-/// screen.
+/// `build` for a screen-owning frontend: stderr piped and forwarded
+/// line by line; plain text enforced, not assumed (cargo's coloring
+/// off, every line sanitized — build scripts answer to neither cargo
+/// nor CARGO_TERM_COLOR). stdout discarded: `cargo install` speaks on
+/// stderr, and a stray write must not corrupt the screen.
 ///
-/// On failure the full captured output is written to
-/// `<log_dir>/build-<name>-<pid>-<nanos>.log` and the error carries the
-/// interesting tail — from the first compiler error onward when there is
-/// one, the last lines otherwise — plus the log path, so "failed" is
-/// never blind even when the frontend showed only a gauge.
+/// On failure the full output goes to a log and the error carries the
+/// interesting tail plus the path — "failed" is never blind.
 #[cfg(feature = "tui")]
 pub fn build_captured(
     name: &str,
@@ -254,18 +228,15 @@ pub fn build_captured(
 ) -> Result<Built> {
     fs::create_dir_all(stage).with_context(|| format!("creating {}", stage.display()))?;
     let mut cmd = command(name, version, locked, stage);
-    // A pipe usually makes cargo drop colors on its own, but `term.color
-    // = "always"` or an inherited CARGO_TERM_COLOR=always would still
-    // paint ANSI into the capture — and the parser matches on plain
-    // prefixes, the failure panel shows the lines verbatim. Captured
-    // means captured; the terminal build stays untouched.
+    // A pipe usually drops colors, but term.color=always would still
+    // paint ANSI into the capture — and the parser matches plain
+    // prefixes. The terminal build stays untouched.
     cmd.env("CARGO_TERM_COLOR", "never");
-    // Its own process group, so a cancel can address cargo *and* every
-    // rustc and build script it is running with one negative-pid kill.
-    // Signalling cargo alone would orphan running compilations, which
-    // keep writing into the stage the caller is about to discard. The
-    // terminal build stays in the session's foreground group on
-    // purpose: there, Ctrl-C reaching everything is the terminal's job.
+    // Its own process group, so one negative-pid kill reaches cargo and
+    // every rustc it runs; signalling cargo alone would orphan
+    // compilations still writing into the stage. The terminal build stays
+    // in the session's foreground group: there Ctrl-C is the terminal's
+    // job.
     std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
     let mut child = cmd
         .stdin(std::process::Stdio::null())
@@ -273,12 +244,9 @@ pub fn build_captured(
         .stderr(std::process::Stdio::piped())
         .spawn()
         .context("failed to spawn cargo")?;
-    // The child is its own group leader, so its pid is the group id.
-    // Announced before the first read: a cancel that arrives while
-    // cargo is spawning must find something to signal, not a
-    // forever-empty slot — and `spawned` also delivers a cancel that
-    // was accepted before there was anything to signal. Kept locally
-    // too, for the sweep below.
+    // The leader's pid is the group id. Announced before the first read:
+    // a cancel arriving mid-spawn must find something to signal, and
+    // `spawned` also delivers one accepted earlier.
     let pgid = i32::try_from(child.id()).ok();
     if let Some(pgid) = pgid {
         control.spawned(pgid);
@@ -287,23 +255,17 @@ pub fn build_captured(
         .stderr
         .take()
         .context("cargo spawned without a stderr pipe")?;
-    // read_until + lossy conversion instead of `.lines()`: a build
-    // script or linker can emit bytes that are not UTF-8, and a reader
-    // that errors out here would return before `child.wait()` — leaving
-    // the child running and unreaped, since Child is not killed on drop.
-    // Whatever happens on the pipe, the process is always collected.
+    // read_until + lossy conversion, not `.lines()`: non-UTF-8 bytes
+    // would error the reader out before `child.wait()`, leaving the child
+    // unreaped (Child is not killed on drop).
     let mut reader = std::io::BufReader::new(stderr);
     let mut lines: Vec<String> = Vec::new();
     let read_error = drain_stderr(&mut reader, &mut child, control, pgid, on_line, &mut lines);
     if read_error.is_some() {
-        // The reader abandons the pipe with cargo possibly still
-        // writing; a full pipe would park cargo on write while we park
-        // on wait — a quiet mutual stall. Kill first, then reap — and
-        // kill the whole group: the build runs in its own process group
-        // precisely so rustc and build scripts cannot outlive cargo,
-        // and a leader-only kill here would abandon them to keep
-        // writing into a stage about to be discarded. The build is
-        // already lost to the read failure either way.
+        // The reader abandons the pipe with cargo possibly still writing: a
+        // full pipe would park cargo on write while we park on wait. Kill the
+        // whole group first, then reap — a leader-only kill would abandon
+        // rustc to keep writing into a stage about to be discarded.
         if let Ok(pgid) = i32::try_from(child.id()) {
             // SAFETY: kill(2) with a negative pid signals the process
             // group; no memory is touched and an error (ESRCH: already
@@ -314,20 +276,13 @@ pub fn build_captured(
         }
     }
     let status = child.wait();
-    // The leader's death does not end the group: a child that ignores
-    // SIGTERM — a build script, say: precisely the population the group
-    // exists to cover — survives it, and the group id stays alive with
-    // any surviving member. On a cancellation those survivors are
-    // strays: their supervisor is gone, so no further grace is owed,
-    // and the stage they may still be writing to is about to be removed
-    // — the remainder of the group is therefore SIGKILLed as cleanup,
-    // not escalation, before the address is withdrawn. SIGKILL cannot
-    // be ignored; this sweep is what makes "a cancel leaves no orphans
-    // writing into the stage" true rather than merely usual. Usually it
-    // already ran from the read loop (a stray holding stderr is exactly
-    // how EOF gets withheld — see there); this one covers the leader
-    // dying after the last line without ever wedging the pipe, and a
-    // repeat is a no-op.
+    // The leader's death does not end the group: a TERM-ignoring child
+    // survives, and the id stays alive with any member. On a cancellation
+    // the survivors' supervisor is gone — SIGKILL the remainder as
+    // cleanup before the address is withdrawn; this sweep is what makes
+    // "a cancel leaves no orphans writing into the stage" true. Usually
+    // the read loop already ran it; this covers a leader dying after the
+    // last line, and a repeat is a no-op.
     if control.cancelled()
         && let Some(pgid) = pgid
     {
@@ -338,12 +293,9 @@ pub fn build_captured(
             libc::kill(-pgid, libc::SIGKILL);
         }
     }
-    // The announcement is withdrawn once this side is done signalling:
-    // after the leader's reap and, on a cancellation, after the sweep —
-    // the post-wait I/O (failure log, stage verification) stays outside
-    // the window. Withdrawn on a failed wait too: the child's state is
-    // then unknown, and "never signal" is the only safe direction to be
-    // wrong in.
+    // Withdrawn once this side is done signalling — after the reap and
+    // the sweep, before the post-wait I/O. On a failed wait too: the
+    // state is unknown, and "never signal" is the safe direction.
     control.reaped();
     let status = status.context("waiting for cargo")?;
     if let Some(e) = read_error {
@@ -356,16 +308,11 @@ pub fn build_captured(
         ));
     }
     if !status.success() {
-        // Ended by the cancel, not by cargo: no failure log — an error
-        // that says the person's own decision was carried out is not a
-        // diagnosis — and the stage is removed rather than kept, since
-        // the only thing it is evidence of is that decision. Both
-        // conditions, deliberately: the phase alone would lose the race
-        // where cargo dies of its own causes an instant before a late
-        // cancel is accepted (a normal exit code is cargo's own verdict
-        // and must surface as the failure it is, phase notwithstanding);
-        // exit-by-signal alone would misfile an external kill — an OOM,
-        // say — as a cancellation nobody requested.
+        // Ended by the cancel, not by cargo: no failure log (the person's own
+        // decision is not a diagnosis), stage removed. Both conditions on
+        // purpose: phase alone loses the race where cargo dies just before a
+        // late cancel; signal alone would misfile an external OOM kill as a
+        // cancellation.
         use std::os::unix::process::ExitStatusExt;
         if control.cancelled() && status.signal().is_some() {
             let _ = fs::remove_dir_all(stage);
@@ -390,10 +337,9 @@ pub fn build_captured(
             &tail_from(&lines, start),
         ));
     }
-    // The failure contract — diagnosis plus the full log — holds past the
-    // exit code: cargo saying 0 and the stage failing verification (a
-    // missing or forged .crates2.json, a version mismatch) is a failure
-    // of this build like any other, and its log matters just as much.
+    // The failure contract holds past the exit code: cargo saying 0 with
+    // a stage failing verification is a failure like any other, log
+    // included.
     verified_info(name, version, stage).map_err(|e| {
         failure_with_log(
             log_dir,
@@ -414,9 +360,8 @@ fn tail_from(lines: &[String], start: usize) -> Vec<&str> {
         .collect()
 }
 
-/// One shape for every captured-build failure: headline, then the log
-/// path — right under it, because a shallow panel truncates from the
-/// bottom and the pointer to everything else must survive — then the
+/// One shape for every captured failure: headline, log path right
+/// under it (a shallow panel truncates from the bottom), then the
 /// tail.
 #[cfg(feature = "tui")]
 fn failure_with_log(
@@ -449,15 +394,11 @@ fn failure_with_log(
 const TAIL_LINES: usize = 12;
 
 #[cfg(feature = "tui")]
-/// The full captured output, written to a fresh, private file:
-/// `create_new` turns the PID+nanos naming from "collision absurdly
-/// unlikely" into "overwrite impossible" — an existing file is an error,
-/// never silently replaced evidence — and 0600 keeps build.rs output,
-/// which can quote the environment, out of other users' reach. Exactly
-/// 0600, not merely "no wider": open-time mode is an upper bound under
-/// umask (0777 would leave the log unreadable to its own owner), so a
-/// chmod on the descriptor restores the owner's rw — safe against the
-/// window, since the file is born at most tighter, never looser.
+/// The full output to a fresh, private file: `create_new` makes
+/// overwrite impossible (an existing file is an error, never replaced
+/// evidence); 0600 keeps build.rs output — which can quote the
+/// environment — from other users. chmod on the descriptor restores
+/// owner rw under a hostile umask; the file is born at most tighter.
 fn write_build_log(log_dir: &Path, name: &str, lines: &[String]) -> Result<PathBuf> {
     fs::create_dir_all(log_dir)
         .with_context(|| format!("creating log directory {}", log_dir.display()))?;
@@ -484,8 +425,8 @@ fn write_build_log(log_dir: &Path, name: &str, lines: &[String]) -> Result<PathB
 /// of both build variants.
 fn verified_info(name: &str, version: Option<&Version>, stage: &Path) -> Result<Built> {
     let built = staged_info(name, stage)?;
-    // What the stage holds is the truth about what was built; check it
-    // against what was asked rather than assume cargo honoured `=`.
+    // The stage is the truth about what was built; check it against what
+    // was asked rather than assume cargo honoured `=`.
     if let Some(version) = version
         && built.version != *version
     {
@@ -504,9 +445,8 @@ fn staged_info(name: &str, stage: &Path) -> Result<Built> {
     let parsed: Crates2 =
         serde_json::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?;
 
-    // Key format: `name version (source)`. The stage only ever holds one
-    // version per crate (cargo replaces on reinstall), but be defensive and
-    // take the semver max if we ever see more.
+    // Key format: `name version (source)`. One version per crate in
+    // practice; take the semver max defensively.
     let mut best: Option<Built> = None;
     for (key, info) in &parsed.installs {
         let mut parts = key.split_whitespace();
@@ -525,9 +465,8 @@ fn staged_info(name: &str, stage: &Path) -> Result<Built> {
             None => true,
         };
         if replace {
-            // Stage bookkeeping is also disk input steering placement; hold
-            // it to the same standard as the manifest: valid filenames, no
-            // duplicates — caught here, before anything touches the prefix.
+            // Stage bookkeeping is disk input steering placement; hold it to the
+            // manifest's standard — caught here, before the prefix is touched.
             crate::validate::validate_bin_list(&info.bins)
                 .with_context(|| format!("stage bookkeeping for `{name}`"))?;
             let bin_dir = stage.join("bin");
@@ -612,9 +551,8 @@ mod tests {
         .unwrap();
         fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
 
-        // Injected, not resolved: mutating $PATH would be process-global
-        // unsafety; the guard hands the fake to `command` directly and
-        // clears it on drop, panics included.
+        // Injected, not resolved: the guard hands the fake to `command`
+        // directly and clears it on drop.
         let _fake = FakeCargo::install(&script);
 
         let mut seen: Vec<String> = Vec::new();
@@ -643,8 +581,8 @@ mod tests {
         );
         assert!(msg.contains("full log:"), "log path travels in the error");
         let log = fs::read_dir(&logs).unwrap().next().unwrap().unwrap().path();
-        // The screw is torqued; mark it with paint: 0600 is a guarantee
-        // of write_build_log, not a happy accident of the umask.
+        // Torqued, marked with paint: 0600 is a guarantee of
+        // write_build_log, not a happy accident of the umask.
         let mode = fs::metadata(&log).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "the build log is private to the user");
         let full = fs::read_to_string(&log).unwrap();
@@ -656,10 +594,9 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    /// The other half of the captured contract: success streams lines
-    /// through the same parser path, and an exit-0 build that staged
-    /// nothing still fails with the log written — split from the
-    /// failure-diagnostics test above along its own seam.
+    /// The other half of the captured contract: success streams through
+    /// the same parser path, and an exit-0 build that staged nothing still
+    /// fails with the log written.
     #[cfg(feature = "tui")]
     #[test]
     fn captured_build_streams_success_and_verifies_the_stage() {

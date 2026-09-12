@@ -24,13 +24,10 @@ pub struct Entry {
     /// Whether the crate was built with `--locked`; reused on update.
     #[serde(default)]
     pub locked: bool,
-    /// Held at its installed version: excluded from `update --all`, and
-    /// refused by `update NAME` and `install NAME` until unpinned. A pin
-    /// is a statement about the future, so it survives everything that
-    /// is not an explicit `unpin` — including a rewrite of the entry.
-    /// Absent in manifests written before pins existed, which reads as
-    /// "not pinned", the only sensible meaning for a file that had no
-    /// way to say otherwise.
+    /// Held at its installed version: excluded from `update --all`,
+    /// refused by `update NAME`/`install NAME` until unpinned. A statement
+    /// about the future — survives everything but an explicit `unpin`.
+    /// Absent in older manifests, which reads as "not pinned".
     #[serde(default)]
     pub pinned: bool,
 }
@@ -55,24 +52,15 @@ impl Manifest {
         Ok(manifest)
     }
 
-    /// `load` without `validate` — for `verify` alone. Verify's whole
-    /// job is to look at state `load` refuses to hand over and to name
-    /// each broken invariant, with a granularity `validate`'s
-    /// first-failure bail cannot give; behind `load`, an unparseable
-    /// version or a doubly-claimed binary would surface as one opaque
-    /// "invalid manifest" error instead of findings. Everything that
-    /// mutates keeps `load`: the validated form is the only one the
-    /// pipeline may trust, and this reader hands its result to code that
+    /// `load` without `validate` — for `verify` alone, whose job is to
+    /// name each broken invariant behind `load`'s one opaque refusal.
+    /// Everything that mutates keeps `load`; this reader feeds code that
     /// only ever `stat`s.
     pub fn load_unvalidated(prefix: &Path) -> Result<Self> {
         let path = Self::path(prefix);
-        // Bytes first, parse second — deliberately not read_to_string,
-        // whose UTF-8 check turns a corrupt *file* into an I/O error
-        // (InvalidData) before serde ever sees it. The caller's whole
-        // point in the split is that an I/O failure says nothing about
-        // the content while refused bytes are exactly the corruption
-        // "repair or restore" is for; a 0xff in the manifest belongs to
-        // the second world, and only fs::read keeps it there.
+        // Bytes first, parse second — not read_to_string, whose UTF-8 check
+        // turns a corrupt *file* into an I/O error before serde sees it; a
+        // 0xff belongs to the parse world, and only fs::read keeps it there.
         match fs::read(&path) {
             Ok(raw) => serde_json::from_slice(&raw)
                 .with_context(|| format!("corrupt manifest at {}", path.display())),
@@ -81,12 +69,10 @@ impl Manifest {
         }
     }
 
-    /// The manifest steers file operations that may run under sudo, so it is
-    /// treated as untrusted input: every crate name must be a safe crates.io
-    /// identifier, every bin exactly one plain filename, every version valid
-    /// semver, and every bin owned by exactly one crate — `check_collisions`
-    /// and `remove` both assume ownership is a function, so the manifest must
-    /// guarantee it. Validated once here; the rest of the code relies on it.
+    /// The manifest steers file operations that may run under sudo, so it
+    /// is untrusted input: names safe, bins plain unique filenames,
+    /// versions semver, ownership a function (`check_collisions` and
+    /// `remove` assume it). Validated once here.
     fn validate(&self) -> Result<()> {
         let mut owners: BTreeMap<&str, &str> = BTreeMap::new();
         for (name, entry) in &self.crates {
@@ -117,15 +103,13 @@ impl Manifest {
         self.store_with_policy(prefix, privileged::Policy::for_prefix(prefix))
     }
 
-    /// `store` with the caller's policy, threaded rather than re-derived:
-    /// the manifest commit is the pipeline's last privileged write, and a
-    /// store that quietly reset the Screen axis here would hand the very
-    /// end of a captured run back to interactive sudo and an inherited
-    /// stderr — the one side entrance left after all the others closed.
+    /// `store` with the caller's policy threaded, not re-derived: the
+    /// commit is the pipeline's last privileged write, and a quiet reset
+    /// of the Screen axis here would hand the end of a captured run back
+    /// to interactive sudo.
     pub fn store_with_policy(&self, prefix: &Path, policy: privileged::Policy) -> Result<()> {
-        // Symmetry with load(): cargo-lbin never knowingly writes state it would
-        // later refuse to read back. Upstream checks should make this
-        // unreachable; it exists as the last line of defense.
+        // Symmetry with load(): never knowingly write state we would refuse
+        // to read back; the last line of defense.
         self.validate()
             .context("refusing to store invalid manifest")?;
         let mut raw = serde_json::to_string_pretty(self)?;
@@ -193,10 +177,8 @@ mod tests {
         assert!(err.contains("owned by both"), "{err}");
         assert!(err.contains("foo") && err.contains("baz"), "{err}");
 
-        // Intra-entry duplicate: distinct message. Note {:#}: anyhow's
-        // Display shows only the outermost context ("crate `foo`"), while
-        // the alternate form prints the whole chain — which is also what
-        // main() shows the user.
+        // Intra-entry duplicate: distinct message. {:#} prints the whole
+        // chain, which is what main() shows.
         let mut m = Manifest::default();
         m.crates.insert("foo".to_owned(), entry(&["x", "x"]));
         let err = format!("{:#}", m.validate().unwrap_err());

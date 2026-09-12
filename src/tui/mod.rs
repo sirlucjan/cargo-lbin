@@ -1,25 +1,20 @@
 //! Interactive front end over the same commands the CLI runs.
 //!
-//! The TUI adds no logic of its own. It reads the manifest and the last
-//! `checkupdate` report from disk, and every action is one of the existing
-//! commands: `r` is `checkupdate`, `u`/`U` are `update NAME`/`update --all`,
-//! `i` is `install`, `x` is `remove`, `s` is `search`, `v` is `verify`. Nothing happens
-//! unless a key asks for it — no polling, no refresh or network access on
-//! start. (Once asked, `i`, `u` and `U` reach the network too, through
-//! cargo; the guarantee is about what the TUI does unprompted.)
+//! The TUI adds no logic of its own: `r` is `checkupdate`, `u`/`U` are
+//! `update`, `i` is `install`, `x` is `remove`, `s` is `search`, `v` is
+//! `verify`. Nothing happens unless a key asks for it — no polling, no
+//! refresh or network access on start.
 //!
-//! Two ways of running a command. Commands that build and place binaries
-//! (`update`, `install`, `remove`) need the real terminal: cargo prints its
-//! own progress, rustc its own diagnostics, and sudo may prompt for a
-//! password. The TUI steps aside for them — leaves the alternate screen,
-//! runs the command exactly as the CLI would, waits for Enter, and comes
-//! back (the lazygit-spawns-an-editor pattern). The `Terminal` is created
-//! once and kept across handoffs: `ratatui::try_init()` installs a panic hook
-//! on every call, wrapping the previous one, so re-initializing per
-//! command would stack a hook per operation. `checkupdate` and `search`
-//! only talk to crates.io, and `v` (`verify`) only reads the disk; all
-//! three run on a one-shot thread while the list stays navigable, and
-//! their answers are applied on the main thread.
+//! Two ways of running a command. Some take over the real terminal
+//! (`u`/`U` updates, multi-crate installs, `downgrade`): the TUI steps
+//! aside, runs the command as the CLI would, waits for Enter, and comes
+//! back. Others run in place: a single-crate install or migrate builds
+//! behind the framed panel with its cancel door and sudo roundtrip, and
+//! a removal or pin flip that needs no escalation never leaves the
+//! screen. The `Terminal` is created once and kept across handoffs —
+//! `ratatui::try_init()` stacks a panic hook per call. `checkupdate`,
+//! `search` and `v` run on a one-shot thread while the list stays
+//! navigable.
 //!
 //! A manifest the validated loader refuses does not keep the TUI out:
 //! the session starts degraded — empty list, mutating actions refused,
@@ -52,10 +47,9 @@ use crate::validate::InstallSpec;
 /// How often the input poll wakes up to look for finished background work.
 const TICK: Duration = Duration::from_millis(100);
 
-/// How long an accepted cancel is given before the run loop escalates
-/// to SIGKILL on its own. Two seconds: enough for any well-behaved
-/// build tree to fold after SIGTERM, short enough that a wedged one
-/// does not hold the person hostage.
+/// Grace an accepted cancel gets before the run loop escalates to
+/// SIGKILL: enough for a well-behaved tree to fold after SIGTERM,
+/// short enough not to hold the person hostage.
 const CANCEL_GRACE: Duration = Duration::from_secs(2);
 
 /// One installed crate as the list shows it.
@@ -66,15 +60,14 @@ pub struct Row {
     pub bins: Vec<String>,
     pub locked: bool,
     pub pinned: bool,
-    /// Pre-formatted ` [also in ...]` suffix from the prefixes module —
-    /// the same formatter the CLI listing uses, so the two surfaces
-    /// cannot drift; empty for a crate installed nowhere else.
+    /// Pre-formatted ` [also in ...]` suffix, from the same formatter the
+    /// CLI uses so the two surfaces cannot drift; empty otherwise.
     pub also: String,
     pub status: RowStatus,
 }
 
-/// What the last `checkupdate` says about a row — three states, and the
-/// third is silence, never a guess (see `report::Status`).
+/// What the last `checkupdate` says about a row — three states, the
+/// third silence, never a guess (see `report::Status`).
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum RowStatus {
     UpToDate,
@@ -119,10 +112,8 @@ impl Filter {
 }
 
 /// Whether a row belongs to a view. Updates means what `update --all`
-/// will act on: a pinned crate is held back by it, so a pinned crate
-/// with a newer version does not belong in a view whose count promises
-/// actionable updates. Its backlog is not hidden — it lives in the
-/// Pinned tab, whose count is always on screen.
+/// will act on: a pinned crate is held back, so its backlog lives in
+/// the always-counted Pinned tab instead.
 fn admits(filter: Filter, row: &Row) -> bool {
     match filter {
         Filter::All => true,
@@ -134,9 +125,8 @@ fn admits(filter: Filter, row: &Row) -> bool {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum MessageKind {
     Info,
-    /// The operation succeeded but something around it did not — shown
-    /// in yellow so it is neither dismissed as routine nor read as a
-    /// failure.
+    /// Succeeded, but something around it did not — yellow: neither
+    /// routine nor a failure.
     Warning,
     Error,
 }
@@ -165,9 +155,8 @@ pub struct Confirm {
 }
 
 impl Confirm {
-    /// The one funnel: the prompt is Span-bound like every other line,
-    /// and both builders interpolate strings the TUI does not control —
-    /// binary names from the manifest, prefixes inherited from $HOME.
+    /// The one funnel: the prompt is Span-bound, and both builders
+    /// interpolate strings the TUI does not control.
     fn new(prompt: &str, action: OnConfirm) -> Self {
         Self {
             prompt: crate::text::sanitize(prompt),
@@ -176,27 +165,21 @@ impl Confirm {
     }
 }
 
-/// What a confirmed `y` triggers. A migration starts an in-place job
-/// like an install does; a removal decides its shape only at the `y` —
-/// in place, or the terminal handoff — because privilege is a property
-/// of the world, checked fresh (see `remove_confirmed`).
+/// What a confirmed `y` triggers. A removal decides its shape only at
+/// the `y`: privilege is a property of the world, checked fresh.
 enum OnConfirm {
     Migrate {
         name: String,
-        /// The row's version string, for the result line — display data
-        /// for the same plan the snapshot freezes.
+        /// The row's version string, for the result line.
         version: String,
         dest: PathBuf,
-        /// The plan, frozen at the keypress from the very row the person
-        /// is looking at. The worker receives *this* snapshot — never a
-        /// fresh one taken after the `y`, which could bless a version
-        /// the person never confirmed; a source that moved on since is
-        /// the checkpoint's job to reject.
+        /// The plan, frozen at the keypress from the very row on screen; the
+        /// worker receives *this* snapshot — a fresh one after the `y` could
+        /// bless a version the person never confirmed.
         snap: crate::MigrationSnapshot,
     },
-    /// `x`: the shape (in place or terminal handoff) is decided fresh
-    /// at the `y`, not at the keypress — privilege is a property of the
-    /// world, and the world may move while the prompt is open.
+    /// `x`: the shape (in place or handoff) is decided fresh at the `y` —
+    /// the world may move while the prompt is open.
     Remove { name: String },
     /// `migrate --all`: the whole plan frozen at the keypress, one
     /// snapshot per row, complete or not at all.
@@ -206,8 +189,8 @@ enum OnConfirm {
     },
 }
 
-/// Commands that take over the terminal; queued by key handlers and run
-/// by the event loop after the frame announcing them has been drawn.
+/// Commands that take over the terminal; queued by key handlers, run
+/// by the event loop after the announcing frame.
 #[derive(Clone)]
 enum PendingAction {
     Update(String),
@@ -222,16 +205,14 @@ enum PendingAction {
         name: String,
         pinned: bool,
     },
-    /// `downgrade`: the version prompt appears in the terminal, like
-    /// `update`'s confirmation.
+    /// `downgrade`: the version prompt appears in the terminal.
     Downgrade(String),
 }
 
 /// The render boundary in one function: every pipeline line becomes a
-/// `BuildMsg` here — sanitized, because past this point it is Span-bound,
-/// and a shadow warning or a lock notice carries paths, and a path may
-/// hold ESC as legally as `a`. The worker forwards through this and
-/// nothing else; a future producer cannot route around it.
+/// `BuildMsg` here — sanitized, because past this point it is
+/// Span-bound and paths may hold ESC. A future producer cannot route
+/// around it.
 fn build_msg(kind: crate::LineKind, line: &str) -> BuildMsg {
     let line = crate::text::sanitize(line);
     match kind {
@@ -241,45 +222,34 @@ fn build_msg(kind: crate::LineKind, line: &str) -> BuildMsg {
     }
 }
 
-/// Messages a build worker streams to the UI thread — the protocol
-/// mirrors the pipeline's classification, because capture is not
-/// presentation and the UI decides differently per kind.
+/// Messages a build worker streams to the UI thread; the protocol
+/// mirrors the pipeline's classification.
 enum BuildMsg {
     /// cargo's own output: parsed for the gauge, kept for the tail.
     Cargo(String),
     /// The pipeline narrating itself; promoted to the live status so
-    /// "waiting for the state lock" is what the person sees, not a
-    /// gauge frozen at zero units.
+    /// "waiting for the state lock" beats a gauge frozen at zero.
     Notice(String),
-    /// Kept past success: a shadowed binary does not stop being
-    /// shadowed because the install succeeded.
+    /// Kept past success: a shadowed binary does not stop being shadowed
+    /// because the install succeeded.
     Warning(String),
-    /// A privileged step wants sudo revalidated on a real terminal —
-    /// for the named prefix: one worker can escalate for two prefixes
-    /// in one job (a migration's destination placement, then its source
-    /// retirement), and the prompt must name the one actually asking.
-    /// The worker blocks on the auth channel until the run loop — the
-    /// only place that owns the terminal — answers.
+    /// A privileged step wants sudo revalidated on a real terminal — for
+    /// the named prefix: one worker can escalate for both prefixes of a
+    /// migration, and the prompt must name the one asking. The worker
+    /// blocks until the run loop answers.
     NeedAuth(PathBuf),
-    /// The pipeline finished, one way or the other — classified by the
-    /// worker, where the error itself is at hand: the UI must not guess
-    /// "cancelled" from a phase flag that a late `c` can set an instant
+    /// Finished, classified by the worker where the error is at hand: the
+    /// UI must not guess "cancelled" from a phase flag a late `c` can set
     /// after cargo died of its own causes.
     Done(BuildOutcome),
 }
 
-/// How a build ended. `Cancelled` is a real outcome of the pipeline
-/// (the `BuildCancelled` marker travelling up as an error), not a UI
-/// interpretation: a cancelled build writes no failure log and leaves
-/// no stage behind. `CompletedWithWarning` is a job whose build
-/// succeeded but whose follow-through did not finish as asked — the
-/// name is deliberately generic: the payload owns the specifics, and
-/// the protocol does not learn any one operation's vocabulary.
-/// `Migrated` is a moved migration's success, carrying the version the
-/// destination actually committed: the frozen plan's version is what
-/// was confirmed and revalidated, not necessarily what was installed,
-/// and the note must speak the result — never fished out of the
-/// pipeline's prose, never guessed from the plan.
+/// How a build ended. `Cancelled` is a real pipeline outcome (the
+/// typed marker), not a UI interpretation. `CompletedWithWarning` is
+/// deliberately generic: the payload owns the specifics. `Migrated`
+/// carries the version the destination actually committed — the frozen
+/// plan's version is what was confirmed, not necessarily what was
+/// installed, and the note must speak the result.
 enum BuildOutcome {
     Success,
     Migrated(Version),
@@ -288,18 +258,17 @@ enum BuildOutcome {
     Failed(anyhow::Error),
 }
 
-/// What the job is building toward. The UI composes its result lines
-/// from this data — the worker reports outcomes, never prose.
+/// What the job builds toward; the UI composes result lines from
+/// this — the worker reports outcomes, never prose.
 enum BuildKind {
     Install,
-    /// Boxed: `Job::Build` is already the enum's largest variant, and
-    /// the target rides in every build job regardless of kind — an
-    /// inline payload here is dead weight on every install.
+    /// Boxed: the variant is already the enum's largest, and the target
+    /// rides in every build job.
     Migrate(Box<MigrateTarget>),
 }
 
-/// A confirmed migration on its way to `start_migrate`, carried through
-/// the run loop because the destination preflight may need the terminal.
+/// A confirmed migration on its way to `start_migrate`; the
+/// destination preflight may need the terminal.
 struct PendingMigrate {
     name: String,
     version: String,
@@ -307,38 +276,31 @@ struct PendingMigrate {
     snap: crate::MigrationSnapshot,
 }
 
-/// A confirmed `M`: the CLI's `migrate --all`, as a queue of the very
-/// same single migrations `m` runs — each crate its own unit of work,
-/// its own preflight (a sudo timestamp can expire mid-batch), its own
-/// pass through the Build panel and the cancel door. The batch owns the
-/// tally and the final summary; per-crate panels are suppressed in
-/// favor of one report at the end, which is the CLI's "reported, and
-/// the batch moves on" in the TUI's shape.
+/// A confirmed `M`: `migrate --all` as a queue of the very single
+/// migrations `m` runs — each its own unit, preflight and cancel door.
+/// The batch owns the tally and one final summary: the CLI's
+/// "reported, and the batch moves on", in the TUI's shape.
 struct MigrateBatch {
     dest: PathBuf,
     queue: std::collections::VecDeque<PendingMigrate>,
     total: usize,
     moved: usize,
     /// `(name, lines)` — destination committed, source not retired: the
-    /// full Incomplete reason plus any build warnings of that member.
+    /// Incomplete reason plus that member's warnings.
     warned: Vec<(String, Vec<String>)>,
-    /// `(name, lines)` — the same diagnostics a single job's failure
-    /// panel gets (error chain, tail excerpt when the chain is terse),
-    /// the authoritative already-installed refusal among them exactly
-    /// as the CLI counts it: a shortfall, not a skip.
+    /// `(name, lines)` — the same diagnostics a single failure panel
+    /// gets; the already-installed refusal counts as a shortfall, as on
+    /// the CLI.
     failed: Vec<(String, Vec<String>)>,
-    /// `(name, warnings)` — members that migrated *fully* but whose
-    /// build spoke warnings: a batch summary must not launder a shadow
-    /// warning into a clean "migrated N of N".
+    /// `(name, warnings)` — fully migrated members whose build spoke
+    /// warnings: the summary must not launder them.
     noticed: Vec<(String, Vec<String>)>,
-    /// The last mid-batch reload failure, resurfaced at the summary —
-    /// recorded, not discarded.
+    /// The last mid-batch reload failure, resurfaced at the summary.
     reload_error: Option<String>,
 }
 
 /// Did `start_migrate` actually start a worker? A refusal carries its
-/// reason: the caller — a batch especially — must put it somewhere the
-/// final summary will not overwrite.
+/// reason — the summary must not overwrite it.
 enum StartOutcome {
     Started,
     Refused(String),
@@ -352,45 +314,36 @@ enum Preflight {
     /// `sudo -n` would be asked a question it cannot voice.
     NoCache,
     /// Something failed; the message is returned, not swallowed — the
-    /// caller decides where it must survive (a footer line for an
-    /// install; the batch's summary panel for a migration, whose later
-    /// summary would overwrite the footer).
+    /// caller decides where it must survive.
     Reported(String),
 }
 
-/// Where a migration is headed; the UI composes its result lines from
-/// this.
+/// Where a migration is headed.
 struct MigrateTarget {
     version: String,
     dest: PathBuf,
 }
 
-/// A build's sticky report, held in the details panel until dismissed.
-/// A failure carries the error tail and the log path (see
-/// `stage::build_captured`); a success carries warnings — a shadowed
-/// binary does not stop being shadowed because the install succeeded —
-/// and either would be wasted by a message that scrolls away with the
-/// next keypress.
+/// A build's sticky report, held until dismissed: a failure carries
+/// the tail and log path, a success its warnings — either would be
+/// wasted by a message that scrolls away.
 pub struct BuildReport {
     pub title: String,
     pub lines: Vec<String>,
     pub failed: bool,
 }
 
-/// How many output lines the gauge keeps around for the failure panel.
-/// The full text is in the log file; this is only what a placement or
-/// commit error — which carries no tail of its own — gets to show.
+/// Output lines kept for the failure panel; the full text is in the
+/// log file.
 const BUILD_TAIL: usize = 40;
 
-/// Background work in flight. At most one at a time: the footer shows one
-/// busy label and the user should know what it stands for.
+/// Background work in flight — at most one, so the busy label is
+/// unambiguous.
 enum Job {
     Check(Receiver<Result<Vec<Checked>>>),
-    /// A read-only audit of the current prefix on a worker thread: the
-    /// checks only stat, but /usr/local may be slow storage and the UI
-    /// stays responsive on principle. While it runs it gets the same
-    /// framed panel a build gets; findings land in the sticky report
-    /// panel — the CLI's severity split, in the TUI's shape.
+    /// The read-only audit on a worker thread (slow storage; the UI stays
+    /// responsive on principle), in the build's framed panel; findings
+    /// land in the sticky report — the CLI's severity split.
     Verify {
         rx: Receiver<Result<crate::VerifyReport>>,
         started: std::time::Instant,
@@ -399,15 +352,14 @@ enum Job {
         query: String,
         rx: Receiver<Result<Vec<api::Hit>>>,
     },
-    /// A captured single-crate install: `tui_install_one` on a worker
-    /// thread, its lines streaming in over `rx`.
+    /// A captured single-crate install streaming over `rx`.
     Build {
         name: String,
         rx: Receiver<BuildMsg>,
         /// The run loop's answer to `BuildMsg::NeedAuth`.
         auth_tx: Sender<bool>,
-        /// Units started, per the progress parser. Started, not
-        /// finished: cargo announces a unit when it begins.
+        /// Units started, not finished: cargo announces a unit when it
+        /// begins.
         units_started: usize,
         /// The unit last announced by cargo.
         current: Option<String>,
@@ -416,30 +368,23 @@ enum Job {
         /// The last pipeline notice, shown as the live status until
         /// cargo speaks again.
         status_note: Option<String>,
-        /// Warnings; shown past a success, dropped on failure — a
-        /// rollback removes the binaries they described.
+        /// Warnings; shown past a success, dropped on failure — a rollback
+        /// removed the binaries they described.
         warnings: Vec<String>,
-        /// When the worker was spawned. Lock waiting counts on purpose:
-        /// the clock answers "how long has this operation been running",
-        /// not "how long has cargo been compiling".
+        /// When the worker spawned; lock waiting counts on purpose — the
+        /// clock answers "how long has this operation been running".
         started: std::time::Instant,
-        /// Set by `poll_job` when the worker asked for revalidation —
-        /// carrying the prefix the escalation is for; answered by the
-        /// run loop, which owns the terminal.
+        /// Set by `poll_job` on a revalidation request — carrying the prefix
+        /// the escalation is for; answered by the run loop.
         needs_auth: Option<PathBuf>,
-        /// The cancel state machine shared with the worker: `c` and
-        /// Ctrl-C talk to the build through this and nothing else.
+        /// The cancel state machine shared with the worker.
         control: std::sync::Arc<crate::BuildControl>,
-        /// What is being built toward; the result lines are composed
-        /// from this.
+        /// What is being built toward.
         kind: BuildKind,
-        /// When the grace period of an accepted cancel runs out; armed
-        /// by the first Accepted, one-shot. The run loop escalates to
-        /// SIGKILL when it passes, because the worker cannot be trusted
-        /// to reach its own sweep — a group member holding the inherited
-        /// stderr can wedge it *inside* `read_until`, past the poll: a
-        /// partial line with no terminating newline is enough to turn
-        /// "readable" into a blocking read on a pipe nobody will close.
+        /// When an accepted cancel's grace runs out; one-shot. The run loop
+        /// escalates because the worker cannot be trusted to reach its own
+        /// sweep — a member holding inherited stderr can wedge it inside
+        /// `read_until`.
         cancel_deadline: Option<std::time::Instant>,
     },
 }
@@ -455,26 +400,22 @@ impl Job {
     }
 }
 
-/// How many hits the details panel can show; passed to `api::search`,
-/// which guarantees no more come back.
+/// Hits the details panel shows; `api::search` guarantees no more.
 const SEARCH_HITS: usize = 6;
 
-/// A finished search, shown in the details panel until dismissed. Digit
-/// keys pick a hit by its 1-based position and fill the install input.
+/// A finished search, shown until dismissed; digits pick a hit.
 pub struct SearchResult {
     pub query: String,
     pub hits: Vec<api::Hit>,
-    /// Installed version per hit name, read from the manifest when the
-    /// result was presented (see `finish_search`).
+    /// Installed version per hit, read when the result was presented.
     pub installed: BTreeMap<String, String>,
 }
 
 pub struct App {
     prefix: PathBuf,
     cache: PathBuf,
-    /// Ctrl-C during a build: quit, but only once the worker has
-    /// reported back — leaving earlier would orphan a cargo that is
-    /// still being torn down.
+    /// Ctrl-C during a build: quit once the worker reports back —
+    /// leaving earlier would orphan a dying cargo.
     quit_after_build: bool,
     /// Every manifest entry, in manifest (alphabetical) order.
     rows: Vec<Row>,
@@ -486,31 +427,24 @@ pub struct App {
     pub message: Option<Message>,
     pub input: Option<Input>,
     pub confirm: Option<Confirm>,
-    /// A confirmed migration waiting for the run loop, which owns the
-    /// terminal the preflight may need for a password.
+    /// A confirmed migration waiting for the run loop (the preflight may
+    /// need the terminal).
     pending_migrate: Option<PendingMigrate>,
-    /// A running `M` batch; `finish_build` feeds it and advances the
-    /// queue, `c` on the current crate ends it.
+    /// A running `M` batch; `finish_build` feeds it, `c` ends it.
     migrate_batch: Option<MigrateBatch>,
     pub search_result: Option<SearchResult>,
     /// A build's sticky report pinned to the details panel until dismissed.
     pub build_report: Option<BuildReport>,
-    /// The validated loader's refusal, when the manifest cannot be
-    /// loaded — the TUI's degraded state. The list is empty, mutating
-    /// actions are refused, and `v` stays reachable: the key that
-    /// explains what is wrong must not vanish exactly when something
-    /// is. `None` again the moment a reload succeeds.
+    /// The loader's refusal — the degraded state: list empty, mutating
+    /// actions refused, `v` reachable. `None` again once a reload
+    /// succeeds.
     pub manifest_error: Option<String>,
-    /// Scroll offset of the sticky report panel, in rendered rows;
-    /// reset by `pin_report`, clamped at draw time where the width is
-    /// known. Findings are unbounded and the panel is not — a report
-    /// that physically hides its own tail defeats its purpose as the
-    /// durable record.
+    /// Sticky-report scroll offset, reset by `pin_report`, clamped at
+    /// draw time; a report that hides its own tail is no durable record.
     pub report_scroll: u16,
     pub show_help: bool,
     pending: Option<PendingAction>,
-    /// A captured install waiting for the run loop, which owns the
-    /// terminal and must preauthorize sudo before spawning the worker.
+    /// A captured install waiting for the run loop (sudo preauth first).
     pending_build: Option<(String, bool)>,
     job: Option<Job>,
     /// Frame counter; drives the gauge spinner.
@@ -518,23 +452,14 @@ pub struct App {
     should_quit: bool,
 }
 
-/// Entry point for `cargo lbin tui`.
-///
-/// Owns the terminal for the whole session. Teardown mirrors the handoff
-/// in `run_in_terminal` — show the cursor, then leave raw mode and the
-/// alternate screen — and is attempted whether or not the loop returned
-/// an error, so a failure inside the TUI does not also leave the shell
-/// with a hidden cursor. The loop's result is reported first: it is the
-/// one the user asked about.
+/// Entry point for `cargo lbin tui`. Owns the terminal; teardown is
+/// attempted whether or not the loop erred, and the loop's result is
+/// reported first.
 pub fn run(prefix: &Path) -> Result<()> {
-    // Everything that can fail before raw mode does so here, as a plain
-    // error message rather than a garbled screen.
+    // Fail before raw mode as a plain error, not a garbled screen.
     let mut app = App::new(prefix)?;
-    // `try_init` over `init`: a terminal that refuses raw mode or the
-    // alternate screen is a normal error for cargo-lbin to report, not a
-    // panic. It initializes in stages (hook, raw mode, alternate screen,
-    // terminal), so on failure a best-effort restore undoes whichever
-    // stages did succeed before the error is passed on.
+    // `try_init` over `init`: a refused terminal is a normal error, and
+    // its staged failure restores whatever did succeed.
     let mut terminal = match ratatui::try_init() {
         Ok(terminal) => terminal,
         Err(e) => {
@@ -553,13 +478,11 @@ pub fn run(prefix: &Path) -> Result<()> {
     Ok(())
 }
 
-/// What a reload found — a value every caller must face. Since the
-/// degraded state exists, `Ok` no longer means "the list is fresh": it
-/// can also mean "the manifest refused to load and the session
-/// remembered it". A flag inside `App` would let the next caller
-/// forget to look; a `#[must_use]` outcome makes forgetting visible at
-/// the call site, which is where the next lie would otherwise be
-/// written ("nothing installed", "now at …", "checked: 0 updates").
+/// What a reload found — a value every caller must face: since the
+/// degraded state exists, `Ok` no longer means "the list is fresh".
+/// A flag would let the next caller forget; `#[must_use]` makes
+/// forgetting visible at the call site, where the next lie would be
+/// written ("nothing installed", "now at ...", "checked: 0 updates").
 #[must_use]
 enum ReloadOutcome {
     Loaded,
@@ -592,25 +515,19 @@ impl App {
             should_quit: false,
             quit_after_build: false,
         };
-        // Both outcomes are a session: a broken manifest starts degraded
-        // by design, and the footer carries that state from here on.
+        // Both outcomes are a session: degraded starts are by design.
         let _ = app.reload()?;
         Ok(app)
     }
 
-    /// Re-read manifest and report from disk and rebuild the rows. Called
-    /// at start, after every terminal-taking command, before an update
-    /// check, and when a search result is about to be presented — the
-    /// TUI may have been open for an hour while another cargo-lbin
-    /// changed the prefix, and each of those is a moment the user is
-    /// about to be shown or act on the prefix's state. The state lock is
-    /// held only for the manifest read, never while the TUI idles.
+    /// Re-read manifest and report, rebuild the rows — at start, after
+    /// handoffs, before checks and search results: each is a moment the
+    /// person is about to see or act on the prefix. The lock is held only
+    /// for the read.
     fn reload(&mut self) -> Result<ReloadOutcome> {
-        // A search result marks hits as installed — a fact about the
-        // prefix. Anything that re-reads the prefix — a command's return,
-        // `r`, a newer search — is exactly the moment that fact may have
-        // stopped being true, so it goes. `finish_search` reloads first
-        // and sets the new result after, so this never eats a fresh one.
+        // A search result marks hits installed — a fact about the prefix,
+        // stale the moment anything re-reads it; `finish_search` reloads
+        // first and sets the new result after.
         self.search_result = None;
         let report = match Report::load(&self.cache, &self.prefix) {
             Ok(report) => report,
@@ -622,18 +539,15 @@ impl App {
         self.apply_report(report.as_ref())
     }
 
-    /// Rebuild the rows from a fresh manifest read and the given report —
-    /// which may be one that could not be written to disk; what the
-    /// index answered is still shown.
+    /// Rebuild rows from a fresh manifest and the given report — possibly
+    /// one that failed to persist; what the index answered is shown.
     fn apply_report(&mut self, report: Option<&Report>) -> Result<ReloadOutcome> {
         let manifest = {
             let _lock = StateLock::acquire(&self.prefix, &Mode::Shared)?;
-            // The validated loader's refusal is a state to present, not
-            // a reason to keep the TUI out: `verify` exists precisely to
-            // diagnose manifests `load` refuses, and a session that dies
-            // on startup takes the `v` key with it. Degrade instead —
-            // empty list, remembered error, mutating actions gated —
-            // and recover the moment a reload succeeds.
+            // The loader's refusal is a state to present, not a reason to keep
+            // the TUI out: verify exists to diagnose what `load` refuses, and a
+            // session that dies on startup takes the v key with it. Degrade,
+            // recover on the next successful reload.
             match Manifest::load(&self.prefix) {
                 Ok(manifest) => {
                     self.manifest_error = None;
@@ -653,9 +567,7 @@ impl App {
                 }
             }
         };
-        // Once per reload, never per frame — and lockless by design; the
-        // prefixes module explains why an annotation must never wait on
-        // a foreign lock.
+        // Once per reload, lockless by design (see the prefixes module).
         let also = crate::prefixes::also_installed(&self.prefix);
         self.rows = rows_from(&manifest, report, &also);
         self.report_age = report.map(Report::age);
@@ -671,23 +583,17 @@ impl App {
             .collect()
     }
 
-    /// Is a build job (install or migrate) running right now? The
-    /// footer asks: while one runs, `c` is the key that matters and
-    /// most of the list keys bounce off "another operation is already
-    /// running" — the hint bar swaps to the build's controls, the same
-    /// way it already does for a confirmation or an input. Controls,
-    /// not promises: the job outlives the placement door, where `c` is
-    /// `TooLate` and Ctrl-C only arms quit-after, so the bar names the
-    /// keys and leaves each press's truthful outcome to the runtime
-    /// message.
+    /// Is a build job running? While one runs the hint bar swaps to the
+    /// build's controls — controls, not promises: past the placement door
+    /// `c` is `TooLate`, and each press's outcome is the runtime's to
+    /// state.
     pub fn build_running(&self) -> bool {
         matches!(self.job, Some(Job::Build { .. }))
     }
 
-    /// Is anything running or queued? The union every in-place mutation
-    /// and the prefix jump consult before touching shared state: a job
-    /// above all, but also the queued starts — a batch between two
-    /// members has an empty job slot and a full queue, and both count.
+    /// Anything running or queued — the union every in-place mutation and
+    /// the jump consult: a batch between members has an empty job slot
+    /// and a full queue, and both count.
     fn anything_running(&self) -> bool {
         self.job.is_some()
             || self.migrate_batch.is_some()
@@ -701,10 +607,8 @@ impl App {
     }
 
     pub fn updates_available(&self) -> usize {
-        // Keep the cached Updates view aligned with update --all
-        // semantics: pinned crates are held back and counted separately.
-        // Alignment of meaning, not of outcome — this number comes from
-        // the recorded report, while `U` computes a fresh plan.
+        // Aligned with update --all semantics: pinned crates are held back
+        // and counted separately. Meaning, not outcome — `U` computes fresh.
         self.rows
             .iter()
             .filter(|r| matches!(r.status, RowStatus::Outdated(_)) && !r.pinned)
@@ -715,8 +619,7 @@ impl App {
         self.rows.iter().filter(|r| r.pinned).count()
     }
 
-    /// Pinned crates the last check found a newer version for — the
-    /// backlog the pin is deliberately sitting on.
+    /// Pinned crates the last check found newer versions for.
     pub fn pinned_outdated(&self) -> usize {
         self.rows
             .iter()
@@ -728,8 +631,8 @@ impl App {
         self.rows.len()
     }
 
-    /// Rows the last report says nothing about. Counted separately so the
-    /// footer never lets "0 updates" imply "all current".
+    /// Rows the report says nothing about — counted so "0 updates" never
+    /// implies "all current".
     pub fn not_checked(&self) -> usize {
         self.rows
             .iter()
@@ -755,10 +658,8 @@ impl App {
     /// compile for minutes without a new `Compiling` line.
     pub fn build_progress(&self) -> Option<String> {
         const FRAMES: [char; 8] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧'];
-        // A running verify borrows the build's framed panel — the same
-        // window, per the design: an audit in progress deserves to be as
-        // unmissable as a build, and two transient-panel mechanisms
-        // would be one more thing to keep identical by hand.
+        // A running verify borrows the build's framed panel: one mechanism,
+        // so the two cannot drift apart by hand.
         if let Some(Job::Verify { started, .. }) = &self.job {
             let frame = FRAMES[self.ticks % FRAMES.len()];
             return Some(format!(
@@ -780,10 +681,8 @@ impl App {
         };
         let frame = FRAMES[self.ticks % FRAMES.len()];
         let elapsed = format_elapsed(started.elapsed());
-        // A pipeline notice is the live truth of the moment — "waiting
-        // for the state lock…" beats a gauge frozen at zero units, which
-        // is exactly the impression the notice exists to prevent. The
-        // clock runs through it: waiting is part of the operation.
+        // A pipeline notice is the live truth — "waiting for the state
+        // lock..." beats a gauge frozen at zero; the clock runs through it.
         if let Some(note) = status_note {
             return Some(format!("{frame} {name}: {note} · elapsed {elapsed}"));
         }
@@ -827,11 +726,8 @@ impl App {
                 let member = req.name.clone();
                 if let StartOutcome::Refused(reason) = self.start_migrate(terminal, req)? {
                     match self.migrate_batch.as_mut() {
-                        // A batch cannot wait on a worker that never
-                        // existed: the refused member is recorded as a
-                        // failure — with its reason, in the panel, where
-                        // the summary will not overwrite it — and the
-                        // remainder is counted as not attempted.
+                        // A batch cannot wait on a worker that never existed: the refusal is
+                        // recorded as a failure where the summary will not overwrite it.
                         Some(batch) => {
                             batch.failed.push((member, vec![reason]));
                             self.finalize_migrate_batch(Some("aborted"));
@@ -862,19 +758,11 @@ impl App {
         Ok(())
     }
 
-    /// Steps out of the TUI, runs the command as the CLI would — its
-    /// output, its prompts, its sudo — and steps back in. The wait for
-    /// Enter is what lets the user read the output; the redraw would
-    /// otherwise erase it at once.
-    ///
-    /// The cursor is shown explicitly: `draw` hides it whenever a frame
-    /// sets no cursor position, and `restore` does not bring it back, so
-    /// without this sudo would prompt for a password at an invisible
-    /// cursor. `try_restore` rather than `restore`: if raw mode could not
-    /// be left, handing the terminal to cargo and sudo anyway would be
-    /// worse than aborting with the reason. Re-entry re-enables raw mode
-    /// and the alternate screen on the same `Terminal` — see the module
-    /// doc for why not a fresh `init()`.
+    /// Steps out of the TUI, runs the command as the CLI would, steps
+    /// back in; the wait for Enter lets the person read the output.
+    /// The cursor is shown explicitly (sudo would otherwise prompt at an
+    /// invisible one); `try_restore` because handing over a terminal
+    /// still in raw mode would be worse than aborting.
     fn run_in_terminal(
         &mut self,
         terminal: &mut DefaultTerminal,
@@ -910,10 +798,9 @@ impl App {
             .context("re-entering the alternate screen")?;
         terminal.clear()?;
 
-        // The command may have changed everything; the report is stale for
-        // whatever it touched, and `reload` shows that as "not checked".
-        // Degraded or loaded, the command's own outcome line below still
-        // stands — the footer's state line carries the degraded fact.
+        // The command may have changed everything; reload shows that as
+        // "not checked". Degraded or loaded, the outcome line below still
+        // stands — the footer carries the degraded fact.
         let _ = self.reload()?;
         match outcome {
             Ok(()) => self.info(&format!("{} finished", action_label(action))),
@@ -922,19 +809,14 @@ impl App {
         Ok(())
     }
 
-    /// What the escalation preflight found for one prefix; both captured
-    /// workflows (install, migrate) run it before spawning a worker, and
-    /// each maps the outcomes to what it can offer.
+    /// What the escalation preflight found for one prefix; each captured
+    /// workflow maps the outcomes to what it can offer.
     fn preflight_escalation(terminal: &mut DefaultTerminal, prefix: &Path) -> Result<Preflight> {
         let policy = crate::privileged::Policy::for_prefix(prefix);
-        // The pipeline's own union (bin + state) plus the lock file —
-        // the worker's first privileged touch. Mixed ownership needs the
-        // state term up front; lock preparation is consulted only where
-        // escalation is possible at all — and it must be consulted: for
-        // a migration into /usr/local the destination's state lock may
-        // be the first one ever prepared there, ahead of any NeedAuth
-        // machinery, and a cold sudo would fail `sudo -n` instead of
-        // asking.
+        // The pipeline's union (bin + state) plus the lock file — the
+        // worker's first privileged touch: a migration into /usr/local may
+        // prepare the first lock ever there, ahead of any NeedAuth, and a
+        // cold sudo must be asked, not fail `sudo -n`.
         let escalate = match crate::placement_needs_privilege(policy, prefix) {
             Ok(escalate) => escalate,
             Err(e) => {
@@ -957,9 +839,8 @@ impl App {
         {
             return Ok(Preflight::Reported(format!("{e:#}")));
         }
-        // Right after a successful validation the timestamp should be
-        // warm; a sudo that does not cache is detected now, not by the
-        // worker's first `sudo -n`.
+        // Right after validation the timestamp should be warm; a sudo that
+        // does not cache is detected now, not by the worker's `sudo -n`.
         match crate::privileged::credentials_fresh() {
             Ok(true) => Ok(Preflight::Ready),
             Ok(false) => Ok(Preflight::NoCache),
@@ -967,10 +848,9 @@ impl App {
         }
     }
 
-    /// A captured single-crate install. The run loop calls this because
-    /// only it owns the terminal: when placement will need sudo and the
-    /// credential timestamp is stale, the initial prompt happens here, up
-    /// front, on a real terminal — never inside the alternate screen.
+    /// A captured install. The run loop calls this because only it owns
+    /// the terminal: a stale credential prompt happens here, up front —
+    /// never inside the alternate screen.
     fn start_build(
         &mut self,
         terminal: &mut DefaultTerminal,
@@ -987,18 +867,14 @@ impl App {
         if self.refused_by_advisory_pin_check(&spec) {
             return Ok(());
         }
-        // A new attempt supersedes the previous report — a stale
-        // "install foo failed" over a fresh run of foo would report on
-        // the wrong world. Cleared here, once the attempt is definitely
-        // starting, so the terminal-fallback path supersedes it too.
+        // A new attempt supersedes the previous report — a stale failure
+        // over a fresh run would report on the wrong world.
         self.build_report = None;
         match Self::preflight_escalation(terminal, &self.prefix.clone())? {
             Preflight::Ready => {}
-            // Captured placement runs `sudo -n`, so a sudo that does not
-            // cache credentials (timestamp_timeout=0, per-TTY quirks)
-            // would be asked a question it cannot voice. Install has an
-            // old way to fall back to: hand the terminal over instead of
-            // starting a build that must end in an error.
+            // Captured placement runs `sudo -n`; a non-caching sudo would be
+            // asked a question it cannot voice — install falls back to the
+            // terminal handoff instead of a doomed build.
             Preflight::NoCache => {
                 self.info("sudo does not cache credentials here; handing the terminal over");
                 self.pending = Some(PendingAction::Install {
@@ -1030,10 +906,8 @@ impl App {
                     let _ = line_tx.send(build_msg(k, l));
                 },
                 &mut |escalating: &Path| {
-                    // A cancelled build must not ask anyone for a
-                    // password: refuse here instead of raising NeedAuth
-                    // for an install that will never place. The run
-                    // loop guards the other side of the same race.
+                    // A cancelled build must not ask for a password: refuse instead of
+                    // raising NeedAuth; the run loop guards the other side of the race.
                     if control.cancelled() {
                         return Err(anyhow::Error::new(crate::BuildCancelled));
                     }
@@ -1045,9 +919,8 @@ impl App {
                             let _ = worker_tx.send(BuildMsg::NeedAuth(escalating.to_path_buf()));
                             match auth_rx.recv() {
                                 Ok(true) => Ok(()),
-                                // A denial that answers a cancel *is*
-                                // the cancel; a real refusal keeps its
-                                // own name.
+                                // A denial answering a cancel *is* the cancel; a real refusal keeps
+                                // its own name.
                                 Ok(false) if control.cancelled() => {
                                     Err(anyhow::Error::new(crate::BuildCancelled))
                                 }
@@ -1090,15 +963,10 @@ impl App {
         Ok(())
     }
 
-    /// Start an in-place migration of `name` to `dest`: the same
-    /// `Job::Build`, gauge, cancel door, dead-man switch and sudo
-    /// roundtrip as an install — the TUI is a frontend to `migrate`,
-    /// not a second migrate. The worker reports an outcome; the words
-    /// are composed in `finish_build` from the job's own data.
-    /// Whether a worker actually started, and if not, why — the reason
-    /// travels back because a running batch must both end (its queue
-    /// cannot wait on a worker that never existed) and *record* the
-    /// refusal where the summary will not overwrite it.
+    /// Start an in-place migration: the same job, gauge, cancel door and
+    /// sudo roundtrip as an install — a frontend to `migrate`, not a
+    /// second migrate. Whether a worker started travels back with its
+    /// reason: a batch must both end and *record* the refusal.
     fn start_migrate(
         &mut self,
         terminal: &mut DefaultTerminal,
@@ -1115,24 +983,17 @@ impl App {
                 "another operation is already running".to_owned(),
             ));
         }
-        // The same invariant as an install: a new in-place attempt
-        // supersedes whatever report the last one left up — a stale
-        // "install foo failed" must not sit over a fresh migration of
-        // bar, and a cancelled outcome returns early without reaching
-        // any later cleanup.
+        // A new attempt supersedes the last report; a cancelled outcome
+        // returns before any later cleanup.
         self.build_report = None;
-        // The destination's preflight, before the worker exists: its
-        // state lock may be the first ever prepared under /usr/local,
-        // ahead of any NeedAuth roundtrip — a cold sudo must be asked
-        // here, on the suspended terminal, not fail `sudo -n` in the
-        // dark. The source deliberately keeps its late, in-flight
-        // revalidation instead: the prompt-at-the-end timing is
-        // documented, and warming its timestamp before a long build
-        // would buy nothing.
+        // The destination's preflight before the worker exists: its lock may
+        // be the first ever prepared there, so a cold sudo is asked here on
+        // the suspended terminal. The source keeps its late, in-flight
+        // revalidation — warming it before a long build buys nothing.
         match Self::preflight_escalation(terminal, &dest)? {
             Preflight::Ready => {}
-            // No terminal handoff exists for migrate, on purpose; the
-            // CLI is the interactive shape.
+            // No terminal handoff for migrate, on purpose; the CLI is the
+            // interactive shape.
             Preflight::NoCache => {
                 return Ok(StartOutcome::Refused(
                     "sudo does not cache credentials here; migrate via the CLI, \
@@ -1162,9 +1023,8 @@ impl App {
                     let _ = line_tx.send(build_msg(k, l));
                 },
                 &mut |escalating: &Path| {
-                    // The same auth roundtrip as an install; a cancelled
-                    // job must not ask anyone for a password, and a
-                    // denial that answers a cancel is the cancel.
+                    // Same auth roundtrip as an install; a denial answering a cancel is
+                    // the cancel.
                     if control.cancelled() {
                         return Err(anyhow::Error::new(crate::BuildCancelled));
                     }
@@ -1188,8 +1048,7 @@ impl App {
                 },
                 &control,
             );
-            // Classified once, by type and by data — the UI never
-            // guesses.
+            // Classified once, by type and data — the UI never guesses.
             let outcome = match result {
                 Ok(crate::MigrateOutcome::Moved { version, .. }) => BuildOutcome::Migrated(version),
                 Ok(crate::MigrateOutcome::Incomplete(reason)) => {
@@ -1220,12 +1079,10 @@ impl App {
         Ok(StartOutcome::Started)
     }
 
-    /// The worker hit the placement checkpoint with a stale credential
-    /// timestamp — the build outlived it. Revalidate on the real
-    /// terminal and let the worker proceed (or fail, and say so).
-    /// Arm the one-shot grace deadline of an accepted cancel; a repeat
-    /// keeps the original deadline (the person pressing `c` twice fast
-    /// escalates through `request_cancel` itself, not through here).
+    /// The worker hit the checkpoint with a stale timestamp — the build
+    /// outlived it. Revalidate on the real terminal; arm the one-shot
+    /// grace deadline (a repeat keeps the original — double-`c` escalates
+    /// through `request_cancel` itself).
     fn arm_cancel_grace(&mut self) {
         if let Some(Job::Build {
             cancel_deadline, ..
@@ -1235,12 +1092,9 @@ impl App {
         }
     }
 
-    /// The cancel's dead-man switch, run every tick. Once the grace of
-    /// an accepted cancel expires, SIGKILL goes out from this thread —
-    /// the worker cannot be trusted to reach its own sweep (see
-    /// `cancel_deadline`), and signalling from the UI is precisely what
-    /// stays possible no matter where the worker is stuck. One-shot;
-    /// Killed is worth a line, "already stopping" is quiet success.
+    /// The cancel's dead-man switch, every tick: once the grace expires,
+    /// SIGKILL goes out from this thread — the worker cannot be trusted
+    /// to reach its own sweep. One-shot; Killed is worth a line.
     fn escalate_overdue_cancel(&mut self) {
         let due = matches!(
             &self.job,
@@ -1269,10 +1123,9 @@ impl App {
     }
 
     fn answer_auth(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
-        // A cancel that landed after the worker raised NeedAuth: answer
-        // no without suspending the screen — nobody types a password
-        // for a build that will never place. The worker checks before
-        // asking; this guards the other side of the same race.
+        // A cancel that landed after NeedAuth: answer no without suspending
+        // the screen — nobody types a password for a build that will never
+        // place.
         if let Some(Job::Build {
             control,
             auth_tx,
@@ -1285,10 +1138,8 @@ impl App {
             let _ = auth_tx.send(false);
             return Ok(());
         }
-        // The prefix comes from the request, never from the app: a
-        // migration escalates for its *destination* mid-job while
-        // `self.prefix` is the source, and a prompt naming the wrong
-        // side would lie in exactly one direction of the pair.
+        // The prefix comes from the request, never the app: a migration
+        // escalates for its *destination* while `self.prefix` is the source.
         let Some(target) = self.job.as_mut().and_then(|job| {
             let Job::Build { needs_auth, .. } = job else {
                 return None;
@@ -1301,10 +1152,8 @@ impl App {
         let ok = match outcome {
             Ok(()) => match crate::privileged::credentials_fresh() {
                 Ok(true) => true,
-                // Validated and immediately stale again: this sudo does
-                // not cache, and the noninteractive placement ahead
-                // cannot ask. Fail loudly rather than let `sudo -n`
-                // discover it a moment later with a terser message.
+                // Validated and instantly stale: this sudo does not cache, and the
+                // noninteractive placement ahead cannot ask — fail loudly now.
                 Ok(false) => {
                     self.warn(
                         "sudo did not retain credentials; noninteractive placement cannot proceed",
@@ -1322,19 +1171,17 @@ impl App {
             }
         };
         if let Some(Job::Build { auth_tx, .. }) = &mut self.job {
-            // `needs_auth` was taken with the target above; only the
-            // answer remains.
+            // `needs_auth` was taken with the target above; only the answer
+            // remains.
             let _ = auth_tx.send(ok);
         }
         Ok(())
     }
 
-    /// The other prefix of the known pair, when the current prefix is a
-    /// member of it — the gate `m` and `M` share. Symmetric on purpose:
-    /// `known_others` of the current prefix must name exactly one
-    /// candidate *and* that candidate's own view must name us back — a
-    /// custom prefix on a HOME-less system would otherwise pass the
-    /// first half.
+    /// The other prefix of the known pair — the gate `m`/`M` share.
+    /// Symmetric on purpose: the candidate's own view must name us back,
+    /// or a custom prefix on a HOME-less system would pass the first
+    /// half.
     fn known_pair_dest(&self) -> Option<PathBuf> {
         let others = crate::prefixes::known_others(&self.prefix);
         match others.as_slice() {
@@ -1349,13 +1196,10 @@ impl App {
         }
     }
 
-    /// Advisory precheck for `m`: is the crate already installed at the
-    /// destination? Fresh, silent, nonblocking — the same shape as the
-    /// pin precheck below, for the same reason: nobody should confirm a
-    /// migration (or type sudo's password for its preflight) that the
-    /// authoritative refusal will bounce a moment later. A busy lock or
-    /// an unreadable manifest answers "not occupied": advisory means
-    /// the flow proceeds and the backend stays the judge.
+    /// Advisory precheck for `m`: already installed at the destination?
+    /// Fresh, silent, nonblocking — nobody should confirm a migration the
+    /// authoritative refusal will bounce. Busy or unreadable answers
+    /// "not occupied": the backend stays the judge.
     fn destination_occupied(&mut self, dest: &Path, name: &str) -> bool {
         let advisory = StateLock::try_acquire_with(
             dest,
@@ -1378,14 +1222,10 @@ impl App {
         false
     }
 
-    /// Advisory state check before anyone is asked for a password:
-    /// typing sudo's prompt only to hear "that crate is pinned" a
-    /// hundred milliseconds later would be a bad joke. Advisory, silent,
-    /// nonblocking: a busy lock yields "not now", never a frozen UI —
-    /// busy or unreadable skips the courtesy check, and the
-    /// authoritative pass runs in the worker, under the real lock.
-    /// Returns true when the install must stop here (refused or errored,
-    /// message already shown).
+    /// Advisory pin check before anyone types a password. Silent,
+    /// nonblocking: busy yields "not now", never a frozen UI; the
+    /// authoritative pass runs in the worker. True = stop here (message
+    /// already shown).
     fn refused_by_advisory_pin_check(&mut self, spec: &InstallSpec) -> bool {
         if spec.version.is_some() {
             return false;
@@ -1415,9 +1255,9 @@ impl App {
         false
     }
 
-    /// Leaves the TUI, runs `f` on the real terminal, and re-enters.
-    /// The outer Result is the terminal handover itself — if that fails,
-    /// the TUI cannot continue; `f`'s own result is the inner value.
+    /// Leaves the TUI, runs `f` on the real terminal, re-enters. The
+    /// outer Result is the handover itself; `f`'s result is the inner
+    /// value.
     fn suspended<T>(terminal: &mut DefaultTerminal, f: impl FnOnce() -> T) -> Result<T> {
         terminal.show_cursor()?;
         ratatui::try_restore().context("leaving the TUI")?;
@@ -1431,9 +1271,9 @@ impl App {
         Ok(value)
     }
 
-    /// One batch member finished; tally it, advance the queue or wrap
-    /// up. A cancel ends the whole batch: cancelling one crate and
-    /// silently continuing with the rest would be guessing intent.
+    /// One batch member finished; tally, advance or wrap up. A cancel
+    /// ends the whole batch — continuing silently would be guessing
+    /// intent.
     fn finish_batch_step(
         &mut self,
         name: &str,
@@ -1443,24 +1283,20 @@ impl App {
         warnings: Vec<String>,
     ) {
         // The footer speaks the result where there is one: a moved
-        // member's version is the destination's (Migrated's payload) —
-        // an unpinned 0.1.0 that arrived as 0.2.0 must be announced as
-        // 0.2.0. A bare Success on a migrate job — a worker bug by the
-        // classification's own contract — claims no version rather than
-        // inventing one from the plan, the single job's rule. Every
-        // other outcome identifies the plan member by the source version
-        // it was confirmed at, the only version those outcomes
-        // truthfully have.
+        // member announces Migrated's payload — an unpinned 0.1.0 that
+        // arrived as 0.2.0 must be announced as 0.2.0; a bare Success on
+        // a migrate job (a worker bug by the classification's contract)
+        // claims no version rather than inventing one; every other
+        // outcome identifies the member by the source version it was
+        // confirmed at.
         let spoken = match &outcome {
             BuildOutcome::Migrated(installed) => format!(" {installed}"),
             BuildOutcome::Success => String::new(),
             _ => format!(" {}", target.version),
         };
-        // Per-crate reload keeps the list truthful mid-batch; a failure
-        // is recorded on the batch and resurfaces at the summary.
-        // Degraded is not an error here: the batch summary and the
-        // footer's state line both carry it; only a hard failure is
-        // recorded on the batch.
+        // Per-crate reload keeps the list truthful; a hard failure is
+        // recorded on the batch. Degraded is not an error here: the summary
+        // and the footer's state line both carry it.
         let reload_error = match self.reload() {
             Ok(_) => None,
             Err(e) => Some(format!("{e:#}")),
@@ -1473,11 +1309,9 @@ impl App {
             if let Some(e) = reload_error {
                 batch.reload_error = Some(e);
             }
-            // The same diagnostics contract as a single job, member by
-            // member: a fully successful member's build warnings must
-            // not be laundered by the tally, a terse failure still gets
-            // the tail excerpt, and an Incomplete reason travels with
-            // the warnings its build spoke.
+            // The same diagnostics contract as a single job, member by member:
+            // warnings not laundered, terse failures get the tail, Incomplete
+            // reasons travel with their member's warnings.
             match outcome {
                 BuildOutcome::Success | BuildOutcome::Migrated(_) => {
                     batch.moved += 1;
@@ -1518,9 +1352,7 @@ impl App {
     }
 
     /// The batch's one summary: counts in the footer, shortfalls in a
-    /// report panel — warnings with their full Incomplete reasons,
-    /// failures with their errors, the already-installed refusal among
-    /// them exactly as the CLI counts it.
+    /// panel — the already-installed refusal counted as on the CLI.
     fn finalize_migrate_batch(&mut self, ended_early: Option<&str>) {
         let Some(batch) = self.migrate_batch.take() else {
             return;
@@ -1535,14 +1367,12 @@ impl App {
             noticed,
             reload_error,
         } = batch;
-        // Everything the tally counted, plus the queue, must add up to
-        // the plan: a member the caller recorded as refused sits in
-        // `failed`, so "not attempted" is exactly what is still queued.
+        // Tally plus queue must add up to the plan: a refused member sits
+        // in `failed`, so "not attempted" is exactly what is still queued.
         let mut summary = format!("migrated {moved} of {total} to {}", dest.display());
         if let Some(how) = ended_early {
             let unprocessed = queue.len();
-            // write!, not push_str(&format!(..)): no second allocation,
-            // and the sink is infallible.
+            // write!, not push_str(&format!(..)): no second allocation.
             let _ = std::fmt::Write::write_fmt(
                 &mut summary,
                 format_args!(" ({how}; {unprocessed} not attempted)"),
@@ -1598,9 +1428,8 @@ impl App {
     }
 
     /// The diagnostics a failure shows, single job and batch member
-    /// alike: the error chain, plus the build's last lines when the
-    /// chain is terse — a placement or commit error carries no tail of
-    /// its own, and the compiler's actual message often lives there.
+    /// alike: the error chain, plus the tail when the chain is terse —
+    /// the compiler's actual message often lives there.
     fn failure_lines(e: &anyhow::Error, tail: &VecDeque<String>) -> Vec<String> {
         let text = format!("{e:#}");
         let mut lines: Vec<String> = text.lines().map(crate::text::sanitize).collect();
@@ -1611,8 +1440,7 @@ impl App {
     }
 
     /// A finished captured install: reload, then speak in the pipeline's
-    /// own words when it left any — the "installed …" note is more
-    /// informative than a generic "finished".
+    /// own words when it left any.
     fn finish_build(
         &mut self,
         name: &str,
@@ -1623,50 +1451,36 @@ impl App {
     ) {
         let verb = match kind {
             BuildKind::Install => "install",
-            // Tuple variant, tuple pattern: `Migrate { .. }` would also
-            // parse (a rest pattern in braces is legal on tuple
-            // variants), but a pattern should not lie about the shape.
+            // Tuple variant, tuple pattern: a pattern should not lie about the
+            // shape.
             BuildKind::Migrate(_) => "migrate",
         };
-        // A batch owns its members' presentation: tallies instead of
-        // per-crate panels, one summary at the end — the CLI's
-        // "reported, and the batch moves on", in the TUI's shape.
+        // A batch owns its members' presentation: tallies, one summary.
         if self.migrate_batch.is_some()
             && let BuildKind::Migrate(target) = kind
         {
             self.finish_batch_step(name, target, outcome, tail, warnings);
             return;
         }
-        // A cancelled build ended exactly as asked: no failure panel,
-        // no log path — the pipeline wrote no log and removed the stage
-        // — one line saying the person's own decision was carried out.
-        // Nothing was placed and nothing committed (the placement door
-        // refused), so there is nothing to reload. The classification
-        // is the worker's, by type, not this thread's guess from a
-        // phase flag: a cancel that lost every race arrives here as the
-        // Success or Failed it truly was on disk.
+        // A cancelled build ended exactly as asked: no panel, no log (the
+        // pipeline wrote none, removed the stage), nothing to reload. The
+        // classification is the worker's, by type — a cancel that lost every
+        // race arrives as the Success or Failed it truly was.
         if matches!(outcome, BuildOutcome::Cancelled) {
             self.info(&format!("{verb} {name} cancelled"));
             return;
         }
-        // The pipeline's error outranks a reload error: the tail and the
-        // log path are the diagnosis, and a failed screen refresh must
-        // not eat them. On success the roles flip — the reload *is* the
-        // remaining work, so its failure is the headline.
+        // The pipeline's error outranks a reload error: the tail and log
+        // path are the diagnosis. On success the roles flip — the reload
+        // *is* the remaining work.
         let reload = self.reload();
         match outcome {
             BuildOutcome::Cancelled => unreachable!("returned above"),
             outcome @ (BuildOutcome::Success | BuildOutcome::Migrated(_)) => {
-                // Composed from the job's data, not fished out of the
-                // pipeline's prose: the worker reports outcomes, the UI
-                // owns the words. The install note keeps its historical
-                // shape (the pipeline's own summary line is the best
-                // one-liner it has); the migrate note says what is true
-                // in every success flavor — including a source someone
-                // else already retired — and speaks the version the
+                // Composed from the job's data: the worker reports outcomes, the UI
+                // owns the words; the migrate note speaks the version the
                 // destination committed (Migrated's payload), never the
-                // frozen plan's, which is what was confirmed, not
-                // necessarily what was installed.
+                // frozen plan's.
                 let note = match kind {
                     BuildKind::Install => tail
                         .iter()
@@ -1685,22 +1499,18 @@ impl App {
                         _ => format!("migrated {name} to {}", target.dest.display()),
                     },
                 };
-                // A failed reload does not eat the outcome: the install
-                // happened and a shadow warning stays true, so the
-                // report is pinned first and the reload complains after.
+                // A failed reload does not eat the outcome: the report is pinned
+                // first, the reload complains after.
                 if warnings.is_empty() {
                     match reload {
-                        // Degraded included: the note states the
-                        // operation's true outcome, and the footer's
-                        // state line carries the degraded fact itself.
+                        // Degraded included: the note states the operation's true outcome;
+                        // the footer's state line carries the degraded fact.
                         Ok(_) => self.info(&note),
                         Err(e) => self.error(&format!("{note} — but reload failed: {e:#}")),
                     }
                 } else {
-                    // Captured is not shown: a warning that reached the
-                    // channel but never a human would make the whole
-                    // classification pointless. The panel keeps them
-                    // until acknowledged; the message says why it is up.
+                    // Captured but never shown would make the classification pointless:
+                    // the panel keeps them until acknowledged.
                     let mut lines = warnings;
                     if let Err(e) = &reload {
                         lines.push(String::new());
@@ -1719,13 +1529,10 @@ impl App {
                 }
             }
             BuildOutcome::CompletedWithWarning(reason) => {
-                // The build half succeeded and the state on disk has
-                // changed — the reload above already reflects it. The
-                // reason is a payload, shown whole in the panel (which
-                // wraps): it is multi-sentence by design — what stands
-                // where, what not to re-run — and a truncated footer
-                // line must not be its only copy. Not a failure panel:
-                // nothing here is broken, something is unfinished.
+                // The build half succeeded and the disk changed — reload already
+                // reflects it. The reason is a payload shown whole in the wrapping
+                // panel: multi-sentence by design, and a truncated footer line must
+                // not be its only copy. Not a failure: unfinished, not broken.
                 let mut lines: Vec<String> = vec![crate::text::sanitize(&reason)];
                 if !warnings.is_empty() {
                     lines.push(String::new());
@@ -1748,23 +1555,20 @@ impl App {
                 ));
             }
             BuildOutcome::Failed(e) => {
-                // An anyhow chain carries paths too; same boundary rule
-                // — shared with the batch, so both surfaces diagnose
-                // identically.
+                // An anyhow chain carries paths too; same boundary rule, shared with
+                // the batch.
                 let mut lines = Self::failure_lines(&e, tail);
-                // Deliberately no warnings here: they were spoken about
-                // binaries the rollback has since removed — "foo is
-                // shadowed" is not true of an install that did not
-                // happen. On success they are the whole point; see above.
+                // No warnings here on purpose: they described binaries the rollback
+                // removed — "foo is shadowed" is not true of an install that did not
+                // happen.
                 if let Err(re) = reload {
                     lines.push(crate::text::sanitize(&format!(
                         "(and the list reload failed: {re:#})"
                     )));
                 }
                 self.pin_report(BuildReport {
-                    // "install", not "build": the failure may be the
-                    // placement or the manifest commit after a clean
-                    // cargo run, and the title must not narrow it.
+                    // "install", not "build": the failure may be placement or the
+                    // manifest commit; the title must not narrow it.
                     title: format!("install {name} failed"),
                     lines,
                     failed: true,
@@ -1778,13 +1582,9 @@ impl App {
 
     fn on_key(&mut self, key: KeyEvent) {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-            // Quit — but never orphan cargo. With a build running the
-            // exit is a cancel first: SIGTERM to the group, leave when
-            // the worker reports back (a second Ctrl-C escalates to
-            // SIGKILL through the same state machine). Placement cannot
-            // be cancelled, so there the exit simply waits it out —
-            // placement is seconds, and killing `sudo install` between
-            // two binaries is not an option.
+            // Quit — but never orphan cargo: with a build running the exit is a
+            // cancel first, leave when the worker reports back. Placement cannot
+            // be cancelled, so there the exit waits it out.
             if let Some(Job::Build { control, .. }) = &self.job {
                 match control.request_cancel() {
                     crate::CancelOutcome::Accepted => {
@@ -1820,20 +1620,15 @@ impl App {
                     self.message = None;
                     return;
                 }
-                // While the report owns the panel, the arrows scroll it
-                // rather than the list: the report is the thing being
-                // read, and its tail must be reachable — the offset is
-                // clamped at draw time, where the wrap width is known.
+                // While the report owns the panel the arrows scroll it — its tail
+                // must be reachable; clamped at draw time, where the width is known.
                 KeyCode::Up => {
                     self.report_scroll = self.report_scroll.saturating_sub(1);
                     return;
                 }
                 KeyCode::Down => {
-                    // No stored bound: a guessed cap here once hid the
-                    // tail of a single line that wrapped fifteen ways.
-                    // saturating_add already prevents a runaway, and the
-                    // renderer clamps the displayed offset against the
-                    // real wrapped height.
+                    // No stored bound: a guessed cap once hid the tail of a line that
+                    // wrapped fifteen ways; the renderer clamps against the real height.
                     self.report_scroll = self.report_scroll.saturating_add(1);
                     return;
                 }
@@ -1858,19 +1653,14 @@ impl App {
     }
 
     fn on_key_list(&mut self, key: KeyEvent) {
-        // The degraded gate: while the manifest cannot be loaded, the
-        // only keys that mean anything are the ones that help — audit,
-        // retry, help, quit. Everything mutating would bounce off
-        // Manifest::load in its worker anyway; refusing here says why,
-        // once, instead of letting each action discover it noisily. `r`
-        // is deliberately repurposed from checkupdate to a plain reload
-        // retry: the network cannot help a broken manifest, and the one
-        // thing worth re-checking is whether the hand-repair worked.
+        // The degraded gate: only the keys that help — audit, retry, help,
+        // quit. Refusing here says why once, instead of each worker
+        // discovering it noisily. `r` is repurposed to a plain reload retry:
+        // the network cannot help a broken manifest.
         if self.manifest_error.is_some() {
             match key.code {
-                // B included on purpose: the jump is how one *leaves* a
-                // broken prefix, and it mutates nothing — a gate that
-                // lets you enter degraded but not exit would be a trap.
+                // B on purpose: the jump is how one *leaves* a broken prefix — a
+                // gate that lets you in but not out would be a trap.
                 KeyCode::Char('q')
                 | KeyCode::Char('v')
                 | KeyCode::Char('?')
@@ -1881,8 +1671,7 @@ impl App {
                         Ok(ReloadOutcome::Loaded) => {
                             self.info("the manifest loads again");
                         }
-                        // Still broken: apply_report already set the
-                        // degraded message, and the footer shows the
+                        // Still broken: apply_report set the message; the footer shows the
                         // state either way.
                         Ok(ReloadOutcome::Degraded) => {}
                         Err(e) => self.error(&format!("reload failed: {e:#}")),
@@ -1908,18 +1697,15 @@ impl App {
             }
             KeyCode::Esc => {
                 if self.search_result.take().is_some() {
-                    // Dismissing a result is fine mid-build; only the
-                    // exit is held back, symmetrically with `q`.
+                    // Dismissing a result is fine mid-build; only the exit is held back.
                 } else if matches!(self.job, Some(Job::Build { .. })) {
                     self.error("a build is running; c cancels it, Ctrl-C cancels and quits");
                 } else {
                     self.should_quit = true;
                 }
             }
-            // Cancel the running build and stay: first press SIGTERMs
-            // cargo's group, a second SIGKILLs it. Without a build the
-            // key means nothing — silence, not an error, because there
-            // is nothing the person could have meant instead.
+            // Cancel and stay: first press SIGTERMs the group, a second
+            // SIGKILLs. Without a build, silence — nothing else could be meant.
             KeyCode::Char('c') => {
                 if let Some(Job::Build { name, control, .. }) = &self.job {
                     let name = name.clone();
@@ -1958,9 +1744,8 @@ impl App {
             KeyCode::Char('r') => self.start_check(),
             KeyCode::Char('v') => self.start_verify(),
             KeyCode::Char('s') => self.open_input(InputPurpose::Search),
-            // With a search result up, a digit picks a hit and opens the
-            // install line with that name — editable, so `--locked` can
-            // still be added before Enter.
+            // With a search result up, a digit picks a hit and opens the install
+            // line — editable, so `--locked` can still be added.
             KeyCode::Char(c @ '1'..='9') if self.search_result.is_some() => {
                 let pick = c
                     .to_digit(10)
@@ -1981,21 +1766,14 @@ impl App {
                     self.queue(PendingAction::Update(name));
                 }
             }
-            // No gate at all — not on the cached report, not on the rows
-            // in memory. `update --all` reads the manifest and asks the
-            // index itself; a stale "0 updates" here must not stop a
-            // command that would find two, and a manifest another
-            // cargo-lbin changed since the last reload must not stop one
-            // that would find a crate this list has never seen. If there
-            // is nothing to do, the command says so.
+            // No gate at all: `update --all` reads the manifest and asks the
+            // index itself — a stale "0 updates" must not stop a command that
+            // would find two. If there is nothing to do, the command says so.
             KeyCode::Char('U') => self.queue(PendingAction::UpdateAll),
-            // Toggle from what the row shows; the command itself re-reads
-            // the manifest under the lock, so a pin changed by another
-            // process since the last reload is reported, not overwritten
-            // blindly ("already pinned").
+            // Toggle from what the row shows; the command re-reads under the
+            // lock, so a pin changed elsewhere is reported, not overwritten.
             KeyCode::Char('p') => self.pin_selected(),
-            // The choice of version is made in the terminal, by the
-            // command itself — one prompt, the real list, no TUI copy.
+            // The version choice happens in the terminal, by the command itself.
             KeyCode::Char('D') => {
                 if let Some(name) = self.selected_name() {
                     self.queue(PendingAction::Downgrade(name));
@@ -2003,53 +1781,36 @@ impl App {
             }
             KeyCode::Char('x') => self.remove_selected(),
             KeyCode::Char('B') => self.jump_to_other_prefix(),
-            // Migrate the selected crate to the other prefix of the
-            // known pair — and only there: with a custom --prefix "the
-            // other side" stops being a function, and the TUI does not
-            // grow a path picker for it; the CLI's explicit --to is the
-            // tool. The gate is symmetric on purpose: `known_others` of
-            // the current prefix must name exactly one candidate *and*
-            // that candidate's own view must name us back — a custom
-            // prefix with HOME unset would otherwise pass the first
-            // half.
-            // Both migrate keys live in their own methods: the dispatch
-            // table stays a table.
+            // Migrate to the other prefix of the known pair — and only there: a
+            // custom prefix has the CLI's explicit --to, not a TUI path picker.
+            // The gate is symmetric (see `other_known_prefix`).
+            // Both migrate keys live in their own methods: the dispatch table
+            // stays a table.
             KeyCode::Char('m') => self.migrate_selected(),
             KeyCode::Char('M') => self.migrate_everything(),
             _ => {}
         }
     }
 
-    /// `m`: migrate the selected crate to the other prefix of the known
-    /// pair; the plan is frozen from the row on screen.
+    /// `m`: migrate the selected crate; the plan is frozen from the row
+    /// on screen.
     fn migrate_selected(&mut self) {
-        // Cloned out of the borrow: the fresh advisory precheck
-        // below needs `&mut self` (it reports through the
-        // footer), and the row is a reference into `self`.
+        // Cloned out of the borrow: the advisory precheck below needs
+        // `&mut self`.
         if let Some(row) = self.selected_row().cloned() {
             match self.known_pair_dest() {
                 Some(dest) => {
-                    // The agreed UX for "already on the other
-                    // side" is a plain error line, not a sticky
-                    // failure panel — decided on a *fresh*
-                    // advisory read of the destination, never on
-                    // the row's cached `[also in …]`: that
-                    // annotation is a lockless snapshot of the
-                    // last reload, so it can refuse a migration
-                    // whose destination was emptied minutes ago
-                    // (and stay wrong until the next reload).
-                    // Advisory in the other direction too: a busy
-                    // lock or a fresh install racing this read
-                    // falls through to migrate_one's
-                    // authoritative refusal, which then surfaces
-                    // as Failed — the race window, accepted for
-                    // now over a typed refusal variant.
+                    // "Already on the other side" is a plain error line, decided on a
+                    // *fresh* advisory read — the row's cached `[also in ...]` is a
+                    // lockless snapshot that can be minutes stale. Advisory both ways: a
+                    // racing install falls through to migrate_one's authoritative
+                    // refusal, surfacing as Failed — the window accepted over a typed
+                    // variant.
                     if self.destination_occupied(&dest, &row.name) {
                         return;
                     }
-                    // Frozen here, from the row on screen: the
-                    // plan the person confirms is byte for byte
-                    // the plan the worker revalidates.
+                    // Frozen here, from the row on screen: the plan confirmed is byte
+                    // for byte the plan revalidated.
                     let snap = match crate::MigrationSnapshot::from_parts(
                         &row.name,
                         &row.version,
@@ -2099,11 +1860,10 @@ impl App {
         }
     }
 
-    /// The whole prefix to the other side: `migrate --all` as a
-    /// queue of the exact single migrations `m` runs. The plan is
-    /// frozen here, one snapshot per row, complete or not at all
-    /// — a plan that silently dropped an unparseable row would
-    /// migrate a different set than the person confirmed.
+    /// The whole prefix: `migrate --all` as a queue of the single
+    /// migrations `m` runs. Frozen here, one snapshot per row, complete
+    /// or not at all — silently dropping an unparseable row would migrate
+    /// a different set than confirmed.
     fn migrate_everything(&mut self) {
         let Some(dest) = self.known_pair_dest() else {
             self.info(
@@ -2112,21 +1872,16 @@ impl App {
             );
             return;
         };
-        // `--all` means all crates *now*, not all as of the last
-        // reload: a crate installed by another process since
-        // would otherwise be silently absent from the plan, and
-        // no checkpoint can reject a member the plan never had.
-        // (Small `m` is the opposite case on purpose: there the
-        // person confirms exactly the row they are looking at.)
-        // Races *after* this moment are the per-crate
-        // revalidation's job, as ever.
+        // `--all` means all crates *now*, not as of the last reload: a crate
+        // installed since would be silently absent, and no checkpoint can
+        // reject a member the plan never had. Races after this moment belong
+        // to the per-crate revalidation.
         match self.reload() {
             Err(e) => {
                 self.error(&format!("cannot plan the batch: {e:#}"));
                 return;
             }
-            // Degraded is not "nothing to migrate": the count is
-            // unknown, and the degraded message says what to do.
+            // Degraded is not "nothing to migrate": the count is unknown.
             Ok(ReloadOutcome::Degraded) => return,
             Ok(ReloadOutcome::Loaded) => {}
         }
@@ -2179,14 +1934,11 @@ impl App {
         }
     }
 
-    /// `p`: pin or unpin the selected crate — a manifest write, so the
-    /// same shape decision as `x`, made at the keypress: `p` has no
-    /// confirmation, so the keypress is its `y`. Escalation queues the
-    /// terminal handoff as before; otherwise it runs in place, because
-    /// the most trivial mutation in the tool least deserves a screen
-    /// flip. The
-    /// running guard is the in-place family's, refused up front so the
-    /// two shapes cannot diverge on it.
+    /// `p`: pin or unpin — a manifest write, so the same shape decision
+    /// as `x`, made at the keypress (its own `y`). Escalation queues the
+    /// handoff; otherwise in place — the most trivial mutation least
+    /// deserves a screen flip. The running guard is the in-place
+    /// family's.
     fn pin_selected(&mut self) {
         let Some(row) = self.selected_row() else {
             return;
@@ -2198,10 +1950,8 @@ impl App {
             return;
         }
         let policy = crate::privileged::Policy::for_prefix(&self.prefix);
-        // The state half only: a pin writes the manifest and prepares
-        // the lock, never bin — asking the whole union would let a
-        // read-only bin force a handoff (or, on a custom prefix, an
-        // error) for an operation that never goes near it.
+        // The state half only: a pin never touches bin, and a read-only bin
+        // must not force a handoff for it.
         let escalate = match crate::state_needs_privilege(policy, &self.prefix) {
             Ok(escalate) => escalate,
             Err(e) => {
@@ -2221,26 +1971,24 @@ impl App {
                         self.error(&format!("{verb} {name}, but the reload failed: {e:#}"));
                         return;
                     }
-                    // The pin landed and then the manifest would not
-                    // load back — the degraded message is the headline.
+                    // The pin landed and then the manifest would not load back — the
+                    // degraded message is the headline.
                     Ok(ReloadOutcome::Degraded) => return,
                     Ok(ReloadOutcome::Loaded) => {}
                 }
                 self.info(&format!("{verb} {name} at {version}"));
             }
             Ok(crate::TuiSetPinned::Already) => {
-                // The manifest already agrees, so the row was stale —
-                // reload so the screen agrees too, and say what stands.
+                // The manifest already agrees — the row was stale; reload so the
+                // screen agrees too.
                 match self.reload() {
                     Err(e) => {
                         self.error(&format!("{e:#}"));
                         return;
                     }
-                    // Broken between the write and this read: the
-                    // degraded message is what stands, and "already
-                    // pinned" over it would cover the one line that
-                    // matters. The footer is red either way; the
-                    // message should agree with it.
+                    // Broken between the write and this read: the degraded message is
+                    // what stands; "already pinned" would cover the one line that
+                    // matters.
                     Ok(ReloadOutcome::Degraded) => return,
                     Ok(ReloadOutcome::Loaded) => {}
                 }
@@ -2253,24 +2001,15 @@ impl App {
         }
     }
 
-    /// The decision at the `y`: the same escalation test the build
-    /// preflight consults (destination writability plus, where sudo is
-    /// possible at all, lock preparation). Escalation means today's
-    /// terminal handoff — a password prompt belongs on the real
-    /// terminal, and sudo asks naturally there. No escalation means in
-    /// place: removal is instant, and a prefix that never asks a
-    /// password earns no screen flip. The lock is nonblocking by the
-    /// same UI-thread argument as the in-place worker's checkpoints —
-    /// a busy prefix is an answer, not a frozen interface.
+    /// The decision at the `y`: the same escalation test as the build
+    /// preflight. Escalation = terminal handoff (passwords belong on the
+    /// real terminal); none = in place. Nonblocking lock — a busy prefix
+    /// is an answer, not a frozen interface.
     fn remove_confirmed(&mut self, name: String) {
-        // The handoff path inherits queue()'s job guard; the in-place
-        // path must refuse for itself, and for the whole running family
-        // — the confirm is reachable mid-build, and an in-place removal
-        // there would race the worker's own placement: the lock is free
-        // while cargo compiles, so the removal would win the lock, drop
-        // the entry and the binaries, and the placement would put them
-        // back — a silently lost removal, exactly the interleaving the
-        // queue guard exists to forbid.
+        // The handoff inherits queue()'s guard; the in-place path refuses
+        // for the running family itself — the lock is free while cargo
+        // compiles, so a removal could win it and be silently undone by the
+        // worker's placement.
         if self.anything_running() {
             self.error("an operation is running or queued; finish or cancel it first");
             return;
@@ -2306,10 +2045,8 @@ impl App {
         }
     }
 
-    /// `B`: jump to the other prefix of the known pair — m/M made the
-    /// pair navigable for crates, B makes it navigable for the person.
-    /// The same symmetric gate, the same one-line answer for anything
-    /// else; no path picker grows here either.
+    /// `B`: jump to the other prefix of the known pair — the same
+    /// symmetric gate as m/M, no path picker.
     fn jump_to_other_prefix(&mut self) {
         match self.known_pair_dest() {
             Some(dest) => self.jump_to_prefix(dest),
@@ -2320,52 +2057,36 @@ impl App {
         }
     }
 
-    /// The mechanics of `B`, separate from its gate so the policy and
-    /// the machinery are each testable alone. Everything transient in
-    /// App — a job above all, but also the queued starts — is anchored
-    /// to `self.prefix`, so the jump refuses while any of it is alive:
-    /// switching under a running check would apply the old prefix's
-    /// results to the new prefix's screen, and every surface would lie.
-    /// The switch commits on any read that leaves a presentable state —
-    /// loaded, or degraded with the refusal remembered; a person may be
-    /// jumping to a broken prefix precisely to audit it. Only a hard
-    /// failure (the lock that cannot be acquired) rolls back, because
-    /// there is then no state to present at all, and a title claiming
-    /// one prefix over rows read from another would lie on every line.
-    /// The selection follows the *currently*
-    /// selected crate by name when it is visible on the other side
-    /// under the current filter; otherwise it falls back to the top. No
-    /// stronger promise: a migration's retirement reloads the list and
-    /// moves the selection before B is ever pressed, so "lands on the
-    /// crate just migrated" would hold only sometimes, and a hint that
-    /// holds only sometimes is a lie with good days.
+    /// The mechanics of `B`, separate from its gate so each is testable
+    /// alone. Everything transient is anchored to `self.prefix`, so the
+    /// jump refuses while anything runs — switching under a running check
+    /// would lie on every surface. The switch commits on any read leaving
+    /// a presentable state — loaded, or degraded (the person may be
+    /// jumping there to audit); only a hard failure (the lock) rolls
+    /// back. The selection follows the selected crate by name when
+    /// visible on the other side; no stronger promise — one that holds
+    /// only sometimes is a lie with good days.
     fn jump_to_prefix(&mut self, dest: PathBuf) {
         if self.anything_running() {
             self.error("an operation is running or queued; finish or cancel it first");
             return;
         }
         let keep = self.selected_name();
-        // reload() dismisses the search panel itself, so the panel's
-        // transactionality is by hand: taken before the attempt,
-        // restored after a rollback's own reload — a jump that did not
-        // happen must not cost the person their hits. On success the
-        // saved panel simply drops, together with the build report:
-        // both were the old prefix's (the hits carry its [installed]
-        // marks, the report describes its operations).
+        // reload() dismisses the search panel itself, so its
+        // transactionality is by hand: saved before the attempt, restored
+        // after a rollback — a jump that did not happen must not cost the
+        // hits. On success both saved panels drop: they were the old
+        // prefix's.
         let search = self.search_result.take();
         let back = std::mem::replace(&mut self.prefix, dest);
-        // Only hard failures roll back now — the lock that cannot be
-        // acquired, not the manifest that cannot be loaded: a broken
-        // manifest lands in the degraded state instead (reload returns
-        // Ok and remembers the error), because the person may be
-        // jumping there precisely to press v and learn what broke.
+        // Only hard failures roll back — a broken manifest lands degraded
+        // instead: the person may be jumping there precisely to press v.
         let outcome = match self.reload() {
             Ok(outcome) => outcome,
             Err(e) => {
                 let failed = std::mem::replace(&mut self.prefix, back);
-                // Best-effort: this read succeeded moments ago; if the
-                // world broke since, the error below still names the
-                // real problem.
+                // Best-effort: this read succeeded moments ago; the error below
+                // still names the real problem.
                 let _ = self.reload();
                 self.search_result = search;
                 self.error(&format!(
@@ -2381,9 +2102,8 @@ impl App {
             .unwrap_or(0);
         match outcome {
             ReloadOutcome::Loaded => self.info(&format!("now at {}", self.prefix.display())),
-            // The degraded message apply_report just set is the arrival
-            // announcement — "now at" over it would bury the one thing
-            // worth knowing about the place just arrived at.
+            // The degraded message *is* the arrival announcement — "now at" over
+            // it would bury the one thing worth knowing.
             ReloadOutcome::Degraded => {}
         }
     }
@@ -2458,8 +2178,8 @@ impl App {
     fn submit_input(&mut self, purpose: InputPurpose, buffer: &str) {
         match purpose {
             InputPurpose::Install => match parse_install_input(buffer) {
-                // One crate builds in place, behind the gauge; a batch is
-                // a longer conversation and keeps the terminal handoff.
+                // One crate builds in place; a batch is a longer conversation and
+                // keeps the handoff.
                 Ok((crates, locked)) if crates.len() == 1 => {
                     let spec = crates.into_iter().next().expect("len checked");
                     self.info(&format!("building {spec}…"));
@@ -2497,11 +2217,9 @@ impl App {
         self.pending = Some(action);
     }
 
-    /// `r`: the same query `checkupdate` runs, on a thread; the report is
-    /// written on the main thread once the answer is in.
-    /// `v`: the read-only audit, `verify_prefix` on a worker — the same
-    /// single-job rule as everything else, and a fresh audit supersedes
-    /// whatever report the last operation left up.
+    /// `r`: `checkupdate` on a thread; the report is written on the main
+    /// thread. `v`: the read-only audit on a worker — a fresh audit
+    /// supersedes whatever report was up.
     fn start_verify(&mut self) {
         if self.job.is_some() {
             self.error("busy; wait for the current operation to finish");
@@ -2511,12 +2229,10 @@ impl App {
         let (tx, rx) = mpsc::channel();
         let prefix = self.prefix.clone();
         thread::spawn(move || {
-            // The lock-wait notice is a noop here on purpose: the
-            // spinner already says a job is alive, and a worker's
-            // eprintln beneath the alternate screen is exactly what the
-            // read-only path's quiet design forbids. The CLI passes its
-            // stderr printer instead — same channel split as
-            // acquire_with.
+            // The lock-wait notice is a noop on purpose: the spinner already
+            // says a job is alive, and a worker's eprintln beneath the alternate
+            // screen is what the quiet design forbids. The CLI passes stderr —
+            // the same channel split as acquire_with.
             let _ = tx.send(crate::verify_prefix(&prefix, &mut |_| {}));
         });
         self.job = Some(Job::Verify {
@@ -2525,12 +2241,10 @@ impl App {
         });
     }
 
-    /// The CLI's severity split, in the TUI's shape: broken invariants
-    /// are a failed report panel, warnings alone a non-failed one —
-    /// sticky either way, because findings are the durable record — and
-    /// a clean prefix is one footer line. The panel carries the same
-    /// finding texts the CLI prints; the two surfaces cannot disagree
-    /// about what was found, only about where it is shown.
+    /// The CLI's severity split in the TUI's shape: errors are a failed
+    /// sticky panel, warnings a non-failed one, a clean prefix one footer
+    /// line. Same finding texts as the CLI — the surfaces cannot disagree
+    /// about what, only where.
     fn finish_verify(&mut self, result: Result<crate::VerifyReport>) {
         let report = match result {
             Ok(report) => report,
@@ -2540,17 +2254,15 @@ impl App {
             }
         };
         if report.errors.is_empty() && report.warnings.is_empty() {
-            // Zero errors implies a counted manifest: None exists only
-            // on the unreadable/unparseable early return, which is an
-            // error by construction.
+            // Zero errors implies a counted manifest (None only on the early
+            // error return).
             let crates = report.crates.unwrap_or(0);
             self.info(&format!("verify: ok — {crates} managed crate(s)"));
             return;
         }
         let failed = !report.errors.is_empty();
-        // No sanitize here: VerifyReport is the one sanitization
-        // boundary, established at the source for both renderers — a
-        // second pass would only suggest the first is optional.
+        // No sanitize: VerifyReport is the one boundary — a second pass
+        // would suggest the first is optional.
         let mut lines: Vec<String> = report.errors.clone();
         if !report.warnings.is_empty() {
             if !lines.is_empty() {
@@ -2574,9 +2286,8 @@ impl App {
             failed,
         });
         if failed {
-            // The footer does not guess either: an uncounted manifest —
-            // unreadable or unparseable — reports its errors without
-            // inventing a crate count next to them.
+            // The footer does not guess either: an uncounted manifest reports
+            // errors without inventing a count.
             let head = match report.crates {
                 Some(crates) => format!("verify: {crates} crate(s), "),
                 None => "verify: ".to_owned(),
@@ -2605,9 +2316,8 @@ impl App {
                 self.error(&format!("reload failed: {e:#}"));
                 return;
             }
-            // Degraded is not "nothing installed" — the count is
-            // unknown, and saying zero here would be the reload's
-            // honesty overwritten one line later.
+            // Degraded is not "nothing installed" — the count is unknown, and
+            // zero here would overwrite the reload's honesty one line later.
             Ok(ReloadOutcome::Degraded) => return,
             Ok(ReloadOutcome::Loaded) => {}
         }
@@ -2639,9 +2349,8 @@ impl App {
     }
 
     fn start_search(&mut self, query: String) {
-        // The old result is not a placeholder for the new one: a failed
-        // search must not leave the previous query's hits on screen under
-        // a footer that talks about a different one.
+        // A failed search must not leave the previous query's hits under a
+        // footer about a different one.
         self.search_result = None;
         let (tx, rx) = mpsc::channel();
         let q = query.clone();
@@ -2652,16 +2361,9 @@ impl App {
         self.message = None;
     }
 
-    /// Collects finished background work.
-    ///
-    /// A dropped sender means the worker panicked, and that ends the
-    /// session rather than the job: `ratatui::try_init` installs a global
-    /// panic hook that restores the terminal on *any* thread's panic, so
-    /// by the time the main loop sees `Disconnected`, raw mode is off and
-    /// the alternate screen has been left. Drawing another frame into
-    /// that would scribble over the shell. The loop returns the error,
-    /// the outer teardown runs once more (harmless), and the user gets
-    /// a plain error line — the state ratatui already put them in.
+    /// Collects finished background work. A dropped sender means a worker
+    /// panicked — ratatui's hook already restored the terminal, so the
+    /// loop returns the error rather than scribble over the shell.
     fn poll_job(&mut self) -> Result<()> {
         let Some(job) = self.job.take() else {
             return Ok(());
@@ -2703,9 +2405,8 @@ impl App {
                 kind,
                 cancel_deadline,
             } => {
-                // Drain everything queued since the last frame: a fast
-                // build emits many lines per tick, and rendering one line
-                // per 100ms would show a gauge lagging minutes behind.
+                // Drain everything since the last frame: one line per tick would lag
+                // a fast build by minutes.
                 let mut done: Option<BuildOutcome> = None;
                 loop {
                     match rx.try_recv() {
@@ -2715,16 +2416,12 @@ impl App {
                                     units_started += 1;
                                     current = Some(format!("{name} {version}"));
                                 }
-                                // Compilation is over; collision checks,
-                                // placement and the manifest commit are
-                                // not "compiling foo", and the gauge must
-                                // not claim they are.
+                                // Compilation is over; placement and commit are not compiling-foo,
+                                // and the gauge must not claim they are.
                                 progress::BuildEvent::Finished => current = None,
                                 _ => {}
                             }
-                            // cargo speaking again supersedes a notice:
-                            // "waiting for the state lock" is over once
-                            // Compiling lines flow.
+                            // cargo speaking again supersedes a notice.
                             status_note = None;
                             tail.push_back(line);
                             if tail.len() > BUILD_TAIL {
@@ -2738,10 +2435,8 @@ impl App {
                                 tail.pop_front();
                             }
                         }
-                        // Warnings live in `warnings` alone: the panel
-                        // appends them itself, and a copy in the tail
-                        // would print them twice under a one-line
-                        // placement error.
+                        // Warnings live in `warnings` alone; a copy in the tail would print
+                        // twice under a one-line placement error.
                         Ok(BuildMsg::Warning(line)) => warnings.push(line),
                         Ok(BuildMsg::NeedAuth(target)) => needs_auth = Some(target),
                         Ok(BuildMsg::Done(outcome)) => {
@@ -2757,8 +2452,8 @@ impl App {
                 match done {
                     Some(outcome) => {
                         self.finish_build(&name, &kind, outcome, &tail, warnings);
-                        // A Ctrl-C during this build asked to leave once
-                        // the worker was collected; that is now.
+                        // A Ctrl-C during this build asked to leave once the worker was
+                        // collected; that is now.
                         if self.quit_after_build {
                             self.should_quit = true;
                         }
@@ -2786,10 +2481,9 @@ impl App {
         Ok(())
     }
 
-    /// Same semantics as `checkupdate`: a check that reached the index is
-    /// a success even if the report could not be written — the answer is
-    /// shown from memory and the persistence failure is a warning, not a
-    /// failed check.
+    /// Same semantics as `checkupdate`: reaching the index is success
+    /// even if the report could not persist — shown from memory, the
+    /// persistence failure a warning.
     fn finish_check(&mut self, result: Result<Vec<Checked>>) {
         let report = match result.and_then(|checked| Report::new(&self.prefix, checked)) {
             Ok(report) => report,
@@ -2804,15 +2498,14 @@ impl App {
                 self.error(&format!("reload failed: {e:#}"));
                 return;
             }
-            // "checked: 0 update(s)" over a manifest that just refused
-            // to load would be an invented number.
+            // "checked: 0 update(s)" over a manifest that refused to load would
+            // be an invented number.
             Ok(ReloadOutcome::Degraded) => return,
             Ok(ReloadOutcome::Loaded) => {}
         }
         let n = self.updates_available();
-        // The count matches the Updates tab — what `U` would do. A pinned
-        // backlog is reported alongside rather than folded in, so the
-        // number never promises an update that `update --all` will skip.
+        // The count matches the Updates tab; the pinned backlog is reported
+        // alongside, never folded in.
         let held = self.pinned_outdated();
         let summary = if held > 0 {
             format!("{n} update(s) available; {held} pinned held back")
@@ -2825,12 +2518,9 @@ impl App {
         }
     }
 
-    /// The installed marks are read from the manifest *now*, not from
-    /// the rows as they were when the request went out: another
-    /// cargo-lbin may have installed or removed a crate while crates.io
-    /// was answering, and the mark states installation as a fact.
-    /// `checkupdate` is immune by construction (`status_for` validates
-    /// the version); search has no such check, so it reloads instead.
+    /// Installed marks are read from the manifest *now*, not from the
+    /// request-time rows: the mark states installation as a fact, and
+    /// search has no version check to make it immune.
     fn finish_search(&mut self, query: String, result: Result<Vec<api::Hit>>) {
         match result {
             Ok(hits) if hits.is_empty() => self.info(&format!("no crates match `{query}`")),
@@ -2840,9 +2530,8 @@ impl App {
                         self.error(&format!("reload failed: {e:#}"));
                         return;
                     }
-                    // The hits are real, but their [installed] marks
-                    // would come from a manifest that did not load; the
-                    // degraded message outranks a panel built on it.
+                    // The hits are real, but their [installed] marks would come from a
+                    // manifest that did not load; the degraded message outranks them.
                     Ok(ReloadOutcome::Degraded) => return,
                     Ok(ReloadOutcome::Loaded) => {}
                 }
@@ -2879,10 +2568,8 @@ impl App {
         self.selected = self.selected.saturating_sub(1);
     }
 
-    /// The one door to the sticky report panel: pinning a new report
-    /// resets the scroll, so the reader starts at the headline — a
-    /// leftover offset from the previous report would open a fresh one
-    /// somewhere in its middle.
+    /// The one door to the sticky panel: pinning resets the scroll — a
+    /// leftover offset would open the next report in its middle.
     fn pin_report(&mut self, report: BuildReport) {
         self.report_scroll = 0;
         self.build_report = Some(report);
@@ -2901,8 +2588,7 @@ impl App {
     }
 
     fn notify(&mut self, text: &str, kind: MessageKind) {
-        // The footer is Span-bound like everything else; one funnel,
-        // one rule — a reload error carries paths too.
+        // Span-bound like everything else; a reload error carries paths too.
         self.message = Some(Message {
             text: crate::text::sanitize(text),
             kind,
@@ -2931,9 +2617,8 @@ fn action_label(action: &PendingAction) -> String {
     }
 }
 
-/// mm:ss, rolling to h:mm:ss past an hour — a Rust build can outlive
-/// both formats' assumptions, but never silently: the widest field
-/// grows instead of wrapping.
+/// mm:ss, rolling to h:mm:ss — the widest field grows instead of
+/// wrapping.
 fn format_elapsed(d: std::time::Duration) -> String {
     let total = d.as_secs();
     let (h, m, s) = (total / 3600, (total % 3600) / 60, total % 60);
@@ -2944,9 +2629,9 @@ fn format_elapsed(d: std::time::Duration) -> String {
     }
 }
 
-/// Manifest entries joined with what the report knows about each. The
-/// report is consulted per installed version, so a crate updated or
-/// installed after the check comes out `Unknown`, not stale.
+/// Manifest entries joined with the report, consulted per installed
+/// version: a crate changed since the check comes out `Unknown`, not
+/// stale.
 fn rows_from(
     manifest: &Manifest,
     report: Option<&Report>,
@@ -2976,11 +2661,9 @@ fn rows_from(
         .collect()
 }
 
-/// `i` input: crate specs (`NAME` or `NAME@VERSION`) separated by
-/// whitespace, optionally with `--locked` anywhere — the same shape as
-/// the CLI, so nothing new to learn. Specs are validated here so a typo
-/// fails in the footer, not after the screen has been handed over; the
-/// strings are passed on as typed and parsed again by `install`.
+/// `i` input: crate specs, `--locked` anywhere — the CLI's shape.
+/// Validated here so a typo fails in the footer, not after handoff;
+/// passed on as typed.
 fn parse_install_input(buffer: &str) -> Result<(Vec<String>, bool)> {
     let mut crates = Vec::new();
     let mut locked = false;
@@ -2988,10 +2671,8 @@ fn parse_install_input(buffer: &str) -> Result<(Vec<String>, bool)> {
         if token == "--locked" {
             locked = true;
         } else {
-            // Kept as typed, duplicates included: `parse_all` is the one
-            // place that decides what a repeated crate means, and it
-            // refuses it. Silently collapsing `bat bat` here would let
-            // the TUI accept what the CLI rejects.
+            // Kept as typed, duplicates included: `parse_all` is the one place
+            // that decides what a repeated crate means.
             crates.push(token.to_owned());
         }
     }
@@ -2999,9 +2680,7 @@ fn parse_install_input(buffer: &str) -> Result<(Vec<String>, bool)> {
         bail!("no crate name given");
     }
     // The same validation `install` will apply, including "one crate
-    // once": `foo foo@1.2.3`, and `foo foo`, are two specs for one crate
-    // and are refused here, in the footer, rather than in the terminal
-    // after handoff.
+    // once" — refused here, in the footer.
     InstallSpec::parse_all(&crates)?;
     Ok((crates, locked))
 }
@@ -3175,7 +2854,7 @@ mod tests {
 
         let control = std::sync::Arc::new(crate::BuildControl::new());
         // The deadline is armed only after an accepted cancel, so the
-        // control is already Cancelling when the timer looks at it.
+        // control is already Cancelling.
         assert!(matches!(
             control.request_cancel(),
             crate::CancelOutcome::Accepted
@@ -3288,15 +2967,9 @@ mod tests {
         app.jump_to_prefix(here.clone());
         assert_eq!(app.prefix, here);
         assert_eq!(app.selected, 0, "no counterpart: back to the top");
-        // Visible, not merely existing: under the Pinned filter an
-        // unpinned counterpart does not catch the selection — the
-        // documented word is "visible", and this is why. Order matters
-        // twice for the test to exercise the branch it claims to: the
-        // filter goes on *first* and the position is found under it
-        // (an index carried over from the All view would point past the
-        // Pinned view and selected_name would answer None before the
-        // jump even looks), and foo must be visible-here-hidden-there,
-        // which the pinned-here/unpinned-there seeding above provides.
+        // Visible, not merely existing: the filter goes on first and the
+        // position is found under it; foo is visible-here-hidden-there by
+        // the seeding above.
         app.filter = Filter::Pinned;
         let pos = app
             .visible()
@@ -3357,12 +3030,8 @@ mod tests {
         app.job = None;
 
         // A broken manifest no longer bounces the jump: the landing is
-        // the degraded state, because the person may be jumping there
-        // precisely to press v and learn what broke. The old prefix's
-        // search panel drops as on any committed jump — its [installed]
-        // marks were the old prefix's facts. Rollback still exists, but
-        // for hard failures (the lock cannot be acquired), not for the
-        // very states verify diagnoses.
+        // degraded — the person may be jumping there to press v. Rollback
+        // remains for hard failures (the lock).
         app.search_result = Some(SearchResult {
             query: "foo".into(),
             hits: Vec::new(),
@@ -3428,10 +3097,9 @@ mod tests {
             said.text
         );
 
-        // Mid-job the confirm is still reachable, so the in-place path
-        // must refuse for itself: the state lock is free while cargo
-        // compiles, and a removal that won it would be silently undone
-        // by the worker's own placement.
+        // Mid-job the confirm is reachable, so the in-place path refuses for
+        // itself: a removal winning the free lock would be silently undone
+        // by the worker's placement.
         let (_tx, rx) = mpsc::channel();
         let (auth_tx, _auth_rx) = mpsc::channel();
         app.job = Some(Job::Build {
@@ -3457,9 +3125,8 @@ mod tests {
         app.job = None;
         app.message = None;
 
-        // The state that earns the union over a bare job check: a batch
-        // between two members has an *empty* job slot and a live queue —
-        // and it must hold the prefix just the same.
+        // What earns the union over a bare job check: a batch between
+        // members has an empty job slot and a live queue.
         app.migrate_batch = Some(MigrateBatch {
             dest: prefix.join("elsewhere"),
             queue: std::collections::VecDeque::new(),
@@ -3545,9 +3212,8 @@ mod tests {
         let said = app.message.take().expect("the unpin reports itself");
         assert!(said.text.contains("unpinned foo"), "{}", said.text);
 
-        // A stale row: the manifest moved underneath (pinned by another
-        // instance), so the flip finds itself already answered — the
-        // screen is reloaded to agree and the message says what stands.
+        // A stale row: the manifest moved underneath, so the flip finds
+        // itself already answered.
         let mut moved = Manifest::load(&prefix).unwrap();
         moved.crates.get_mut("foo").unwrap().pinned = true;
         moved.store(&prefix).unwrap();
@@ -3626,11 +3292,10 @@ mod tests {
             dest: dest.clone(),
         };
 
-        // Success advances the queue into pending_migrate — and a fully
-        // successful member's build warnings are not laundered by the
-        // tally. The outcome's version (0.2.0) deliberately differs from
-        // the plan's (0.1.0): the footer must announce what the
-        // destination committed, not echo the plan back.
+        // Success advances the queue — and a successful member's warnings
+        // are not laundered by the tally. The outcome's version (0.2.0)
+        // deliberately differs from the plan's (0.1.0): the footer must
+        // announce what the destination committed, not echo the plan.
         app.migrate_batch = Some(MigrateBatch {
             dest: dest.clone(),
             queue: [pending("bar")].into_iter().collect(),
@@ -3661,8 +3326,8 @@ mod tests {
             app.message.as_ref().map(|m| m.text.clone())
         );
 
-        // …a failure on the last member finalizes with a failed panel
-        // that carries the successful member's warning section too…
+        // ...a failure on the last member finalizes with a failed panel
+        // carrying the successful member's warnings too...
         app.pending_migrate = None;
         app.finish_batch_step(
             "bar",
@@ -3680,8 +3345,7 @@ mod tests {
             "the successful member's warning reached the summary panel"
         );
 
-        // …and a cancel ends the batch with the queue dropped, never
-        // silently continued.
+        // ...and a cancel ends the batch with the queue dropped.
         app.migrate_batch = Some(MigrateBatch {
             dest: dest.clone(),
             queue: [pending("baz"), pending("qux")].into_iter().collect(),
@@ -3718,14 +3382,14 @@ mod tests {
             r#"{"crates":{"a":{"version":"nope","bins":["x"]}}}"#,
         )
         .unwrap();
-        // The session starts: the refusal is a state to present, not a
-        // startup error — dying here would take the v key with it.
+        // The refusal is a state to present — dying here would take the v
+        // key with it.
         let mut app = App::new(&prefix).expect("degraded, not dead");
         assert!(app.manifest_error.is_some());
         assert!(app.rows.is_empty());
 
         // Mutating keys are refused with the reason, not forwarded to
-        // workers that would bounce off Manifest::load noisily.
+        // workers that would bounce noisily.
         app.on_key(KeyEvent::from(KeyCode::Char('u')));
         assert!(app.confirm.is_none() && app.input.is_none());
         assert!(
@@ -3744,9 +3408,8 @@ mod tests {
         );
         app.job = None; // the verify worker's slot, released for the test
 
-        // ? opens the help — which in this state is the degraded page,
-        // drawn from manifest_error; the gate lets the key through and
-        // the page must not advertise the doors the gate locked.
+        // ? opens the degraded page: the gate lets the key through and the
+        // page must not advertise the doors the gate locked.
         app.on_key(KeyEvent::from(KeyCode::Char('?')));
         assert!(app.show_help, "help is one of the keys that still work");
         app.on_key(KeyEvent::from(KeyCode::Esc));
@@ -3779,9 +3442,8 @@ mod tests {
 
     #[test]
     fn a_mid_session_breakage_never_reports_an_invented_zero() {
-        // The manifest breaks while the session is open; every caller
-        // of reload() must then present the degraded fact, not its own
-        // happy-path sentence over an empty rows vector.
+        // The manifest breaks mid-session; every reload() caller must
+        // present the degraded fact, not its happy-path sentence.
         let prefix = std::env::temp_dir().join("cargo-lbin-test-tui-midbreak");
         let _ = std::fs::remove_dir_all(&prefix);
         std::fs::create_dir_all(prefix.join("share/cargo-lbin")).unwrap();
@@ -3791,9 +3453,8 @@ mod tests {
         assert!(app.manifest_error.is_none());
 
         std::fs::write(crate::Manifest::path(&prefix), "not json").unwrap();
-        // r is checkupdate while healthy; its first act is a reload,
-        // which lands degraded — and must not say "nothing installed;
-        // nothing to check": the count is unknown, not zero.
+        // r is checkupdate while healthy; its reload lands degraded and must
+        // not say "nothing installed": the count is unknown, not zero.
         app.on_key(KeyEvent::from(KeyCode::Char('r')));
         assert!(app.manifest_error.is_some());
         let text = app
@@ -3838,9 +3499,8 @@ mod tests {
 
     #[test]
     fn a_fresh_report_opens_at_its_headline() {
-        // The scroll survives dismissal only as a field; pinning the
-        // next report must zero it, or a long verify's leftover offset
-        // would open the next failure somewhere in its middle.
+        // Pinning the next report must zero the scroll, or it would open in
+        // the middle.
         let prefix = std::env::temp_dir().join("cargo-lbin-test-tui-scroll");
         let _ = std::fs::create_dir_all(prefix.join("share/cargo-lbin"));
         let _ = std::fs::create_dir_all(prefix.join("bin"));
@@ -3859,9 +3519,8 @@ mod tests {
 
     #[test]
     fn captured_kinds_survive_to_the_person() {
-        // The exact regression: a warning was once captured, tailed and
-        // then dropped by a successful finish; a notice was captured
-        // and never shown while the gauge sat at zero units.
+        // The exact regression: a warning once captured, tailed and dropped
+        // by a successful finish; a notice captured and never shown.
         let prefix = std::env::temp_dir().join("cargo-lbin-test-tui-kinds");
         let _ = std::fs::remove_dir_all(&prefix);
         std::fs::create_dir_all(&prefix).unwrap();
@@ -3904,9 +3563,8 @@ mod tests {
             "cargo's stream supersedes a stale notice: {gauge}"
         );
 
-        // A warning survives a successful finish, pinned to the report.
-        // (Raw here: this test injects past the worker's sanitizing
-        // boundary on purpose — the boundary itself is exercised below.)
+        // A warning survives a successful finish. (Raw on purpose: this
+        // injects past the boundary, which is exercised below.)
         tx.send(BuildMsg::Warning(
             "`foo` is shadowed by /usr/bin/foo".into(),
         ))
@@ -3929,10 +3587,8 @@ mod tests {
 
     #[test]
     fn the_render_boundary_sanitizes_every_kind() {
-        // A path may hold ESC as legally as `a`. build_msg IS the
-        // boundary — the worker forwards through it and nothing else —
-        // so this test guards the exact function whose removal would
-        // re-open the hole.
+        // build_msg IS the boundary — this guards the exact function whose
+        // removal would re-open the hole.
         let hostile = "warning: `foo` shadowed by /tmp/\u{1b}]0;pwned\u{7}/foo";
         for kind in [
             crate::LineKind::Cargo,
@@ -3955,8 +3611,7 @@ mod tests {
 
     #[test]
     fn rows_carry_the_cross_prefix_suffix() {
-        // The suffix comes pre-formatted from the shared formatter, so
-        // this pins both the plumbing and the no-drift property.
+        // Pre-formatted by the shared formatter: pins plumbing and no-drift.
         let mut also = std::collections::BTreeMap::new();
         also.insert(
             "one".to_owned(),

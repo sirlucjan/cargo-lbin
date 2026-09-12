@@ -20,15 +20,10 @@ pub struct InstallSpec {
 }
 
 impl InstallSpec {
-    /// Parse every spec and refuse a crate named more than once — with
-    /// or without versions, in any combination. One `install` call
-    /// checks pins once, against the manifest as it was before the
-    /// first build; a second spec for the same crate would run after
-    /// that check and see a pin the first one just set (or set a pin
-    /// the first one did not ask for), and `foo@1.2.3 foo` would end
-    /// with the newest version pinned. Two builds of one crate in one
-    /// command is never what anyone meant, so the whole command is
-    /// refused before anything is built.
+    /// Parse every spec and refuse a crate named twice, versions or not:
+    /// pins are checked once against the pre-build manifest, so a second
+    /// spec would race the first one's pin — and `foo@1.2.3 foo` would end
+    /// with the newest version pinned. Never what anyone meant.
     pub fn parse_all(specs: &[String]) -> Result<Vec<Self>> {
         let parsed = specs
             .iter()
@@ -43,11 +38,9 @@ impl InstallSpec {
         Ok(parsed)
     }
 
-    /// Parse `NAME` or `NAME@VERSION`. The version is an exact semver
-    /// version, not a requirement: `foo@^1` is refused, because "any
-    /// matching version" is what `install foo` already means, and the
-    /// point of naming one is to get that one and keep it (the caller
-    /// pins it). The name is validated as every other name is.
+    /// Parse `NAME` or `NAME@VERSION` — an exact version, not a
+    /// requirement: "any matching" is what `install foo` already means,
+    /// and the point of naming one is to get and pin that one.
     pub fn parse(spec: &str) -> Result<Self> {
         let (name, version) = match spec.split_once('@') {
             Some((name, version)) => (name, Some(version)),
@@ -85,10 +78,8 @@ pub fn validate_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Binary name: exactly one normal path component, equal to the whole
-/// string. Anything that could escape the bin directory when joined —
-/// absolute paths, `..`, separators, `.` — is rejected. This matters
-/// because bin names from the manifest and the stage bookkeeping end up in
+/// Binary name: exactly one normal path component. Anything that could
+/// escape bin/ when joined is rejected — these names end up in
 /// `rm`/`install` invocations that may run under sudo.
 pub fn validate_bin_name(name: &str) -> Result<()> {
     let mut components = Path::new(name).components();

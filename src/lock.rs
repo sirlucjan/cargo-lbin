@@ -1,27 +1,17 @@
-//! Prefix-scoped state lock.
+//! Prefix-scoped state lock: mutations take exclusive for their whole
+//! duration, builds included; readers take shared. The lock lives next
+//! to the state (`<prefix>/share/cargo-lbin/lock`), so it protects the
+//! prefix, not a user — and must be acquired before `Manifest::load()`
+//! or load-mutate-store is a textbook lost update.
 //!
-//! Serializes cargo-lbin instances operating on the same prefix: mutations
-//! (install/update/remove/downgrade, pin/unpin, migrate) take an exclusive
-//! lock for their whole duration, builds included; readers
-//! (list/checkupdate) take a shared lock. The lock lives next to the state
-//! (`<prefix>/share/cargo-lbin/lock`), so it protects the prefix rather than
-//! a particular user — two different users driving `/usr/local` contend on
-//! the same file.
+//! For a root-owned prefix, exclusive acquisition prepares the lock
+//! file via the privileged path (`mkdir -p` + `touch`, idempotent and
+//! inode-preserving); cargo and the build still run as the user.
+//! Readers on a never-mutated prefix degrade with a warning instead of
+//! demanding sudo.
 //!
-//! The lock must be acquired before `Manifest::load()`, otherwise the
-//! load-mutate-store sequence is a textbook lost update.
-//!
-//! For a root-owned prefix the lock file cannot be created by an
-//! unprivileged user, so exclusive acquisition prepares it via the
-//! privileged path (`mkdir -p` + `touch` — idempotent and inode-preserving,
-//! see `privileged::ensure_lock_file`). This is a filesystem bookkeeping
-//! operation only; cargo and the build still always run as the user.
-//! Readers on a prefix that has never seen a mutation degrade with a
-//! warning instead of demanding sudo.
-//!
-//! Locking uses `std::fs::File`'s lock API (`flock(2)` on Linux); the lock
-//! is advisory and scoped to the open file description, so it releases
-//! when the guard drops and the descriptor closes — including on crash.
+//! `flock(2)` via std's File lock API: advisory, scoped to the open
+//! file description, released on drop — including on crash.
 
 use crate::privileged;
 use anyhow::{Context, Result};
@@ -40,25 +30,16 @@ pub struct StateLock {
 
 impl StateLock {
     /// A shared lock over state that already exists, or nothing — the
-    /// read-only auditor's form. `acquire`'s preparation path writes
-    /// twice on any writable prefix that has never held a lock
-    /// (`create_dir_all`, then `O_CREAT`), which a command whose
-    /// contract is "never writes" cannot use. This one opens the lock
-    /// file read-only and never creates it or its parents; `Ok(None)`
-    /// means there is no lock to take — the file is absent (nothing has
-    /// ever prepared this prefix) or unopenable (a foreign prefix whose
-    /// lock the user cannot read) — and the caller reads without one,
-    /// which the atomic manifest placement keeps safe from torn files if
-    /// not from a racing removal; an auditor's findings are advisory
-    /// either way, and a spurious one costs a re-run, never state.
-    /// Blocks like `acquire` when the lock exists — waiting out someone
-    /// else's build beats auditing a prefix mid-placement — and says so
-    /// through `notice`, the same channel split `acquire_with` uses: the
-    /// CLI prints it to stderr, because a silent multi-minute wait on
-    /// someone else's build is indistinguishable from a hang, while the
-    /// TUI passes a noop — its spinner already says a job is alive, and
-    /// a worker's eprintln beneath the alternate screen is exactly what
-    /// this path's quiet design forbids.
+    /// read-only auditor's form: opens read-only, never creates the file
+    /// or its parents (`acquire`'s preparation writes twice, which "never
+    /// writes" cannot use). `Ok(None)` = no lock to take (absent or
+    /// permission-denied); the caller reads locklessly — atomic manifest
+    /// placement keeps that safe from torn files, and an auditor's
+    /// spurious finding costs a re-run, never state.
+    /// Blocks like `acquire` when the lock exists, and says so through
+    /// `notice` — the same channel split as `acquire_with`: the CLI prints
+    /// to stderr (a silent multi-minute wait reads as a hang), the TUI
+    /// passes a noop (its spinner already says a job is alive).
     pub fn acquire_shared_existing(
         prefix: &Path,
         notice: &mut dyn FnMut(&str),
@@ -66,11 +47,9 @@ impl StateLock {
         let path = prefix.join("share/cargo-lbin/lock");
         let file = match OpenOptions::new().read(true).open(&path) {
             Ok(file) => file,
-            // Absent: nothing ever prepared this prefix. Denied: a
-            // foreign prefix whose lock the user cannot read — both mean
-            // "read locklessly". Anything else (EIO, EMFILE) is a real
-            // failure of *this* process or disk and deserves to surface,
-            // not to be quietly rounded down to "no lock".
+            // Absent or denied both mean "read locklessly"; anything else (EIO,
+            // EMFILE) is a real failure of *this* process and must surface, not
+            // be rounded down to "no lock".
             Err(e)
                 if matches!(
                     e.kind(),
@@ -83,10 +62,8 @@ impl StateLock {
                 return Err(e).with_context(|| format!("opening {}", path.display()));
             }
         };
-        // The same probe-then-block shape as `acquire_impl`, for the
-        // same reason: a non-blocking probe tells an actual wait apart
-        // from an instant acquisition, so the notice fires only when
-        // there is genuinely someone to wait for.
+        // The same probe-then-block shape as `acquire_impl`: the notice fires
+        // only when there is genuinely someone to wait for.
         match file.try_lock_shared() {
             Ok(()) => {}
             Err(TryLockError::WouldBlock) => {
@@ -114,14 +91,11 @@ impl StateLock {
         )
     }
 
-    /// `acquire` with the two decisions a screen-owning frontend must
-    /// own decided by the caller: `policy` says whether preparing a
-    /// missing lock file may prompt (a captured frontend passes a
-    /// noninteractive policy, so the one path in this module that can
-    /// reach sudo runs it as `sudo -n` — a prompt beneath an alternate
-    /// screen would hang invisibly), and `notice` is where the human
-    /// lines go — stderr on the CLI, the frontend's line stream under a
-    /// TUI, nowhere for an advisory read that would rather stay silent.
+    /// `acquire` with the two decisions a screen-owning frontend must own:
+    /// `policy` says whether preparing a missing lock file may prompt (a
+    /// captured frontend passes noninteractive, so sudo runs `-n`), and
+    /// `notice` is where the human lines go — stderr, the frontend's
+    /// stream, or nowhere for an advisory read.
     pub fn acquire_with(
         prefix: &Path,
         mode: &Mode,
@@ -132,13 +106,10 @@ impl StateLock {
             .map(|lock| lock.expect("blocking acquisition always returns a lock"))
     }
 
-    /// `acquire_with` that does not wait: `Ok(None)` when another
-    /// instance holds the lock. For advisory reads on a live UI thread —
-    /// an optimization that would freeze the screen for the length of
+    /// `acquire_with` that does not wait: `Ok(None)` when held. For
+    /// advisory reads on a live UI thread — freezing the screen for
     /// someone else's build is no optimization, and the authoritative
-    /// check under the real lock happens elsewhere anyway.
-    /// Only the TUI's advisory path calls this, so a CLI-only build
-    /// never does.
+    /// check happens under the real lock elsewhere. TUI-only caller.
     #[cfg_attr(not(feature = "tui"), allow(dead_code))]
     pub fn try_acquire_with(
         prefix: &Path,
@@ -149,15 +120,11 @@ impl StateLock {
         Self::acquire_impl(prefix, mode, policy, notice, false)
     }
 
-    /// Will acquiring on this prefix need the privileged preparation
-    /// path? Mirrors `acquire`'s own first steps — create the parents
-    /// best-effort, then try to open or create the file — so a frontend
-    /// deciding whether to validate sudo up front sees exactly what the
-    /// worker will see. A user-writable prefix answers `false` by
-    /// creating the file here, which is the same file `acquire` would
-    /// have created a moment later.
-    /// Only the TUI's advisory path calls this, so a CLI-only build
-    /// never does.
+    /// Will acquiring here need the privileged preparation path? Mirrors
+    /// `acquire`'s first steps, so a frontend deciding on up-front sudo
+    /// sees what the worker will see; a user-writable prefix answers
+    /// `false` by creating the same file `acquire` would have. TUI-only
+    /// caller.
     #[cfg_attr(not(feature = "tui"), allow(dead_code))]
     pub fn preparation_needs_privilege(prefix: &Path) -> bool {
         let path = prefix.join("share/cargo-lbin/lock");
@@ -200,12 +167,11 @@ impl StateLock {
         let file = match (file, mode) {
             (Ok(f), _) => f,
             (Err(_), Mode::Exclusive) => {
-                // Mutations must not proceed unsynchronized: prepare the
-                // lock file with escalation, then it must open. Announce
-                // what is about to happen — this is the one code path that
-                // can put a sudo prompt on the screen before any other
-                // output, and a bare password prompt with no context looks
-                // exactly like what this tool exists to prevent.
+                // Mutations must not proceed unsynchronized: prepare with escalation,
+                // then it must open. Announce first — this is the one path that can
+                // put a sudo prompt before any other output, and a bare password
+                // prompt with no context looks exactly like what this tool exists to
+                // prevent.
                 notice(&format!(
                     "initializing state for {}: creating {}",
                     prefix.display(),
@@ -219,8 +185,8 @@ impl StateLock {
                     .with_context(|| format!("opening state lock {}", path.display()))?
             }
             (Err(_), Mode::Shared) => {
-                // A reader on a prefix that never saw a mutation; nothing
-                // to protect yet and no reason to demand sudo for a `list`.
+                // A reader on a never-mutated prefix: nothing to protect, no sudo for
+                // a `list`.
                 notice(&format!(
                     "warning: cannot open {} — proceeding without a state lock \
                      (the file is created by the first mutation)",
@@ -278,9 +244,8 @@ mod tests {
         assert!(!fired, "an instant acquisition says nothing");
         drop(got);
 
-        // Contended: an exclusive holder on a separate description, the
-        // waiter on a thread, the notice through a channel — it must
-        // arrive while the holder still holds, or the wait was silent.
+        // Contended: exclusive holder on a separate description, waiter on a
+        // thread — the notice must arrive while the holder still holds.
         let holder = std::fs::OpenOptions::new()
             .write(true)
             .open(&lock_path)
