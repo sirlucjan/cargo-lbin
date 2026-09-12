@@ -104,6 +104,7 @@ cargo lbin tui
 | `update --all [--yes]` | Update every managed crate with an available update; `--yes` skips confirmation |
 | `migrate <crate>... --to <prefix> [--yes]` | Rebuild installed crates under another prefix, then retire them here |
 | `migrate --all --to <prefix> [--yes]` | Migrate every managed crate to another prefix |
+| `verify` | Check the manifest's claims against the disk, read-only; non-zero exit on verification errors |
 | `search <terms>... [--limit N]` | Find crates by keyword |
 | `info <crate>...` | Show exact-name crate information and installed state |
 | `tui` | Interactive frontend over the same operations, when the `tui` feature is enabled |
@@ -448,6 +449,100 @@ migrating *away* from `/usr/local`: the destination is user-writable, so
 the one privileged step is retiring the source — the password prompt can
 therefore appear only at the end, after the build. A declined or failed
 prompt degrades to an incomplete migration with the destination intact.
+
+## Verify
+
+Ask whether the managed state is healthy:
+
+```bash
+cargo lbin verify
+```
+
+```
+error: `foo`: managed binary /home/user/.local/bin/foo is missing — reinstall: cargo lbin install foo --prefix=/home/user/.local
+warning: 2 stage directories under /home/user/.cache/cargo-lbin/stage whose owning cargo-lbin process is gone — possible leftover build debris; inspect and remove when safe (a PID can be reused, and an orphaned build may still hold the directory)
+```
+
+The manifest is the source of truth; every command relies on that,
+`verify` is the one that checks it. lbin's writes are atomic where it
+matters — the manifest and binary placement — but a multi-step
+operation can still crash between its steps, nothing stops a hand from
+removing a managed binary, and a system package can shadow one — and
+the messages that report such states scroll away. `verify` is the
+standing query those states were missing.
+
+It is read-only in the strictest sense: it does not even prepare the
+lock. A shared lock is taken only where one already exists — never
+created, along with nothing else — and a prefix that has no lock yet is
+read without one, which the atomic manifest placement keeps safe from
+torn files. There is no `--fix` by design — a finding names the
+existing repair command where lbin has an unambiguous one, and
+otherwise describes the state and leaves the decision to you; the
+repair commands already own the locks, confirmations and privilege
+rules a repair needs, and a second mutating path would buy one saved
+keystroke for a whole new surface of failure modes. A named command is
+spelled to be pasteable and true: it carries the audited prefix as
+`--prefix=<path>` (the default is `/usr/local`, and your shell may carry
+its own `CARGO_LBIN_PREFIX`), shell-quoted when the path needs it, the
+pinned version when there is one, and `--locked` when the entry was
+built with it — pasteable means pasteable, including over a prefix with
+a space or an apostrophe in its name. A prefix whose name has no honest
+shell spelling at all (not UTF-8, or holding a control character) gets
+its findings without a command: a command that is safe to paste but
+names a different path would be the one lie worse than none. And a
+command is named only when
+it would actually run: one broken entry anywhere makes every lbin
+command refuse the whole manifest, so a manifest with any structural
+finding gets its disk findings without commands — repaired manifest
+first, reinstalls second.
+
+Findings come in two severities, and the split is the contract.
+**Errors** are broken invariants or claims that could not be verified —
+the manifest says something the disk contradicts, or something the disk
+would not even answer about: an entry that does not parse, a declared binary
+missing, of the wrong type — a symlink counts, even one that resolves
+to a healthy executable: lbin places regular files, and a symlink under
+a managed name is structural drift — or not executable, or one binary
+name claimed by two entries (a state lbin never writes itself; the finding
+names no repair command: lbin's own commands begin by loading the
+manifest, which refuses exactly these states, so the honest remedy is
+repairing the file by hand or restoring it from a backup — and that is
+what every validate-class finding says). A manifest that does
+not deserialize at all is reported as the audit's one finding, and a
+binary that cannot be inspected — permissions, I/O — is reported as
+exactly that, never as "missing". Any error makes the exit status
+non-zero. **Warnings** observe the surroundings while the managed state
+itself is healthy: the crate also installed under the other known
+prefix (legal by construction — `verify` does not know the history and
+does not guess it), another executable with a managed binary's name on
+`PATH` — whichever side resolves first, that is the one check that
+notices drift *between* operations — and stage directories whose owning
+process is gone (kept deliberately as crash forensics; listed here
+because nothing else ever lists them, and worded as a possibility:
+PIDs can be reused, so inspect before removing). Warnings alone exit
+zero, so a deliberate `PATH` or cache debris cannot turn a healthy
+prefix red in a script.
+
+`verify` checks structure, not integrity: that an executable file
+answers to every claimed name — `pacman -Qk`, not `-Qkk`. The manifest
+records no hashes, by the same decision that makes [`migrate`](#migrate)
+rebuild rather than copy: lbin does not attest that today's bytes are
+the bytes it placed.
+
+In the TUI, `v` runs the same audit in the build panel's shape; the
+findings land in a panel that stays up until dismissed — and scrolls,
+because a durable record whose tail is unreachable is not one. The
+availability is the CLI's, including on a manifest the loader refuses:
+the session starts degraded rather than dying — empty list, mutating
+actions refused, `r` retrying the load, `B` still switching prefixes —
+so the key that explains what is wrong stays reachable exactly when
+something is. Degraded is a state the whole UI renders, not a message
+that scrolls away: the footer says "managed crate count unavailable"
+instead of an invented zero — the CLI's `Option` honesty, kept — and
+its key bar advertises only what still works. One honest note on
+scope: the `v` audit itself never writes, while a TUI *session*, like
+every TUI session, prepares the state lock when it starts — strict
+read-only-ness belongs to `cargo lbin verify`, the command.
 
 ## Remove
 
