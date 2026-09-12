@@ -475,12 +475,13 @@ fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
             "v           verify: audit the broken managed state",
             "r           retry loading the manifest",
             "B           switch to the other known prefix",
-            "?/Esc       close this help",
-            "q           quit",
+            "q / Esc     quit (from the list)",
             "",
             "The manifest did not load. Mutating actions, update",
             "checks and search are disabled until it is repaired",
             "by hand — v names every finding.",
+            "",
+            "any key closes this help",
         ];
         draw_help_box(frame, &lines, area);
         return;
