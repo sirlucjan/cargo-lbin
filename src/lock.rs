@@ -39,6 +39,48 @@ pub struct StateLock {
 }
 
 impl StateLock {
+    /// A shared lock over state that already exists, or nothing — the
+    /// read-only auditor's form. `acquire`'s preparation path writes
+    /// twice on any writable prefix that has never held a lock
+    /// (`create_dir_all`, then `O_CREAT`), which a command whose
+    /// contract is "never writes" cannot use. This one opens the lock
+    /// file read-only and never creates it or its parents; `Ok(None)`
+    /// means there is no lock to take — the file is absent (nothing has
+    /// ever prepared this prefix) or unopenable (a foreign prefix whose
+    /// lock the user cannot read) — and the caller reads without one,
+    /// which the atomic manifest placement keeps safe from torn files if
+    /// not from a racing removal; an auditor's findings are advisory
+    /// either way, and a spurious one costs a re-run, never state.
+    /// Blocks like `acquire` when the lock exists — waiting out someone
+    /// else's build beats auditing a prefix mid-placement — but silently:
+    /// the callers are read-only paths that may run beneath an alternate
+    /// screen, and an advisory read would rather say nothing.
+    pub fn acquire_shared_existing(prefix: &Path) -> Result<Option<Self>> {
+        let path = prefix.join("share/cargo-lbin/lock");
+        let file = match OpenOptions::new().read(true).open(&path) {
+            Ok(file) => file,
+            // Absent: nothing ever prepared this prefix. Denied: a
+            // foreign prefix whose lock the user cannot read — both mean
+            // "read locklessly". Anything else (EIO, EMFILE) is a real
+            // failure of *this* process or disk and deserves to surface,
+            // not to be quietly rounded down to "no lock".
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+                ) =>
+            {
+                return Ok(None);
+            }
+            Err(e) => {
+                return Err(e).with_context(|| format!("opening {}", path.display()));
+            }
+        };
+        file.lock_shared()
+            .with_context(|| format!("locking {} (shared)", path.display()))?;
+        Ok(Some(Self { _file: Some(file) }))
+    }
+
     /// Acquire the prefix lock, blocking if another instance holds it (with
     /// a notice, so a wait during someone else's 10-minute build is not
     /// mistaken for a hang). CLI form: lock-file preparation may prompt

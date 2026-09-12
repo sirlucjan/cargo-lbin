@@ -114,6 +114,25 @@ enum Cmd {
         #[arg(required = true)]
         crates: Vec<String>,
     },
+    /// Check the manifest's claims against the disk
+    ///
+    /// Read-only, always — verify does not even prepare the lock; it
+    /// takes a shared lock only where one already exists. Every entry
+    /// must parse, every declared binary must exist as an executable
+    /// regular file, and no two entries may claim one binary name —
+    /// anything else is an invariant violation and the command exits
+    /// non-zero. Observations about the surroundings (the crate also
+    /// installed under another known prefix, another executable with a
+    /// managed binary's name on PATH, stage directories left by a
+    /// crashed build) are warnings and leave the exit status at zero
+    /// (a claim that could not be checked at all — permissions, I/O —
+    /// is an error, not a warning: an unverifiable claim on one's own
+    /// prefix is itself not healthy):
+    /// they measure the environment, not the managed state. A finding
+    /// names the repair command where lbin has an unambiguous one, and
+    /// otherwise describes the state and leaves the decision to you;
+    /// verify itself never writes, prompts, or escalates.
+    Verify,
     /// Pin crates to their installed version
     ///
     /// A pin declares the version, not just a hold against the next
@@ -286,6 +305,7 @@ fn main() -> ExitCode {
     let result = match cli.cmd {
         Cmd::Install { ref crates, locked } => cmd_install(&cli.prefix, crates, locked),
         Cmd::Remove { ref crates } => cmd_remove(&cli.prefix, crates),
+        Cmd::Verify => cmd_verify(&cli.prefix),
         Cmd::Pin { ref crates } => cmd_set_pinned(&cli.prefix, crates, true),
         Cmd::Unpin { ref crates } => cmd_set_pinned(&cli.prefix, crates, false),
         Cmd::Pinned { check, json } => return cmd_pinned(&cli.prefix, check, json),
@@ -1145,6 +1165,19 @@ fn place_and_commit(
 /// outside cargo-lbin, and repeating the warning on every update would
 /// be the price of catching it.
 fn shadow_warnings(prefix: &Path, bins: &[String]) -> Vec<String> {
+    // The install pipeline's frontends print these lines raw, so the
+    // severity word travels inside the string; `verify` composes its own
+    // severity framing and takes the notes bare — one describe, two
+    // dressings, no double "warning: warning:".
+    shadow_notes(prefix, bins)
+        .into_iter()
+        .map(|n| format!("warning: {n}"))
+        .collect()
+}
+
+/// `shadow_warnings` without the severity word: the raw
+/// `shadow::describe` lines, for callers that add their own framing.
+fn shadow_notes(prefix: &Path, bins: &[String]) -> Vec<String> {
     if bins.is_empty() {
         return Vec::new();
     }
@@ -1163,10 +1196,7 @@ fn shadow_warnings(prefix: &Path, bins: &[String]) -> Vec<String> {
         .iter()
         .map(|s| {
             let owner = shadow::owner_of(&s.existing);
-            format!(
-                "warning: {}",
-                shadow::describe(s, &prefix_bin, owner.as_deref())
-            )
+            shadow::describe(s, &prefix_bin, owner.as_deref())
         })
         .collect()
 }
@@ -1186,6 +1216,449 @@ fn shadow_warnings(prefix: &Path, bins: &[String]) -> Vec<String> {
 fn install_needs_privilege(policy: privileged::Policy, prefix: &Path) -> Result<bool> {
     Ok(policy.probe_destination(&prefix.join("bin"))?
         || policy.probe_destination(&prefix.join("share/cargo-lbin"))?)
+}
+
+/// Everything `verify` found, split the way the exit status needs it.
+/// Errors are broken invariants — the manifest claims something the
+/// disk contradicts — and claims that could not be verified at all: an
+/// unverifiable claim on one's own prefix is an error without being a
+/// broken invariant, and the summaries say "verification error(s)" for
+/// exactly that reason.
+/// Warnings are surroundings worth a look while that state stays
+/// healthy: a legal second installation, a PATH that shadows, debris in
+/// the cache. Data, not placement: the CLI prints, the TUI panels, and
+/// the split is the contract both surfaces speak.
+pub(crate) struct VerifyReport {
+    /// `Some(n)` when the manifest was counted — `Some(0)` on a fresh
+    /// prefix is knowledge, not absence — and `None` when it could not
+    /// be: an unreadable or unparseable manifest may hold forty entries
+    /// behind a missing brace, and a summary that said "0 crates" there
+    /// would be the audit guessing in its own verdict line.
+    pub(crate) crates: Option<usize>,
+    pub(crate) errors: Vec<String>,
+    pub(crate) warnings: Vec<String>,
+}
+
+/// The whole audit, read-only in the strictest sense: it does not even
+/// prepare the lock. `acquire` would `mkdir -p` and `O_CREAT` on a
+/// fresh prefix — two small writes, but "never writes" is a contract,
+/// not a rounding rule — so verify takes a shared lock only where one
+/// already exists and otherwise reads without it, which the atomic
+/// manifest placement keeps safe from torn files. Nothing in here
+/// writes, prompts, or escalates — verify answers "is my state
+/// healthy", it never volunteers to make it so; a finding names the
+/// repair command where lbin has an unambiguous one, and otherwise
+/// describes the state and leaves the decision to the person.
+///
+/// Two phases by lock scope: the hard invariants read this prefix's
+/// disk and run under the shared lock; the environmental observations —
+/// a lockless-by-design look at the other prefixes, a PATH scan that
+/// may ask the distro package manager who owns a file — run after it
+/// drops, because nobody's install should wait on `rpm -qf`.
+pub(crate) fn verify_prefix(prefix: &Path) -> Result<VerifyReport> {
+    let (crates, errors, names, all_bins) = {
+        let _lock = StateLock::acquire_shared_existing(prefix)?;
+        // `load_unvalidated`, because the validated loader refuses
+        // exactly the corrupt states verify exists to name: behind
+        // `Manifest::load`, an unparseable version or a doubly-claimed
+        // binary is one opaque "invalid manifest" error and never a
+        // finding. A manifest that does not even deserialize is the
+        // deepest inconsistency there is — reported as the audit's one
+        // finding, not as a failure of the audit.
+        let manifest = match Manifest::load_unvalidated(prefix) {
+            Ok(manifest) => manifest,
+            // Two findings for two different worlds: an I/O failure
+            // (EACCES, EIO) says nothing about the manifest's content —
+            // it may be perfectly healthy — so "restore it" would be far
+            // too strong; only once the bytes were read and refused by
+            // serde is repair-or-restore the honest advice.
+            Err(e) => {
+                let finding = if e.downcast_ref::<std::io::Error>().is_some() {
+                    format!(
+                        "the manifest cannot be inspected: {e:#} — no further \
+                         manifest-dependent checks can be performed"
+                    )
+                } else {
+                    format!(
+                        "the manifest cannot be parsed: {e:#} — repair {} by \
+                         hand, or restore it from a backup",
+                        Manifest::path(prefix).display()
+                    )
+                };
+                return Ok(VerifyReport {
+                    crates: None,
+                    errors: vec![text::sanitize(&finding)],
+                    warnings: Vec::new(),
+                });
+            }
+        };
+        let (errors, checkable_bins) = verify_entries(prefix, &manifest);
+        let names: Vec<String> = manifest.crates.keys().cloned().collect();
+        (Some(manifest.crates.len()), errors, names, checkable_bins)
+    };
+    let mut warnings = Vec::new();
+    // A crate in another known prefix is a legal state by construction
+    // — the prefixes are independent domains and `[also in …]` exists
+    // precisely because seeing it is useful — so this is an observation,
+    // never a violation. Verify does not know the history and does not
+    // guess it: an incomplete migration is one possible cause, a
+    // deliberate pair of installs is another, and the finding names the
+    // state, not a story.
+    let also = prefixes::also_installed(prefix);
+    for name in &names {
+        for a in also.get(name).map_or(&[][..], Vec::as_slice) {
+            warnings.push(format!(
+                "`{name}` is also installed under {} @{} — legal; `cargo lbin remove` \
+                 the unwanted side if both were not meant",
+                a.prefix.display(),
+                a.version
+            ));
+        }
+    }
+    // The install-time name scan over every managed binary, bare of the
+    // severity word (verify frames its own): the one check that watches
+    // the environment drift *between* operations — a distro package
+    // taking a name after ours did is invisible to every command that
+    // only runs when asked. Neutral on purpose: `describe` says which
+    // side PATH resolves first, and a same-named executable is worth
+    // seeing whichever side wins.
+    warnings.extend(shadow_notes(prefix, &all_bins));
+    // Cache debris is prefix-independent and deliberately kept (see
+    // `install_and_commit`: a stage surviving a failure is forensic
+    // evidence); verify is the one place that lists it, because nothing
+    // else ever does. One aggregated finding, not one per directory: the
+    // parent is what gets cleaned, and a machine that crashed often
+    // enough to hold forty of these must not have them bury the finding
+    // that matters. An unreadable cache contributes silence, like a
+    // foreign manifest in `also_installed`: a read-only audit of this
+    // prefix must not fail over a directory it was not asked about.
+    if let Ok(cache) = cache_dir() {
+        let stale = stale_stages(&cache);
+        if !stale.is_empty() {
+            warnings.push(format!(
+                "{} stage director{} under {} whose owning cargo-lbin process is \
+                 gone — possible leftover build debris; inspect and remove when \
+                 safe (a PID can be reused, and an orphaned build may still hold \
+                 the directory)",
+                stale.len(),
+                if stale.len() == 1 { "y" } else { "ies" },
+                cache.join("stage").display()
+            ));
+        }
+    }
+    // Sanitized at the source, once for both renderers, and last, so the
+    // stale-stage line above is covered too: everything in these strings
+    // — names, versions, paths — travelled through `load_unvalidated`
+    // and is untrusted terminal text until proven otherwise. The CLI
+    // prints findings raw and the TUI puts them in Spans; neither should
+    // have to remember that on its own.
+    Ok(VerifyReport {
+        crates,
+        errors: errors.iter().map(|e| text::sanitize(e)).collect(),
+        warnings: warnings.iter().map(|w| text::sanitize(w)).collect(),
+    })
+}
+
+/// POSIX single-quote shell quoting, for the one place lbin composes a
+/// command it invites a human to paste: bare when every character is
+/// boring, single-quoted otherwise, embedded quotes as the classic
+/// `'\''` dance. Quoting always beats a caveat here — "pasteable"
+/// promised over a prefix named `/tmp/my lbin` would hand the shell a
+/// stray argument, and over a hostile one it could hand it `$()`;
+/// nothing lbin executes itself, but a hint the documentation calls
+/// pasteable must not be the one thing in the output that is unsafe to
+/// paste.
+fn shell_quote(s: &str) -> String {
+    let boring = !s.is_empty()
+        && s.chars().all(|c| {
+            c.is_ascii_alphanumeric()
+                || matches!(c, '/' | '.' | '_' | '-' | '+' | ':' | ',' | '=' | '@' | '%')
+        });
+    if boring {
+        return s.to_owned();
+    }
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// The pasteable spelling of the audited prefix, or `None` when no
+/// honest one exists. Two paths have none: a non-UTF-8 name, whose
+/// `display()` is lossy, and a name with a control character, which
+/// `shell_quote` would carry faithfully only for the sanitize boundary
+/// to launder into a space — a command safe to paste but naming a
+/// different path, the one lie worse than no command. Not worth a
+/// byte-level shell escaper to rescue a pathological pathname; those
+/// findings simply carry no command. The `--prefix=<quoted>` spelling
+/// is deliberate: a relative prefix that begins with a dash must not
+/// be lexable as another option.
+fn pasteable_prefix(prefix: &Path) -> Option<String> {
+    let s = prefix.to_str()?;
+    if s.chars().any(char::is_control) {
+        return None;
+    }
+    Some(format!("--prefix={}", shell_quote(s)))
+}
+
+/// The reinstall a disk finding may name — or `None` when the audited
+/// prefix has no safe shell spelling (see `pasteable_prefix`). When
+/// present it is pasteable and true: the prefix always (the default is
+/// /usr/local and the shell may carry its own $CARGO_LBIN_PREFIX — a
+/// hint that silently repairs a different prefix than the one just
+/// audited is worse than none), the pinned version when there is one (a
+/// bare `install` bounces off the pin), and `--locked` when the entry
+/// carries it (a "repair" that silently changes the entry's build
+/// policy is not a repair). Only the prefix needs the quoting: hints
+/// exist only for a manifest the validated loader accepts, so the name
+/// and version here already passed `validate_name` and semver — both
+/// shell-inert alphabets.
+fn reinstall_hint(prefix: &Path, name: &str, entry: &Entry) -> Option<String> {
+    let prefix_arg = pasteable_prefix(prefix)?;
+    let mut hint = format!("cargo lbin install {name}");
+    if entry.pinned {
+        hint.push('@');
+        hint.push_str(&entry.version);
+    }
+    if entry.locked {
+        hint.push_str(" --locked");
+    }
+    hint.push(' ');
+    hint.push_str(&prefix_arg);
+    Some(hint)
+}
+
+/// The hard invariants — `Manifest::validate`'s exact set, one finding
+/// per breach instead of validate's first-failure bail, plus the disk
+/// checks validate cannot do. Kept in lockstep with `validate` on
+/// purpose: a check that loader gains must appear here too, or verify
+/// will bless state `load` refuses. The set: every crate name valid,
+/// every version semver, every bin list non-empty with each element one
+/// plain filename listed once, every binary name owned by exactly one
+/// crate — and then, for names that passed, the disk: exists, regular
+/// file, executable. Only a name `validate_bin_name` accepts is ever
+/// joined under `bin/` or handed onward — a `../../x` from a hand-edited
+/// manifest must not make a read-only auditor stat outside the prefix.
+///
+/// Two passes, because the remedies depend on the whole: the validate
+/// mirror runs first over every entry, and only when it found *nothing*
+/// may the disk pass name a reinstall — every lbin command begins with
+/// `Manifest::load`, so one broken entry anywhere poisons the command
+/// suggested next to a perfectly sound one. Validate-class findings
+/// name no command ever: "run `remove`" would be a remedy the tool
+/// itself immediately bounces, and a loader-bypassing repair command
+/// would be a back door around the central validation — those findings
+/// say so and point at the manifest file itself.
+///
+/// Returns `(errors, checkable_bins)`: the second element is the bins
+/// that passed name validation, the only ones the caller may feed to
+/// the PATH scan.
+///
+/// `fs::symlink_metadata` on purpose: lbin places regular files, so a
+/// symlink under a managed name is structural drift even when its
+/// target runs fine — and a dangling one is then honestly a symlink
+/// finding, not a lying "missing". The scope stays structural — the
+/// check of `pacman -Qk`, not `-Qkk`: no attestation that the bytes
+/// are the bytes lbin placed, because the manifest records no hashes,
+/// by the same decision that makes migrate rebuild rather than copy.
+fn verify_entries(prefix: &Path, manifest: &Manifest) -> (Vec<String>, Vec<String>) {
+    use std::os::unix::fs::PermissionsExt;
+    let mut errors = Vec::new();
+    let mut checkable: Vec<String> = Vec::new();
+    let mut claims: BTreeMap<&String, Vec<&String>> = BTreeMap::new();
+    let bin_dir = prefix.join("bin");
+    let by_hand = format!(
+        "lbin's own commands refuse a manifest in this state; repair {} by hand, \
+         or restore it from a backup",
+        Manifest::path(prefix).display()
+    );
+    // Pass 1 — the validate mirror, over everything.
+    for (name, entry) in &manifest.crates {
+        if validate_name(name).is_err() {
+            errors.push(format!("`{name}` is not a valid crate name — {by_hand}"));
+        }
+        if Version::parse(&entry.version).is_err() {
+            errors.push(format!(
+                "`{name}`: manifest version `{}` is unparseable — {by_hand}",
+                entry.version
+            ));
+        }
+        if entry.bins.is_empty() {
+            errors.push(format!(
+                "`{name}`: declares no binaries — a state lbin never writes; {by_hand}"
+            ));
+        }
+        let mut seen: BTreeSet<&str> = BTreeSet::new();
+        for bin in &entry.bins {
+            if validate::validate_bin_name(bin).is_err() {
+                // Deliberately not joined under bin/, not claimed, not
+                // scanned: the name is the breach, and following it to
+                // the disk could lead outside the prefix.
+                errors.push(format!(
+                    "`{name}`: bin entry `{bin}` is not one plain filename — {by_hand}"
+                ));
+                continue;
+            }
+            if !seen.insert(bin.as_str()) {
+                errors.push(format!(
+                    "`{name}`: binary `{bin}` is listed twice — {by_hand}"
+                ));
+                continue;
+            }
+            claims.entry(bin).or_default().push(name);
+            checkable.push(bin.clone());
+        }
+    }
+    // A name two entries claim is a state lbin cannot produce — the
+    // collision check refuses it at install time — so finding one means
+    // hand-edited or otherwise corrupt state, which is also why no
+    // command is named: `remove` on either owner both refuses the
+    // manifest and, were it forced, would delete the file the survivor
+    // still claims. Decide which entry truly owns the name, delete the
+    // other from the manifest, and verify again.
+    for (bin, names) in &claims {
+        if names.len() > 1 {
+            let owners = names
+                .iter()
+                .map(|n| format!("`{n}`"))
+                .collect::<Vec<_>>()
+                .join(" and ");
+            errors.push(format!(
+                "binary `{bin}` is claimed by {owners} — a state lbin never \
+                 writes; {by_hand}"
+            ));
+        }
+    }
+    // Pass 2 — the disk audit, over the names pass 1 let through. The
+    // reinstall hint only exists when pass 1 found nothing: `install`
+    // on a manifest with any validate-class breach bounces off
+    // `Manifest::load` before touching anything, however sound the one
+    // crate in the hint is.
+    let loadable = errors.is_empty();
+    for (name, entry) in &manifest.crates {
+        // The same gate as pass 1, dedup included: a twice-listed name
+        // was flagged once there and gets one disk verdict here.
+        let mut seen: BTreeSet<&str> = BTreeSet::new();
+        for bin in &entry.bins {
+            if validate::validate_bin_name(bin).is_err() || !seen.insert(bin.as_str()) {
+                continue;
+            }
+            let remedy = if !loadable {
+                " — reinstall once the manifest findings above are repaired".to_owned()
+            } else {
+                match reinstall_hint(prefix, name, entry) {
+                    Some(hint) => format!(" — reinstall: {hint}"),
+                    // A loadable manifest under a prefix whose name has
+                    // no safe shell spelling: the repair is still a
+                    // reinstall, there is just no command worth pasting.
+                    None => " — reinstall it (this prefix's name cannot be \
+                              spelled as a safe shell command, so none is \
+                              offered)"
+                        .to_owned(),
+                }
+            };
+            let path = bin_dir.join(bin);
+            match fs::symlink_metadata(&path) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => errors.push(format!(
+                    "`{name}`: managed binary {} is missing{remedy}",
+                    path.display()
+                )),
+                // EACCES, EIO, a symlink loop: the binary may well be
+                // there, so "missing" would be a lie — the honest finding
+                // is that the claim could not be checked, which on one's
+                // own prefix is itself not healthy.
+                Err(e) => errors.push(format!(
+                    "`{name}`: managed binary {} cannot be inspected: {e} — the \
+                     manifest's claim could not be checked",
+                    path.display()
+                )),
+                Ok(md) if md.file_type().is_symlink() => errors.push(format!(
+                    "`{name}`: managed binary {} is a symlink, not the regular \
+                     file lbin placed — remove it, then{}",
+                    path.display(),
+                    remedy.trim_start_matches(" —")
+                )),
+                Ok(md) if !md.is_file() => errors.push(format!(
+                    "`{name}`: managed binary {} is not a regular file — remove \
+                     whatever took its place, then{}",
+                    path.display(),
+                    remedy.trim_start_matches(" —")
+                )),
+                Ok(md) if md.permissions().mode() & 0o111 == 0 => errors.push(format!(
+                    "`{name}`: managed binary {} is not executable{remedy}",
+                    path.display()
+                )),
+                Ok(_) => {}
+            }
+        }
+    }
+    (errors, checkable)
+}
+
+/// Stage directories whose owning process is gone. Stages are kept on
+/// failure as forensic evidence and named by PID, so liveness is the
+/// exact test: a directory under a PID that `/proc` still knows belongs
+/// to a running instance and is not a finding; anything else — a dead
+/// PID, a name that is not a PID at all — is debris.
+fn stale_stages(cache: &Path) -> Vec<PathBuf> {
+    let mut stale = Vec::new();
+    let Ok(entries) = fs::read_dir(cache.join("stage")) else {
+        return stale;
+    };
+    for entry in entries.flatten() {
+        let alive = entry
+            .file_name()
+            .to_str()
+            .and_then(|s| s.parse::<u32>().ok())
+            .is_some_and(|pid| Path::new(&format!("/proc/{pid}")).exists());
+        if !alive {
+            stale.push(entry.path());
+        }
+    }
+    stale.sort();
+    stale
+}
+
+/// The CLI's words over `verify_prefix`'s data: findings to stderr as
+/// the running commentary, the verdict to stdout, and the exit status
+/// measuring exactly one thing — whether the managed state is
+/// consistent. Warnings alone exit zero on purpose: a deliberate PATH
+/// or a leftover stage must not turn a healthy prefix red in a script.
+fn cmd_verify(prefix: &Path) -> Result<()> {
+    let report = verify_prefix(prefix)?;
+    for e in &report.errors {
+        eprintln!("error: {e}");
+    }
+    for w in &report.warnings {
+        eprintln!("warning: {w}");
+    }
+    if report.errors.is_empty() {
+        // Zero errors implies the manifest was counted: `None` exists
+        // only on the unreadable/unparseable early return, which is an
+        // error by construction. The fallback keeps that invariant a
+        // comment instead of a panic.
+        let crates = report.crates.unwrap_or(0);
+        if report.warnings.is_empty() {
+            println!("ok: {crates} managed crate(s)");
+        } else {
+            println!(
+                "ok: {crates} managed crate(s), {} warning(s)",
+                report.warnings.len()
+            );
+        }
+        return Ok(());
+    }
+    match report.crates {
+        Some(crates) => bail!(
+            "{crates} managed crate(s): {} verification error(s), {} warning(s)",
+            report.errors.len(),
+            report.warnings.len()
+        ),
+        // The count is unknown, and the verdict line does not guess: a
+        // manifest missing its last brace may hold forty entries.
+        None => bail!(
+            "managed crate count unavailable: {} verification error(s), {} warning(s)",
+            report.errors.len(),
+            report.warnings.len()
+        ),
+    }
 }
 
 /// The state half of the escalation union: the manifest under the
@@ -3901,6 +4374,524 @@ mod tests {
         let entry = &Manifest::load(&dest).unwrap().crates["okcrate"];
         assert_eq!(entry.version, "0.1.0", "pinned rebuilds the exact version");
         assert!(entry.pinned, "and stays pinned");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn verify_passes_a_healthy_prefix_and_names_every_broken_invariant() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join("cargo-lbin-test-verify");
+        let _ = fs::remove_dir_all(&root);
+        let prefix = seeded_prefix(&root, "prefix", "okcrate", false, false);
+
+        // Healthy: the seeded claim holds, no findings.
+        let manifest = Manifest::load(&prefix).unwrap();
+        assert!(
+            verify_entries(&prefix, &manifest).0.is_empty(),
+            "a healthy prefix verifies clean"
+        );
+
+        // Missing: the person did `rm ~/.local/bin/okcrate` by hand.
+        fs::remove_file(prefix.join("bin/okcrate")).unwrap();
+        let (errors, _) = verify_entries(&prefix, &manifest);
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("is missing"), "{errors:?}");
+        assert!(
+            errors[0].contains("install okcrate"),
+            "the finding names the repair: {errors:?}"
+        );
+        assert!(
+            errors[0].contains(&format!("--prefix={}", prefix.display())),
+            "the hint repairs the prefix that was audited, not the default: {errors:?}"
+        );
+
+        // Wrong type: a directory answers to the name.
+        fs::create_dir(prefix.join("bin/okcrate")).unwrap();
+        let (errors, _) = verify_entries(&prefix, &manifest);
+        assert!(errors[0].contains("not a regular file"), "{errors:?}");
+        fs::remove_dir(prefix.join("bin/okcrate")).unwrap();
+
+        // A symlink is structural drift even when its target runs fine:
+        // lbin places regular files, and verify checks structure.
+        std::os::unix::fs::symlink("/bin/sh", prefix.join("bin/okcrate")).unwrap();
+        let (errors, _) = verify_entries(&prefix, &manifest);
+        assert!(
+            errors[0].contains("is a symlink"),
+            "a healthy target does not excuse the drift: {errors:?}"
+        );
+        fs::remove_file(prefix.join("bin/okcrate")).unwrap();
+
+        // And a dangling one is honestly a symlink finding, never a
+        // lying "missing".
+        std::os::unix::fs::symlink("/nonexistent/target", prefix.join("bin/okcrate")).unwrap();
+        let (errors, _) = verify_entries(&prefix, &manifest);
+        assert!(
+            errors[0].contains("is a symlink") && !errors[0].contains("missing"),
+            "{errors:?}"
+        );
+        fs::remove_file(prefix.join("bin/okcrate")).unwrap();
+
+        // Not executable: the file is back but the mode is wrong.
+        fs::write(prefix.join("bin/okcrate"), "#!/bin/sh\ntrue\n").unwrap();
+        fs::set_permissions(
+            prefix.join("bin/okcrate"),
+            fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        let (errors, _) = verify_entries(&prefix, &manifest);
+        assert!(errors[0].contains("not executable"), "{errors:?}");
+        fs::set_permissions(
+            prefix.join("bin/okcrate"),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+
+        // A pinned crate's remedy names the pinned version — a bare
+        // `install` would be refused by the pin itself.
+        let mut pinned = Manifest::load(&prefix).unwrap();
+        pinned.crates.get_mut("okcrate").unwrap().pinned = true;
+        fs::remove_file(prefix.join("bin/okcrate")).unwrap();
+        let (errors, _) = verify_entries(&prefix, &pinned);
+        assert!(
+            errors[0].contains("install okcrate@0.1.0"),
+            "the pinned remedy is the exact re-pin: {errors:?}"
+        );
+
+        // A locked entry's remedy carries --locked: a repair that
+        // silently changes the entry's build policy is not a repair.
+        let mut locked = Manifest::load(&prefix).unwrap();
+        locked.crates.get_mut("okcrate").unwrap().locked = true;
+        let (errors, _) = verify_entries(&prefix, &locked);
+        assert!(
+            errors[0].contains("--locked"),
+            "the locked remedy keeps the policy: {errors:?}"
+        );
+        fs::write(prefix.join("bin/okcrate"), "#!/bin/sh\ntrue\n").unwrap();
+        fs::set_permissions(
+            prefix.join("bin/okcrate"),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+
+        // Unparseable entry: hand-edited state.
+        let mut broken = Manifest::load(&prefix).unwrap();
+        broken.crates.get_mut("okcrate").unwrap().version = "not-a-version".into();
+        let (errors, _) = verify_entries(&prefix, &broken);
+        assert!(errors[0].contains("unparseable"), "{errors:?}");
+
+        // Duplicate claim: two entries, one binary name — a state lbin
+        // never writes, so only a hand-built manifest can carry it.
+        let mut dup = Manifest::load(&prefix).unwrap();
+        dup.crates.insert(
+            "othercrate".into(),
+            Entry {
+                version: "0.1.0".into(),
+                bins: vec!["okcrate".into()],
+                locked: false,
+                pinned: false,
+            },
+        );
+        let (errors, _) = verify_entries(&prefix, &dup);
+        assert!(
+            errors.iter().any(|e| e.contains("claimed by")
+                && e.contains("`okcrate`")
+                && e.contains("`othercrate`")),
+            "the duplicate claim names both owners: {errors:?}"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn verify_never_prepares_the_prefix() {
+        // The read-only contract, tested at its sharpest edge: a fresh
+        // prefix that has never seen lbin. `acquire` would create
+        // share/cargo-lbin/ and the lock file here; verify must not — a
+        // command whose contract is "never writes" does not get to
+        // round two small writes down to zero.
+        let root = std::env::temp_dir().join("cargo-lbin-test-verify-ro");
+        let _ = fs::remove_dir_all(&root);
+        let prefix = root.join("fresh");
+        fs::create_dir_all(&prefix).unwrap();
+        let report = verify_prefix(&prefix).unwrap();
+        assert_eq!(
+            report.crates,
+            Some(0),
+            "a fresh prefix is known-zero — knowledge, not absence"
+        );
+        assert!(report.errors.is_empty());
+        assert!(
+            !prefix.join("share").exists(),
+            "verify prepared state on a prefix it promised only to read"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn verify_reaches_the_states_the_validated_loader_refuses() {
+        // The real path, not the hand-built shortcut: the manifest is
+        // written to disk carrying a duplicate claim and an unparseable
+        // version, `Manifest::load` refuses it, and verify still turns
+        // both into findings — because it reads through
+        // `load_unvalidated`. This is the test that keeps the declared
+        // invariants reachable.
+        let root = std::env::temp_dir().join("cargo-lbin-test-verify-load");
+        let _ = fs::remove_dir_all(&root);
+        let prefix = root.join("prefix");
+        fs::create_dir_all(prefix.join("bin")).unwrap();
+        fs::create_dir_all(prefix.join("share/cargo-lbin")).unwrap();
+        fs::write(
+            Manifest::path(&prefix),
+            r#"{"crates":{
+                "acrate":{"version":"not-a-version","bins":["shared"]},
+                "bcrate":{"version":"0.1.0","bins":["shared"]}
+            }}"#,
+        )
+        .unwrap();
+        assert!(
+            Manifest::load(&prefix).is_err(),
+            "the validated loader refuses this state; that is its job"
+        );
+        let manifest = Manifest::load_unvalidated(&prefix).unwrap();
+        let (errors, _) = verify_entries(&prefix, &manifest);
+        assert!(
+            errors.iter().any(|e| e.contains("unparseable")),
+            "the bad version became a finding: {errors:?}"
+        );
+        assert!(
+            errors.iter().any(|e| e.contains("claimed by")),
+            "the duplicate claim became a finding: {errors:?}"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn verify_reports_an_undeserializable_manifest_as_its_one_finding() {
+        let root = std::env::temp_dir().join("cargo-lbin-test-verify-garbage");
+        let _ = fs::remove_dir_all(&root);
+        let prefix = root.join("prefix");
+        fs::create_dir_all(prefix.join("share/cargo-lbin")).unwrap();
+        fs::write(Manifest::path(&prefix), "not json at all").unwrap();
+        let report = verify_prefix(&prefix).unwrap();
+        assert_eq!(report.errors.len(), 1, "{:?}", report.errors);
+        assert!(
+            report.errors[0].contains("cannot be parsed"),
+            "the deepest inconsistency is a finding, not a failed audit: {:?}",
+            report.errors
+        );
+        assert_eq!(
+            report.crates, None,
+            "behind a missing brace may sit forty entries — the count is unknown"
+        );
+        assert!(
+            report.errors[0].contains("repair"),
+            "serde refused the bytes, so repair-or-restore is honest: {:?}",
+            report.errors
+        );
+
+        // Bytes that are not UTF-8 are still the parse world, not the
+        // I/O world: the file was read fine, its content is what is
+        // corrupt — read_to_string would have laundered this into
+        // InvalidData and the wrong finding.
+        fs::write(Manifest::path(&prefix), b"\xff\xfe not utf8").unwrap();
+        let report = verify_prefix(&prefix).unwrap();
+        assert!(
+            report.errors[0].contains("cannot be parsed"),
+            "corrupt bytes are corruption, not I/O: {:?}",
+            report.errors
+        );
+        assert!(
+            report.errors[0].contains("repair"),
+            "read bytes that serde refused earn repair-or-restore: {:?}",
+            report.errors
+        );
+
+        // The other world: the file cannot even be read (EISDIR — the
+        // manifest path is a directory). Its content may be perfectly
+        // healthy, so the finding must not suggest restoring anything.
+        fs::remove_file(Manifest::path(&prefix)).unwrap();
+        fs::create_dir(Manifest::path(&prefix)).unwrap();
+        let report = verify_prefix(&prefix).unwrap();
+        assert!(
+            report.errors[0].contains("cannot be inspected"),
+            "an I/O failure says nothing about the content: {:?}",
+            report.errors
+        );
+        assert!(
+            !report.errors[0].contains("restore"),
+            "no repair advice over bytes nobody has seen: {:?}",
+            report.errors
+        );
+        assert_eq!(report.crates, None, "unread bytes count nothing");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn verify_distinguishes_missing_from_uninspectable() {
+        // ENOTDIR, deterministically, through a *valid* bin name — a
+        // path-like name never reaches the disk at all (the gate below
+        // tests that): here `bin` itself is a regular file, so metadata
+        // on `bin/tool` fails with something that is not NotFound — and
+        // "missing" would be a lie the finding must not tell.
+        let root = std::env::temp_dir().join("cargo-lbin-test-verify-inspect");
+        let _ = fs::remove_dir_all(&root);
+        let prefix = root.join("prefix");
+        fs::create_dir_all(&prefix).unwrap();
+        fs::write(prefix.join("bin"), "a file, not a directory").unwrap();
+        let mut manifest = Manifest::default();
+        manifest.crates.insert(
+            "weird".into(),
+            Entry {
+                version: "0.1.0".into(),
+                bins: vec!["tool".into()],
+                locked: false,
+                pinned: false,
+            },
+        );
+        let (errors, _) = verify_entries(&prefix, &manifest);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(
+            errors[0].contains("cannot be inspected"),
+            "not-NotFound is not \"missing\": {errors:?}"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_reinstall_hint_is_safe_to_paste() {
+        // The documentation calls the hint pasteable; a prefix with a
+        // space and an apostrophe is the regression that keeps that
+        // word honest — unquoted, the shell would read `lbin's` as a
+        // stray argument and an unterminated quote.
+        let root = std::env::temp_dir().join("cargo-lbin-test-verify-quote");
+        let _ = fs::remove_dir_all(&root);
+        let prefix = seeded_prefix(&root, "cargo lbin's test", "okcrate", false, false);
+        fs::remove_file(prefix.join("bin/okcrate")).unwrap();
+        let manifest = Manifest::load(&prefix).unwrap();
+        let (errors, _) = verify_entries(&prefix, &manifest);
+        let expected = format!("--prefix='{}/cargo lbin'\\''s test'", root.display());
+        assert!(
+            errors[0].contains(&expected),
+            "the prefix is single-quoted with the classic apostrophe dance:\n  \
+             finding: {}\n  expected fragment: {expected}",
+            errors[0]
+        );
+
+        // A prefix whose name holds a control character has no honest
+        // pasteable spelling: shell_quote would carry the newline
+        // faithfully, the sanitize boundary would launder it into a
+        // space, and the shown command would name a different path —
+        // safe to paste, wrong to run. Such findings carry no command.
+        let sneaky = seeded_prefix(&root, "with\nnewline", "okcrate", false, false);
+        fs::remove_file(sneaky.join("bin/okcrate")).unwrap();
+        let manifest = Manifest::load(&sneaky).unwrap();
+        let (errors, _) = verify_entries(&sneaky, &manifest);
+        assert!(
+            !errors[0].contains("cargo lbin install"),
+            "a command the sanitizer would falsify is no command: {errors:?}"
+        );
+        assert!(
+            errors[0].contains("cannot be spelled"),
+            "the finding says why no command is offered: {errors:?}"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn pasteable_prefix_refuses_what_it_cannot_spell() {
+        use std::os::unix::ffi::OsStrExt;
+        assert_eq!(
+            pasteable_prefix(Path::new("/usr/local")).as_deref(),
+            Some("--prefix=/usr/local")
+        );
+        // The = spelling keeps a dash-leading relative prefix from being
+        // lexable as another option.
+        assert_eq!(
+            pasteable_prefix(Path::new("--weird")).as_deref(),
+            Some("--prefix=--weird")
+        );
+        assert_eq!(
+            pasteable_prefix(Path::new("/tmp/my lbin")).as_deref(),
+            Some("--prefix='/tmp/my lbin'")
+        );
+        assert_eq!(pasteable_prefix(Path::new("/tmp/a\nb")), None);
+        let non_utf8 = Path::new(std::ffi::OsStr::from_bytes(b"/tmp/\xff"));
+        assert_eq!(
+            pasteable_prefix(non_utf8),
+            None,
+            "display() is lossy here; a lossy command is not a true one"
+        );
+    }
+
+    #[test]
+    fn shell_quote_leaves_boring_paths_bare() {
+        assert_eq!(shell_quote("/usr/local"), "/usr/local");
+        assert_eq!(shell_quote("/tmp/my lbin"), "'/tmp/my lbin'");
+        assert_eq!(shell_quote("a'b"), "'a'\\''b'");
+        assert_eq!(shell_quote("$(reboot)"), "'$(reboot)'");
+        assert_eq!(shell_quote(""), "''");
+    }
+
+    #[test]
+    fn a_broken_entry_anywhere_silences_every_reinstall_hint() {
+        // `install` begins with Manifest::load; one validate-class
+        // breach anywhere makes it refuse the whole file, so a concrete
+        // hint next to a perfectly sound crate would bounce — the
+        // findings must not point people at commands that cannot run.
+        let root = std::env::temp_dir().join("cargo-lbin-test-verify-poison");
+        let _ = fs::remove_dir_all(&root);
+        let prefix = seeded_prefix(&root, "prefix", "okcrate", false, false);
+        fs::remove_file(prefix.join("bin/okcrate")).unwrap();
+        let mut manifest = Manifest::load_unvalidated(&prefix).unwrap();
+        manifest.crates.insert(
+            "poison".into(),
+            Entry {
+                version: "not-a-version".into(),
+                bins: vec!["poison".into()],
+                locked: false,
+                pinned: false,
+            },
+        );
+        let (errors, _) = verify_entries(&prefix, &manifest);
+        let missing = errors
+            .iter()
+            .find(|e| e.contains("is missing"))
+            .expect("the sound crate's disk finding still exists");
+        assert!(
+            !missing.contains("cargo lbin install"),
+            "a hint that bounces off load is no hint: {missing}"
+        );
+        assert!(
+            missing.contains("once the manifest findings above are repaired"),
+            "the finding says why the command is withheld: {missing}"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn verify_mirrors_the_whole_validate_set_and_stats_only_sound_names() {
+        // The full mirror, collected rather than first-bailed: an
+        // invalid crate name, an empty bin list, a path-like bin, a
+        // twice-listed bin — every one a finding, none a bail. And the
+        // safety gate in the same breath: the path-like name must not be
+        // joined under bin/ (a planted file outside bin/ must NOT
+        // produce a disk verdict about it) and must not reach the PATH
+        // scan (`checkable` excludes it).
+        let root = std::env::temp_dir().join("cargo-lbin-test-verify-mirror");
+        let _ = fs::remove_dir_all(&root);
+        let prefix = root.join("prefix");
+        fs::create_dir_all(prefix.join("bin")).unwrap();
+        // The escape target: were `../outside` joined and stat'd, it
+        // would resolve to this existing, executable file — and the
+        // finding would wrongly be about the disk, not the name.
+        use std::os::unix::fs::PermissionsExt;
+        fs::write(prefix.join("outside"), "#!/bin/sh\ntrue\n").unwrap();
+        fs::set_permissions(prefix.join("outside"), fs::Permissions::from_mode(0o755)).unwrap();
+        // A sound binary, so the sound half of the entry verifies clean.
+        fs::write(prefix.join("bin/good"), "#!/bin/sh\ntrue\n").unwrap();
+        fs::set_permissions(prefix.join("bin/good"), fs::Permissions::from_mode(0o755)).unwrap();
+        let mut manifest = Manifest::default();
+        manifest.crates.insert(
+            "0badname".into(),
+            Entry {
+                version: "0.1.0".into(),
+                bins: Vec::new(),
+                locked: false,
+                pinned: false,
+            },
+        );
+        manifest.crates.insert(
+            "weird".into(),
+            Entry {
+                version: "0.1.0".into(),
+                bins: vec!["../outside".into(), "good".into(), "good".into()],
+                locked: false,
+                pinned: false,
+            },
+        );
+        let (errors, checkable) = verify_entries(&prefix, &manifest);
+        assert!(
+            errors.iter().any(|e| e.contains("not a valid crate name")),
+            "{errors:?}"
+        );
+        assert!(
+            errors.iter().any(|e| e.contains("declares no binaries")),
+            "{errors:?}"
+        );
+        assert!(
+            errors.iter().any(|e| e.contains("not one plain filename")),
+            "{errors:?}"
+        );
+        assert!(
+            errors.iter().any(|e| e.contains("listed twice")),
+            "{errors:?}"
+        );
+        assert!(
+            !errors.iter().any(|e| e.contains("outside")
+                && (e.contains("missing") || e.contains("not executable"))),
+            "the path-like name produced a disk verdict — it was stat'd: {errors:?}"
+        );
+        assert_eq!(
+            checkable,
+            vec!["good".to_owned()],
+            "only sound names reach the PATH scan"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn verify_findings_are_terminal_safe() {
+        // Through the real path: a version smuggling ESC survives
+        // deserialization (\u001b is legal JSON) and would reach the
+        // terminal raw from the CLI — the report boundary sanitizes for
+        // both renderers at once.
+        let root = std::env::temp_dir().join("cargo-lbin-test-verify-sanitize");
+        let _ = fs::remove_dir_all(&root);
+        let prefix = root.join("prefix");
+        fs::create_dir_all(prefix.join("bin")).unwrap();
+        fs::create_dir_all(prefix.join("share/cargo-lbin")).unwrap();
+        fs::write(
+            Manifest::path(&prefix),
+            r#"{"crates":{"esccrate":{"version":"0.1.0\u001b[31m","bins":["esccrate"]}}}"#,
+        )
+        .unwrap();
+        let report = verify_prefix(&prefix).unwrap();
+        assert!(
+            !report.errors.is_empty(),
+            "the smuggled version is at least unparseable"
+        );
+        for line in report.errors.iter().chain(report.warnings.iter()) {
+            assert!(
+                !line.chars().any(|c| c.is_control() && c != '\t'),
+                "a finding reached the boundary with a control char: {line:?}"
+            );
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn stale_stages_reports_dead_pids_and_spares_the_living() {
+        let root = std::env::temp_dir().join("cargo-lbin-test-verify-stages");
+        let _ = fs::remove_dir_all(&root);
+        let cache = root.join("cache");
+
+        // No stage directory at all: silence, not an error.
+        assert!(stale_stages(&cache).is_empty());
+
+        // A live PID (ours), a PID /proc cannot know, and a name that is
+        // not a PID at all.
+        let live = cache.join("stage").join(std::process::id().to_string());
+        let dead = cache.join("stage").join(u32::MAX.to_string());
+        let junk = cache.join("stage").join("not-a-pid");
+        for d in [&live, &dead, &junk] {
+            fs::create_dir_all(d).unwrap();
+        }
+        let stale = stale_stages(&cache);
+        assert!(
+            !stale.contains(&live),
+            "a running instance's stage is not debris"
+        );
+        assert!(stale.contains(&dead), "a dead PID's stage is debris");
+        assert!(stale.contains(&junk), "a non-PID name is debris");
         let _ = fs::remove_dir_all(&root);
     }
 

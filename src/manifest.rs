@@ -48,16 +48,37 @@ impl Manifest {
 
     pub fn load(prefix: &Path) -> Result<Self> {
         let path = Self::path(prefix);
-        let manifest: Self = match fs::read_to_string(&path) {
-            Ok(raw) => serde_json::from_str(&raw)
-                .with_context(|| format!("corrupt manifest at {}", path.display()))?,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
-            Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
-        };
+        let manifest = Self::load_unvalidated(prefix)?;
         manifest
             .validate()
             .with_context(|| format!("invalid manifest at {}", path.display()))?;
         Ok(manifest)
+    }
+
+    /// `load` without `validate` — for `verify` alone. Verify's whole
+    /// job is to look at state `load` refuses to hand over and to name
+    /// each broken invariant, with a granularity `validate`'s
+    /// first-failure bail cannot give; behind `load`, an unparseable
+    /// version or a doubly-claimed binary would surface as one opaque
+    /// "invalid manifest" error instead of findings. Everything that
+    /// mutates keeps `load`: the validated form is the only one the
+    /// pipeline may trust, and this reader hands its result to code that
+    /// only ever `stat`s.
+    pub fn load_unvalidated(prefix: &Path) -> Result<Self> {
+        let path = Self::path(prefix);
+        // Bytes first, parse second — deliberately not read_to_string,
+        // whose UTF-8 check turns a corrupt *file* into an I/O error
+        // (InvalidData) before serde ever sees it. The caller's whole
+        // point in the split is that an I/O failure says nothing about
+        // the content while refused bytes are exactly the corruption
+        // "repair or restore" is for; a 0xff in the manifest belongs to
+        // the second world, and only fs::read keeps it there.
+        match fs::read(&path) {
+            Ok(raw) => serde_json::from_slice(&raw)
+                .with_context(|| format!("corrupt manifest at {}", path.display())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
+        }
     }
 
     /// The manifest steers file operations that may run under sudo, so it is
