@@ -32,19 +32,28 @@ pub fn draw(frame: &mut Frame, app: &App) {
         draw_tabs(frame, app, header);
         draw_list(frame, app, list);
         draw_details(frame, app, details);
-        draw_gauge(frame, &gauge, build);
+        draw_gauge(frame, &gauge, app.transient_panel_title(), build);
         draw_footer(frame, app, footer);
         if app.show_help {
-            draw_help(frame, frame.area());
+            draw_help(frame, app, frame.area());
         }
         return;
     }
+    // A pinned report gets more rows than the resting details pane: the
+    // findings are the thing being read, and the list can spare the
+    // space until Esc. Bounded by what the terminal has, floored at the
+    // resting height, and still scrollable past either bound.
+    let details_h = if app.build_report.is_some() {
+        frame.area().height.saturating_sub(11).clamp(8, 16)
+    } else {
+        8
+    };
     let [header, list, details, footer] = Layout::new(
         Direction::Vertical,
         [
             Constraint::Length(3),
             Constraint::Min(5),
-            Constraint::Length(8),
+            Constraint::Length(details_h),
             Constraint::Length(3),
         ],
     )
@@ -57,7 +66,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
 
     if app.show_help {
         let area = frame.area();
-        draw_help(frame, area);
+        draw_help(frame, app, area);
     }
 }
 
@@ -67,8 +76,14 @@ pub fn draw(frame: &mut Frame, app: &App) {
 /// Deliberately a status line inside, never a progress bar: cargo
 /// knows what it has started, not what remains, so a count of started
 /// units is the truth and any percentage would be an invention.
-fn draw_gauge(frame: &mut Frame, gauge: &str, area: Rect) {
-    let block = Block::default().borders(Borders::ALL).title(" Build ");
+fn draw_gauge(frame: &mut Frame, gauge: &str, title: &str, area: Rect) {
+    // The title follows the job: the panel's shape is shared with
+    // verify on purpose (one mechanism, so the two cannot drift), but a
+    // frame that says Build over a running audit would be the shape
+    // promising the wrong operation.
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title.to_owned());
     let inner = block.inner(area);
     frame.render_widget(block, area);
     frame.render_widget(
@@ -182,7 +197,7 @@ fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
 /// The sticky report panel: a failure's tail and log path, or a
 /// success's warnings. Split from `draw_details` for exactly the reason
 /// clippy suggests — it is its own panel with its own rules.
-fn draw_report(frame: &mut Frame, report: &crate::tui::BuildReport, area: Rect) {
+fn draw_report(frame: &mut Frame, report: &crate::tui::BuildReport, scroll: u16, area: Rect) {
     let color = if report.failed {
         Color::Red
     } else {
@@ -198,17 +213,30 @@ fn draw_report(frame: &mut Frame, report: &crate::tui::BuildReport, area: Rect) 
             .iter()
             .map(|l| Line::from(Span::raw(l.clone()))),
     );
+    // The scroll clamp, computed here because only the draw knows the
+    // wrap width — and computed by the renderer's own word wrapper
+    // (`Paragraph::line_count`), because any arithmetic stand-in lies
+    // eventually: width-division undercounts exactly when word wrap
+    // breaks earlier than character wrap would, and an undercounted
+    // height is a tail the reader cannot reach. The stored offset is
+    // clamped for display rather than mutated, so a held key cannot
+    // scroll the reader into blank space.
+    let inner_w = area.width.saturating_sub(2).max(1);
+    let inner_h = area.height.saturating_sub(2).max(1);
+    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
+    let total_rows = u16::try_from(paragraph.line_count(inner_w)).unwrap_or(u16::MAX);
+    let max_scroll = total_rows.saturating_sub(inner_h);
+    let effective = scroll.min(max_scroll);
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(" Esc/Enter dismisses ");
+        .title(if max_scroll > 0 {
+            " Esc/Enter dismisses · Up/Down scrolls "
+        } else {
+            " Esc/Enter dismisses "
+        });
     // Wrapped: the log path is one of the two most important lines
     // here, and a panel that truncates it defeats its own purpose.
-    frame.render_widget(
-        Paragraph::new(lines)
-            .block(block)
-            .wrap(Wrap { trim: false }),
-        area,
-    );
+    frame.render_widget(paragraph.block(block).scroll((effective, 0)), area);
 }
 
 fn draw_details(frame: &mut Frame, app: &App, area: Rect) {
@@ -216,7 +244,7 @@ fn draw_details(frame: &mut Frame, app: &App, area: Rect) {
     // and log path, or a success's warnings — either must survive longer
     // than one keypress.
     if let Some(report) = &app.build_report {
-        draw_report(frame, report, area);
+        draw_report(frame, report, app.report_scroll, area);
         return;
     }
     // A finished search takes over the panel until dismissed; it is the
@@ -321,6 +349,12 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         " y confirm · any other key cancel"
     } else if app.input.is_some() {
         " Enter run · Esc cancel"
+    } else if app.manifest_error.is_some() {
+        // The degraded key bar advertises only what the gate lets
+        // through — a bar promising `u update · i install` over a
+        // manifest that will not load is instructions for a door that
+        // is locked — and it renames `r` to what `r` now does.
+        " manifest unavailable · v verify · r retry load · B other prefix · ? help · q quit"
     } else if app.build_running() {
         // Deliberately uncategorical: past the placement door `c`
         // answers TooLate and Ctrl-C only arms quit-after — the hint
@@ -329,7 +363,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         " ↑/↓ select · c cancel/escalate · Ctrl-C cancel/quit"
     } else {
         " ↑/↓ select · Tab filter · Enter/u update · U update all · i install · x remove · \
-         m migrate · M migrate all · B other prefix · p pin · D downgrade · r check · s search · ? help · q quit"
+         m migrate · M migrate all · B other prefix · p pin · D downgrade · v verify · r check · s search · ? help · q quit"
     };
     frame.render_widget(
         Paragraph::new(Span::styled(keys, Style::default().fg(Color::DarkGray))),
@@ -341,30 +375,42 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         None => "never checked".to_owned(),
     };
     // "0 updates" alone would read as "all current"; the unknown count
-    // keeps the footer as honest as the status column.
-    let mut status = format!(
-        " {} packages · {} updates",
-        app.total(),
-        app.updates_available()
-    );
-    // The pinned backlog is deliberately absent from the updates count
-    // (it is not something `U` will do), so it must be voiced here: a
-    // held-back update stays loud, it just moved homes.
-    match (app.pinned_count(), app.pinned_outdated()) {
-        (0, _) => {}
-        (p, 0) => {
-            let _ = write!(status, " · {p} pinned");
+    // keeps the footer as honest as the status column. And in the
+    // degraded state the whole line is one honest sentence instead:
+    // "0 packages · never checked" over a manifest that refused to load
+    // would be the same invented zero VerifyReport's Option<usize>
+    // exists to forbid — the count is not zero, it is unknown.
+    let (status, status_color) = if app.manifest_error.is_some() {
+        (
+            " managed crate count unavailable — the manifest did not load".to_owned(),
+            Color::Red,
+        )
+    } else {
+        let mut status = format!(
+            " {} packages · {} updates",
+            app.total(),
+            app.updates_available()
+        );
+        // The pinned backlog is deliberately absent from the updates count
+        // (it is not something `U` will do), so it must be voiced here: a
+        // held-back update stays loud, it just moved homes.
+        match (app.pinned_count(), app.pinned_outdated()) {
+            (0, _) => {}
+            (p, 0) => {
+                let _ = write!(status, " · {p} pinned");
+            }
+            (p, held) => {
+                let _ = write!(status, " · {p} pinned ({held} behind)");
+            }
         }
-        (p, held) => {
-            let _ = write!(status, " · {p} pinned ({held} behind)");
+        if app.not_checked() > 0 {
+            let _ = write!(status, " · {} not checked", app.not_checked());
         }
-    }
-    if app.not_checked() > 0 {
-        let _ = write!(status, " · {} not checked", app.not_checked());
-    }
-    let _ = write!(status, " · {checked}");
+        let _ = write!(status, " · {checked}");
+        (status, Color::DarkGray)
+    };
     frame.render_widget(
-        Paragraph::new(Span::styled(status, Style::default().fg(Color::DarkGray))),
+        Paragraph::new(Span::styled(status, Style::default().fg(status_color))),
         status_area,
     );
 
@@ -417,7 +463,28 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     }
 }
 
-fn draw_help(frame: &mut Frame, area: Rect) {
+fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
+    // The degraded help is its own short page, not the normal one
+    // grayed out: help is one of the few keys the degraded gate lets
+    // through, and the one function still standing must not hand out
+    // instructions for doors the gate just locked — worst of all `r`,
+    // which the footer calls "retry load" while the normal page calls
+    // it "check crates.io". Five keys work; the page lists five keys.
+    if app.manifest_error.is_some() {
+        let lines = [
+            "v           verify: audit the broken managed state",
+            "r           retry loading the manifest",
+            "B           switch to the other known prefix",
+            "?/Esc       close this help",
+            "q           quit",
+            "",
+            "The manifest did not load. Mutating actions, update",
+            "checks and search are disabled until it is repaired",
+            "by hand — v names every finding.",
+        ];
+        draw_help_box(frame, &lines, area);
+        return;
+    }
     let lines = [
         "↑/↓ j/k     select        Tab       Packages / Updates / Pinned",
         "g/G Home/End first / last ?         this help",
@@ -445,6 +512,9 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         "            update --all holds it back, m migrates exactly it",
         "            (in place unless pinning needs sudo)",
         "D           downgrade: pick an older version in the terminal, pinned",
+        "v           verify: the manifest's claims checked against the disk,",
+        "            read-only; violations and warnings land in a panel,",
+        "            naming the repair where one is unambiguous",
         "r           check crates.io for updates (writes the report)",
         "s           search crates.io by keyword; a digit then picks a hit",
         "            and opens the install line with its name",
@@ -462,6 +532,13 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         "",
         "any key closes this help",
     ];
+    draw_help_box(frame, &lines, area);
+}
+
+/// The framed, centered popup both help pages share: sizing from the
+/// widest line, one box, one title — so the degraded page differs only
+/// in what it says, never in how it appears.
+fn draw_help_box(frame: &mut Frame, lines: &[&str], area: Rect) {
     let width = lines.iter().map(|l| l.chars().count()).max().unwrap_or(0);
     let popup = centered(
         area,

@@ -3,7 +3,7 @@
 //! The TUI adds no logic of its own. It reads the manifest and the last
 //! `checkupdate` report from disk, and every action is one of the existing
 //! commands: `r` is `checkupdate`, `u`/`U` are `update NAME`/`update --all`,
-//! `i` is `install`, `x` is `remove`, `s` is `search`. Nothing happens
+//! `i` is `install`, `x` is `remove`, `s` is `search`, `v` is `verify`. Nothing happens
 //! unless a key asks for it — no polling, no refresh or network access on
 //! start. (Once asked, `i`, `u` and `U` reach the network too, through
 //! cargo; the guarantee is about what the TUI does unprompted.)
@@ -17,8 +17,14 @@
 //! once and kept across handoffs: `ratatui::try_init()` installs a panic hook
 //! on every call, wrapping the previous one, so re-initializing per
 //! command would stack a hook per operation. `checkupdate` and `search`
-//! only talk to crates.io; they run on a one-shot thread while the list
-//! stays navigable, and their answers are applied on the main thread.
+//! only talk to crates.io, and `v` (`verify`) only reads the disk; all
+//! three run on a one-shot thread while the list stays navigable, and
+//! their answers are applied on the main thread.
+//!
+//! A manifest the validated loader refuses does not keep the TUI out:
+//! the session starts degraded — empty list, mutating actions refused,
+//! `r` repurposed as a plain reload retry — because `v`, the key that
+//! explains what is wrong, must not vanish exactly when something is.
 
 mod ui;
 
@@ -380,6 +386,15 @@ const BUILD_TAIL: usize = 40;
 /// busy label and the user should know what it stands for.
 enum Job {
     Check(Receiver<Result<Vec<Checked>>>),
+    /// A read-only audit of the current prefix on a worker thread: the
+    /// checks only stat, but /usr/local may be slow storage and the UI
+    /// stays responsive on principle. While it runs it gets the same
+    /// framed panel a build gets; findings land in the sticky report
+    /// panel — the CLI's severity split, in the TUI's shape.
+    Verify {
+        rx: Receiver<Result<crate::VerifyReport>>,
+        started: std::time::Instant,
+    },
     Search {
         query: String,
         rx: Receiver<Result<Vec<api::Hit>>>,
@@ -433,6 +448,7 @@ impl Job {
     fn label(&self) -> String {
         match self {
             Job::Check(_) => "checking crates.io for updates…".to_owned(),
+            Job::Verify { .. } => "verifying the prefix…".to_owned(),
             Job::Search { query, .. } => format!("searching crates.io for `{query}`…"),
             Job::Build { name, .. } => format!("building {name}…"),
         }
@@ -479,6 +495,18 @@ pub struct App {
     pub search_result: Option<SearchResult>,
     /// A build's sticky report pinned to the details panel until dismissed.
     pub build_report: Option<BuildReport>,
+    /// The validated loader's refusal, when the manifest cannot be
+    /// loaded — the TUI's degraded state. The list is empty, mutating
+    /// actions are refused, and `v` stays reachable: the key that
+    /// explains what is wrong must not vanish exactly when something
+    /// is. `None` again the moment a reload succeeds.
+    pub manifest_error: Option<String>,
+    /// Scroll offset of the sticky report panel, in rendered rows;
+    /// reset by `pin_report`, clamped at draw time where the width is
+    /// known. Findings are unbounded and the panel is not — a report
+    /// that physically hides its own tail defeats its purpose as the
+    /// durable record.
+    pub report_scroll: u16,
     pub show_help: bool,
     pending: Option<PendingAction>,
     /// A captured install waiting for the run loop, which owns the
@@ -525,6 +553,19 @@ pub fn run(prefix: &Path) -> Result<()> {
     Ok(())
 }
 
+/// What a reload found — a value every caller must face. Since the
+/// degraded state exists, `Ok` no longer means "the list is fresh": it
+/// can also mean "the manifest refused to load and the session
+/// remembered it". A flag inside `App` would let the next caller
+/// forget to look; a `#[must_use]` outcome makes forgetting visible at
+/// the call site, which is where the next lie would otherwise be
+/// written ("nothing installed", "now at …", "checked: 0 updates").
+#[must_use]
+enum ReloadOutcome {
+    Loaded,
+    Degraded,
+}
+
 impl App {
     fn new(prefix: &Path) -> Result<Self> {
         let mut app = Self {
@@ -541,6 +582,8 @@ impl App {
             migrate_batch: None,
             search_result: None,
             build_report: None,
+            manifest_error: None,
+            report_scroll: 0,
             pending_build: None,
             ticks: 0,
             show_help: false,
@@ -549,7 +592,9 @@ impl App {
             should_quit: false,
             quit_after_build: false,
         };
-        app.reload()?;
+        // Both outcomes are a session: a broken manifest starts degraded
+        // by design, and the footer carries that state from here on.
+        let _ = app.reload()?;
         Ok(app)
     }
 
@@ -560,7 +605,7 @@ impl App {
     /// changed the prefix, and each of those is a moment the user is
     /// about to be shown or act on the prefix's state. The state lock is
     /// held only for the manifest read, never while the TUI idles.
-    fn reload(&mut self) -> Result<()> {
+    fn reload(&mut self) -> Result<ReloadOutcome> {
         // A search result marks hits as installed — a fact about the
         // prefix. Anything that re-reads the prefix — a command's return,
         // `r`, a newer search — is exactly the moment that fact may have
@@ -580,10 +625,33 @@ impl App {
     /// Rebuild the rows from a fresh manifest read and the given report —
     /// which may be one that could not be written to disk; what the
     /// index answered is still shown.
-    fn apply_report(&mut self, report: Option<&Report>) -> Result<()> {
+    fn apply_report(&mut self, report: Option<&Report>) -> Result<ReloadOutcome> {
         let manifest = {
             let _lock = StateLock::acquire(&self.prefix, &Mode::Shared)?;
-            Manifest::load(&self.prefix)?
+            // The validated loader's refusal is a state to present, not
+            // a reason to keep the TUI out: `verify` exists precisely to
+            // diagnose manifests `load` refuses, and a session that dies
+            // on startup takes the `v` key with it. Degrade instead —
+            // empty list, remembered error, mutating actions gated —
+            // and recover the moment a reload succeeds.
+            match Manifest::load(&self.prefix) {
+                Ok(manifest) => {
+                    self.manifest_error = None;
+                    manifest
+                }
+                Err(e) => {
+                    self.manifest_error = Some(crate::text::sanitize(&format!("{e:#}")));
+                    self.rows.clear();
+                    self.report_age = None;
+                    self.clamp_selection();
+                    self.error(
+                        "the manifest cannot be loaded — v lists the findings; \
+                         mutating actions are disabled until it is repaired \
+                         (r retries the load)",
+                    );
+                    return Ok(ReloadOutcome::Degraded);
+                }
+            }
         };
         // Once per reload, never per frame — and lockless by design; the
         // prefixes module explains why an annotation must never wait on
@@ -592,7 +660,7 @@ impl App {
         self.rows = rows_from(&manifest, report, &also);
         self.report_age = report.map(Report::age);
         self.clamp_selection();
-        Ok(())
+        Ok(ReloadOutcome::Loaded)
     }
 
     /// Rows under the current filter, paired with their index in `rows`.
@@ -673,11 +741,32 @@ impl App {
         self.job.as_ref().map(Job::label)
     }
 
+    /// The transient panel's frame title, following the job it hosts:
+    /// the shape is shared, the name is not.
+    pub fn transient_panel_title(&self) -> &'static str {
+        match &self.job {
+            Some(Job::Verify { .. }) => " Verify ",
+            _ => " Build ",
+        }
+    }
+
     /// The live gauge line for a running build, or `None`. The spinner
     /// keeps the line visibly alive between units — one large crate can
     /// compile for minutes without a new `Compiling` line.
     pub fn build_progress(&self) -> Option<String> {
         const FRAMES: [char; 8] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧'];
+        // A running verify borrows the build's framed panel — the same
+        // window, per the design: an audit in progress deserves to be as
+        // unmissable as a build, and two transient-panel mechanisms
+        // would be one more thing to keep identical by hand.
+        if let Some(Job::Verify { started, .. }) = &self.job {
+            let frame = FRAMES[self.ticks % FRAMES.len()];
+            return Some(format!(
+                "{frame} verify: checking {} · elapsed {}",
+                self.prefix.display(),
+                format_elapsed(started.elapsed())
+            ));
+        }
         let Some(Job::Build {
             name,
             units_started,
@@ -823,7 +912,9 @@ impl App {
 
         // The command may have changed everything; the report is stale for
         // whatever it touched, and `reload` shows that as "not checked".
-        self.reload()?;
+        // Degraded or loaded, the command's own outcome line below still
+        // stands — the footer's state line carries the degraded fact.
+        let _ = self.reload()?;
         match outcome {
             Ok(()) => self.info(&format!("{} finished", action_label(action))),
             Err(e) => self.error(&format!("{} failed: {e:#}", action_label(action))),
@@ -1367,7 +1458,13 @@ impl App {
         };
         // Per-crate reload keeps the list truthful mid-batch; a failure
         // is recorded on the batch and resurfaces at the summary.
-        let reload_error = self.reload().err().map(|e| format!("{e:#}"));
+        // Degraded is not an error here: the batch summary and the
+        // footer's state line both carry it; only a hard failure is
+        // recorded on the batch.
+        let reload_error = match self.reload() {
+            Ok(_) => None,
+            Err(e) => Some(format!("{e:#}")),
+        };
         let cancelled = matches!(outcome, BuildOutcome::Cancelled);
         let (done, total) = {
             let Some(batch) = self.migrate_batch.as_mut() else {
@@ -1490,7 +1587,7 @@ impl App {
                 "(and a mid-batch list reload failed: {e})"
             )));
         }
-        self.build_report = Some(BuildReport {
+        self.pin_report(BuildReport {
             title: format!("migrate --all: {moved} of {total} migrated"),
             lines,
             failed: !failed.is_empty(),
@@ -1593,7 +1690,10 @@ impl App {
                 // report is pinned first and the reload complains after.
                 if warnings.is_empty() {
                     match reload {
-                        Ok(()) => self.info(&note),
+                        // Degraded included: the note states the
+                        // operation's true outcome, and the footer's
+                        // state line carries the degraded fact itself.
+                        Ok(_) => self.info(&note),
                         Err(e) => self.error(&format!("{note} — but reload failed: {e:#}")),
                     }
                 } else {
@@ -1608,7 +1708,7 @@ impl App {
                             "(and the list reload failed: {e:#})"
                         )));
                     }
-                    self.build_report = Some(BuildReport {
+                    self.pin_report(BuildReport {
                         title: format!("{verb} {name}: warnings"),
                         lines,
                         failed: false,
@@ -1637,7 +1737,7 @@ impl App {
                         "(and the list reload failed: {e:#})"
                     )));
                 }
-                self.build_report = Some(BuildReport {
+                self.pin_report(BuildReport {
                     title: format!("{verb} {name}: completed with a warning"),
                     lines,
                     failed: false,
@@ -1661,7 +1761,7 @@ impl App {
                         "(and the list reload failed: {re:#})"
                     )));
                 }
-                self.build_report = Some(BuildReport {
+                self.pin_report(BuildReport {
                     // "install", not "build": the failure may be the
                     // placement or the manifest commit after a clean
                     // cargo run, and the title must not narrow it.
@@ -1713,14 +1813,40 @@ impl App {
             self.show_help = false;
             return;
         }
-        if self.build_report.is_some()
-            && self.input.is_none()
-            && self.confirm.is_none()
-            && matches!(key.code, KeyCode::Esc | KeyCode::Enter)
-        {
-            self.build_report = None;
-            self.message = None;
-            return;
+        if self.build_report.is_some() && self.input.is_none() && self.confirm.is_none() {
+            match key.code {
+                KeyCode::Esc | KeyCode::Enter => {
+                    self.build_report = None;
+                    self.message = None;
+                    return;
+                }
+                // While the report owns the panel, the arrows scroll it
+                // rather than the list: the report is the thing being
+                // read, and its tail must be reachable — the offset is
+                // clamped at draw time, where the wrap width is known.
+                KeyCode::Up => {
+                    self.report_scroll = self.report_scroll.saturating_sub(1);
+                    return;
+                }
+                KeyCode::Down => {
+                    // No stored bound: a guessed cap here once hid the
+                    // tail of a single line that wrapped fifteen ways.
+                    // saturating_add already prevents a runaway, and the
+                    // renderer clamps the displayed offset against the
+                    // real wrapped height.
+                    self.report_scroll = self.report_scroll.saturating_add(1);
+                    return;
+                }
+                KeyCode::PageUp => {
+                    self.report_scroll = self.report_scroll.saturating_sub(5);
+                    return;
+                }
+                KeyCode::PageDown => {
+                    self.report_scroll = self.report_scroll.saturating_add(5);
+                    return;
+                }
+                _ => {}
+            }
         }
         if self.confirm.is_some() {
             self.on_key_confirm(key);
@@ -1732,6 +1858,46 @@ impl App {
     }
 
     fn on_key_list(&mut self, key: KeyEvent) {
+        // The degraded gate: while the manifest cannot be loaded, the
+        // only keys that mean anything are the ones that help — audit,
+        // retry, help, quit. Everything mutating would bounce off
+        // Manifest::load in its worker anyway; refusing here says why,
+        // once, instead of letting each action discover it noisily. `r`
+        // is deliberately repurposed from checkupdate to a plain reload
+        // retry: the network cannot help a broken manifest, and the one
+        // thing worth re-checking is whether the hand-repair worked.
+        if self.manifest_error.is_some() {
+            match key.code {
+                // B included on purpose: the jump is how one *leaves* a
+                // broken prefix, and it mutates nothing — a gate that
+                // lets you enter degraded but not exit would be a trap.
+                KeyCode::Char('q')
+                | KeyCode::Char('v')
+                | KeyCode::Char('?')
+                | KeyCode::Char('B')
+                | KeyCode::Esc => {}
+                KeyCode::Char('r') => {
+                    match self.reload() {
+                        Ok(ReloadOutcome::Loaded) => {
+                            self.info("the manifest loads again");
+                        }
+                        // Still broken: apply_report already set the
+                        // degraded message, and the footer shows the
+                        // state either way.
+                        Ok(ReloadOutcome::Degraded) => {}
+                        Err(e) => self.error(&format!("reload failed: {e:#}")),
+                    }
+                    return;
+                }
+                _ => {
+                    self.error(
+                        "the manifest cannot be loaded — repair it by hand \
+                         (v lists the findings), then r retries the load",
+                    );
+                    return;
+                }
+            }
+        }
         match key.code {
             KeyCode::Char('q') => {
                 if matches!(self.job, Some(Job::Build { .. })) {
@@ -1790,6 +1956,7 @@ impl App {
                 self.clamp_selection();
             }
             KeyCode::Char('r') => self.start_check(),
+            KeyCode::Char('v') => self.start_verify(),
             KeyCode::Char('s') => self.open_input(InputPurpose::Search),
             // With a search result up, a digit picks a hit and opens the
             // install line with that name — editable, so `--locked` can
@@ -1953,9 +2120,15 @@ impl App {
         // person confirms exactly the row they are looking at.)
         // Races *after* this moment are the per-crate
         // revalidation's job, as ever.
-        if let Err(e) = self.reload() {
-            self.error(&format!("cannot plan the batch: {e:#}"));
-            return;
+        match self.reload() {
+            Err(e) => {
+                self.error(&format!("cannot plan the batch: {e:#}"));
+                return;
+            }
+            // Degraded is not "nothing to migrate": the count is
+            // unknown, and the degraded message says what to do.
+            Ok(ReloadOutcome::Degraded) => return,
+            Ok(ReloadOutcome::Loaded) => {}
         }
         if self.rows.is_empty() {
             self.info("nothing to migrate");
@@ -2043,18 +2216,33 @@ impl App {
         let verb = if pinned { "pinned" } else { "unpinned" };
         match crate::tui_set_pinned(&self.prefix, &name, pinned) {
             Ok(crate::TuiSetPinned::Set { version }) => {
-                if let Err(e) = self.reload() {
-                    self.error(&format!("{verb} {name}, but the reload failed: {e:#}"));
-                    return;
+                match self.reload() {
+                    Err(e) => {
+                        self.error(&format!("{verb} {name}, but the reload failed: {e:#}"));
+                        return;
+                    }
+                    // The pin landed and then the manifest would not
+                    // load back — the degraded message is the headline.
+                    Ok(ReloadOutcome::Degraded) => return,
+                    Ok(ReloadOutcome::Loaded) => {}
                 }
                 self.info(&format!("{verb} {name} at {version}"));
             }
             Ok(crate::TuiSetPinned::Already) => {
                 // The manifest already agrees, so the row was stale —
                 // reload so the screen agrees too, and say what stands.
-                if let Err(e) = self.reload() {
-                    self.error(&format!("{e:#}"));
-                    return;
+                match self.reload() {
+                    Err(e) => {
+                        self.error(&format!("{e:#}"));
+                        return;
+                    }
+                    // Broken between the write and this read: the
+                    // degraded message is what stands, and "already
+                    // pinned" over it would cover the one line that
+                    // matters. The footer is red either way; the
+                    // message should agree with it.
+                    Ok(ReloadOutcome::Degraded) => return,
+                    Ok(ReloadOutcome::Loaded) => {}
                 }
                 self.info(&format!("{name} is already {verb}"));
             }
@@ -2101,9 +2289,13 @@ impl App {
         }
         match crate::tui_remove_one(&self.prefix, &name) {
             Ok(crate::TuiRemove::Removed(bins)) => {
-                if let Err(e) = self.reload() {
-                    self.error(&format!("removed {name}, but the reload failed: {e:#}"));
-                    return;
+                match self.reload() {
+                    Err(e) => {
+                        self.error(&format!("removed {name}, but the reload failed: {e:#}"));
+                        return;
+                    }
+                    Ok(ReloadOutcome::Degraded) => return,
+                    Ok(ReloadOutcome::Loaded) => {}
                 }
                 self.info(&format!("removed {name} ({})", bins.join(", ")));
             }
@@ -2134,9 +2326,13 @@ impl App {
     /// to `self.prefix`, so the jump refuses while any of it is alive:
     /// switching under a running check would apply the old prefix's
     /// results to the new prefix's screen, and every surface would lie.
-    /// The switch commits only on a successful read of the other side —
-    /// a title claiming one prefix over rows read from another would
-    /// lie on every line — and the selection follows the *currently*
+    /// The switch commits on any read that leaves a presentable state —
+    /// loaded, or degraded with the refusal remembered; a person may be
+    /// jumping to a broken prefix precisely to audit it. Only a hard
+    /// failure (the lock that cannot be acquired) rolls back, because
+    /// there is then no state to present at all, and a title claiming
+    /// one prefix over rows read from another would lie on every line.
+    /// The selection follows the *currently*
     /// selected crate by name when it is visible on the other side
     /// under the current filter; otherwise it falls back to the top. No
     /// stronger promise: a migration's retirement reloads the list and
@@ -2158,23 +2354,38 @@ impl App {
         // marks, the report describes its operations).
         let search = self.search_result.take();
         let back = std::mem::replace(&mut self.prefix, dest);
-        if let Err(e) = self.reload() {
-            let failed = std::mem::replace(&mut self.prefix, back);
-            // Best-effort: this read succeeded moments ago; if the world
-            // broke since, the error below still names the real problem.
-            let _ = self.reload();
-            self.search_result = search;
-            self.error(&format!(
-                "cannot read {}: {e:#} — staying here",
-                failed.display()
-            ));
-            return;
-        }
+        // Only hard failures roll back now — the lock that cannot be
+        // acquired, not the manifest that cannot be loaded: a broken
+        // manifest lands in the degraded state instead (reload returns
+        // Ok and remembers the error), because the person may be
+        // jumping there precisely to press v and learn what broke.
+        let outcome = match self.reload() {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                let failed = std::mem::replace(&mut self.prefix, back);
+                // Best-effort: this read succeeded moments ago; if the
+                // world broke since, the error below still names the
+                // real problem.
+                let _ = self.reload();
+                self.search_result = search;
+                self.error(&format!(
+                    "cannot read {}: {e:#} — staying here",
+                    failed.display()
+                ));
+                return;
+            }
+        };
         self.build_report = None;
         self.selected = keep
             .and_then(|name| self.visible().iter().position(|row| row.name == name))
             .unwrap_or(0);
-        self.info(&format!("now at {}", self.prefix.display()));
+        match outcome {
+            ReloadOutcome::Loaded => self.info(&format!("now at {}", self.prefix.display())),
+            // The degraded message apply_report just set is the arrival
+            // announcement — "now at" over it would bury the one thing
+            // worth knowing about the place just arrived at.
+            ReloadOutcome::Degraded => {}
+        }
     }
 
     fn on_key_confirm(&mut self, key: KeyEvent) {
@@ -2288,14 +2499,111 @@ impl App {
 
     /// `r`: the same query `checkupdate` runs, on a thread; the report is
     /// written on the main thread once the answer is in.
+    /// `v`: the read-only audit, `verify_prefix` on a worker — the same
+    /// single-job rule as everything else, and a fresh audit supersedes
+    /// whatever report the last operation left up.
+    fn start_verify(&mut self) {
+        if self.job.is_some() {
+            self.error("busy; wait for the current operation to finish");
+            return;
+        }
+        self.build_report = None;
+        let (tx, rx) = mpsc::channel();
+        let prefix = self.prefix.clone();
+        thread::spawn(move || {
+            let _ = tx.send(crate::verify_prefix(&prefix));
+        });
+        self.job = Some(Job::Verify {
+            rx,
+            started: std::time::Instant::now(),
+        });
+    }
+
+    /// The CLI's severity split, in the TUI's shape: broken invariants
+    /// are a failed report panel, warnings alone a non-failed one —
+    /// sticky either way, because findings are the durable record — and
+    /// a clean prefix is one footer line. The panel carries the same
+    /// finding texts the CLI prints; the two surfaces cannot disagree
+    /// about what was found, only about where it is shown.
+    fn finish_verify(&mut self, result: Result<crate::VerifyReport>) {
+        let report = match result {
+            Ok(report) => report,
+            Err(e) => {
+                self.error(&format!("verify failed: {e:#}"));
+                return;
+            }
+        };
+        if report.errors.is_empty() && report.warnings.is_empty() {
+            // Zero errors implies a counted manifest: None exists only
+            // on the unreadable/unparseable early return, which is an
+            // error by construction.
+            let crates = report.crates.unwrap_or(0);
+            self.info(&format!("verify: ok — {crates} managed crate(s)"));
+            return;
+        }
+        let failed = !report.errors.is_empty();
+        // No sanitize here: VerifyReport is the one sanitization
+        // boundary, established at the source for both renderers — a
+        // second pass would only suggest the first is optional.
+        let mut lines: Vec<String> = report.errors.clone();
+        if !report.warnings.is_empty() {
+            if !lines.is_empty() {
+                lines.push(String::new());
+            }
+            lines.push("warnings:".to_owned());
+            lines.extend(report.warnings.iter().cloned());
+        }
+        let title = if failed {
+            format!(
+                "verify: {} verification error(s), {} warning(s)",
+                report.errors.len(),
+                report.warnings.len()
+            )
+        } else {
+            format!("verify: {} warning(s)", report.warnings.len())
+        };
+        self.pin_report(BuildReport {
+            title,
+            lines,
+            failed,
+        });
+        if failed {
+            // The footer does not guess either: an uncounted manifest —
+            // unreadable or unparseable — reports its errors without
+            // inventing a crate count next to them.
+            let head = match report.crates {
+                Some(crates) => format!("verify: {crates} crate(s), "),
+                None => "verify: ".to_owned(),
+            };
+            self.error(&format!(
+                "{head}{} error(s) — details in the panel; Esc/Enter dismisses",
+                report.errors.len()
+            ));
+        } else {
+            let crates = report.crates.unwrap_or(0);
+            self.warn(&format!(
+                "verify: {crates} crate(s) ok, {} warning(s) in the panel; \
+                 Esc/Enter dismisses",
+                report.warnings.len()
+            ));
+        }
+    }
+
     fn start_check(&mut self) {
         if self.job.is_some() {
             self.error("busy; wait for the current lookup to finish");
             return;
         }
-        if let Err(e) = self.reload() {
-            self.error(&format!("reload failed: {e:#}"));
-            return;
+        match self.reload() {
+            Err(e) => {
+                self.error(&format!("reload failed: {e:#}"));
+                return;
+            }
+            // Degraded is not "nothing installed" — the count is
+            // unknown, and saying zero here would be the reload's
+            // honesty overwritten one line later.
+            Ok(ReloadOutcome::Degraded) => return,
+            Ok(ReloadOutcome::Loaded) => {}
         }
         if self.rows.is_empty() {
             self.info("nothing installed; nothing to check");
@@ -2358,6 +2666,13 @@ impl App {
                 Err(TryRecvError::Empty) => self.job = Some(Job::Check(rx)),
                 Err(TryRecvError::Disconnected) => {
                     bail!("update check worker aborted; the terminal was reset by the panic")
+                }
+            },
+            Job::Verify { rx, started } => match rx.try_recv() {
+                Ok(result) => self.finish_verify(result),
+                Err(TryRecvError::Empty) => self.job = Some(Job::Verify { rx, started }),
+                Err(TryRecvError::Disconnected) => {
+                    bail!("verify worker aborted; the terminal was reset by the panic")
                 }
             },
             Job::Search { query, rx } => match rx.try_recv() {
@@ -2478,9 +2793,15 @@ impl App {
             }
         };
         let persisted = report.store(&self.cache);
-        if let Err(e) = self.apply_report(Some(&report)) {
-            self.error(&format!("reload failed: {e:#}"));
-            return;
+        match self.apply_report(Some(&report)) {
+            Err(e) => {
+                self.error(&format!("reload failed: {e:#}"));
+                return;
+            }
+            // "checked: 0 update(s)" over a manifest that just refused
+            // to load would be an invented number.
+            Ok(ReloadOutcome::Degraded) => return,
+            Ok(ReloadOutcome::Loaded) => {}
         }
         let n = self.updates_available();
         // The count matches the Updates tab — what `U` would do. A pinned
@@ -2508,9 +2829,16 @@ impl App {
         match result {
             Ok(hits) if hits.is_empty() => self.info(&format!("no crates match `{query}`")),
             Ok(hits) => {
-                if let Err(e) = self.reload() {
-                    self.error(&format!("reload failed: {e:#}"));
-                    return;
+                match self.reload() {
+                    Err(e) => {
+                        self.error(&format!("reload failed: {e:#}"));
+                        return;
+                    }
+                    // The hits are real, but their [installed] marks
+                    // would come from a manifest that did not load; the
+                    // degraded message outranks a panel built on it.
+                    Ok(ReloadOutcome::Degraded) => return,
+                    Ok(ReloadOutcome::Loaded) => {}
                 }
                 let installed: BTreeMap<String, String> = self
                     .rows
@@ -2543,6 +2871,15 @@ impl App {
 
     fn select_prev(&mut self) {
         self.selected = self.selected.saturating_sub(1);
+    }
+
+    /// The one door to the sticky report panel: pinning a new report
+    /// resets the scroll, so the reader starts at the headline — a
+    /// leftover offset from the previous report would open a fresh one
+    /// somewhere in its middle.
+    fn pin_report(&mut self, report: BuildReport) {
+        self.report_scroll = 0;
+        self.build_report = Some(report);
     }
 
     fn info(&mut self, text: &str) {
@@ -2919,7 +3256,7 @@ mod tests {
             manifest.store(prefix).unwrap();
         }
         let mut app = App::new(&here).unwrap();
-        app.reload().unwrap();
+        let _ = app.reload().unwrap();
         // Select foo on this side…
         let pos = app
             .visible()
@@ -2977,7 +3314,7 @@ mod tests {
     }
 
     #[test]
-    fn a_jump_refuses_while_anything_runs_and_rolls_back_on_a_bad_read() {
+    fn a_jump_refuses_while_anything_runs_and_lands_degraded_on_a_broken_manifest() {
         let root = std::env::temp_dir().join("cargo-lbin-test-tui-jump-guard");
         let _ = std::fs::remove_dir_all(&root);
         let here = root.join("here");
@@ -2989,7 +3326,7 @@ mod tests {
         std::fs::write(broken.join("share/cargo-lbin/manifest.json"), "not json").unwrap();
 
         let mut app = App::new(&here).unwrap();
-        app.reload().unwrap();
+        let _ = app.reload().unwrap();
 
         // Guarded: with a job alive the prefix stays put.
         let (_tx, rx) = mpsc::channel();
@@ -3013,24 +3350,31 @@ mod tests {
         assert_eq!(app.prefix, here, "a live job holds the prefix in place");
         app.job = None;
 
-        // Committed only on a successful read: an unreadable other side
-        // reports and rolls back — the search panel included, even
-        // though the rollback's own reload dismisses it in passing.
+        // A broken manifest no longer bounces the jump: the landing is
+        // the degraded state, because the person may be jumping there
+        // precisely to press v and learn what broke. The old prefix's
+        // search panel drops as on any committed jump — its [installed]
+        // marks were the old prefix's facts. Rollback still exists, but
+        // for hard failures (the lock cannot be acquired), not for the
+        // very states verify diagnoses.
         app.search_result = Some(SearchResult {
             query: "foo".into(),
             hits: Vec::new(),
             installed: std::collections::BTreeMap::new(),
         });
-        app.jump_to_prefix(broken);
-        assert_eq!(app.prefix, here, "a failed read never commits the jump");
-        assert!(
-            app.visible().is_empty(),
-            "the rows still describe `here` (whose manifest is empty), \
-             not the unreadable other side"
+        app.jump_to_prefix(broken.clone());
+        assert_eq!(
+            app.prefix, broken,
+            "the jump commits — degraded, not refused"
         );
         assert!(
-            app.search_result.is_some(),
-            "a jump that did not happen does not cost the person their hits"
+            app.manifest_error.is_some(),
+            "the landing remembers why the list is empty"
+        );
+        assert!(app.visible().is_empty());
+        assert!(
+            app.search_result.is_none(),
+            "a committed jump drops the old prefix's panel"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -3056,7 +3400,7 @@ mod tests {
         }
         manifest.store(&prefix).unwrap();
         let mut app = App::new(&prefix).unwrap();
-        app.reload().unwrap();
+        let _ = app.reload().unwrap();
 
         // A user-writable prefix: the decision lands in place — no
         // terminal handoff is queued, the file and the row are gone,
@@ -3164,7 +3508,7 @@ mod tests {
         );
         manifest.store(&prefix).unwrap();
         let mut app = App::new(&prefix).unwrap();
-        app.reload().unwrap();
+        let _ = app.reload().unwrap();
         app.selected = 0;
 
         // In place: no handoff queued, the bit lands on disk, the row
@@ -3354,6 +3698,156 @@ mod tests {
             app.pending_migrate.is_none(),
             "nothing was silently continued"
         );
+        let _ = std::fs::remove_dir_all(&prefix);
+    }
+
+    #[test]
+    fn a_broken_manifest_degrades_the_session_instead_of_ending_it() {
+        let prefix = std::env::temp_dir().join("cargo-lbin-test-tui-degraded");
+        let _ = std::fs::remove_dir_all(&prefix);
+        std::fs::create_dir_all(prefix.join("share/cargo-lbin")).unwrap();
+        std::fs::create_dir_all(prefix.join("bin")).unwrap();
+        std::fs::write(
+            crate::Manifest::path(&prefix),
+            r#"{"crates":{"a":{"version":"nope","bins":["x"]}}}"#,
+        )
+        .unwrap();
+        // The session starts: the refusal is a state to present, not a
+        // startup error — dying here would take the v key with it.
+        let mut app = App::new(&prefix).expect("degraded, not dead");
+        assert!(app.manifest_error.is_some());
+        assert!(app.rows.is_empty());
+
+        // Mutating keys are refused with the reason, not forwarded to
+        // workers that would bounce off Manifest::load noisily.
+        app.on_key(KeyEvent::from(KeyCode::Char('u')));
+        assert!(app.confirm.is_none() && app.input.is_none());
+        assert!(
+            app.message
+                .as_ref()
+                .is_some_and(|m| m.text.contains("repair")),
+            "the refusal names the way out: {:?}",
+            app.message.as_ref().map(|m| &m.text)
+        );
+
+        // v stays reachable — the whole point of degrading.
+        app.on_key(KeyEvent::from(KeyCode::Char('v')));
+        assert!(
+            app.busy().is_some(),
+            "the audit runs from the degraded state"
+        );
+        app.job = None; // the verify worker's slot, released for the test
+
+        // ? opens the help — which in this state is the degraded page,
+        // drawn from manifest_error; the gate lets the key through and
+        // the page must not advertise the doors the gate locked.
+        app.on_key(KeyEvent::from(KeyCode::Char('?')));
+        assert!(app.show_help, "help is one of the keys that still work");
+        app.on_key(KeyEvent::from(KeyCode::Esc));
+        assert!(!app.show_help);
+
+        // B stays reachable too: the jump is how one *leaves* a broken
+        // prefix, and a gate that lets you in but not out is a trap.
+        app.on_key(KeyEvent::from(KeyCode::Char('B')));
+        assert!(
+            !app.message
+                .as_ref()
+                .is_some_and(|m| m.text.contains("repair")),
+            "B passed the gate: {:?}",
+            app.message.as_ref().map(|m| &m.text)
+        );
+
+        // Hand-repair, then r retries the load and the session recovers.
+        std::fs::write(crate::Manifest::path(&prefix), r#"{"crates":{}}"#).unwrap();
+        app.on_key(KeyEvent::from(KeyCode::Char('r')));
+        assert!(app.manifest_error.is_none(), "{:?}", app.manifest_error);
+        assert!(
+            app.message
+                .as_ref()
+                .is_some_and(|m| m.text.contains("loads again")),
+            "recovery is announced: {:?}",
+            app.message.as_ref().map(|m| &m.text)
+        );
+        let _ = std::fs::remove_dir_all(&prefix);
+    }
+
+    #[test]
+    fn a_mid_session_breakage_never_reports_an_invented_zero() {
+        // The manifest breaks while the session is open; every caller
+        // of reload() must then present the degraded fact, not its own
+        // happy-path sentence over an empty rows vector.
+        let prefix = std::env::temp_dir().join("cargo-lbin-test-tui-midbreak");
+        let _ = std::fs::remove_dir_all(&prefix);
+        std::fs::create_dir_all(prefix.join("share/cargo-lbin")).unwrap();
+        std::fs::create_dir_all(prefix.join("bin")).unwrap();
+        crate::Manifest::default().store(&prefix).unwrap();
+        let mut app = App::new(&prefix).unwrap();
+        assert!(app.manifest_error.is_none());
+
+        std::fs::write(crate::Manifest::path(&prefix), "not json").unwrap();
+        // r is checkupdate while healthy; its first act is a reload,
+        // which lands degraded — and must not say "nothing installed;
+        // nothing to check": the count is unknown, not zero.
+        app.on_key(KeyEvent::from(KeyCode::Char('r')));
+        assert!(app.manifest_error.is_some());
+        let text = app
+            .message
+            .as_ref()
+            .map(|m| m.text.clone())
+            .unwrap_or_default();
+        assert!(
+            !text.contains("nothing installed"),
+            "the reload's honesty survived its caller: {text}"
+        );
+        assert!(text.contains("cannot be loaded"), "{text}");
+        let _ = std::fs::remove_dir_all(&prefix);
+    }
+
+    #[test]
+    fn a_jump_into_degraded_announces_the_breakage_not_the_arrival() {
+        let root = std::env::temp_dir().join("cargo-lbin-test-tui-jump-announce");
+        let _ = std::fs::remove_dir_all(&root);
+        let here = root.join("here");
+        let broken = root.join("broken");
+        std::fs::create_dir_all(here.join("share/cargo-lbin")).unwrap();
+        std::fs::create_dir_all(here.join("bin")).unwrap();
+        crate::Manifest::default().store(&here).unwrap();
+        std::fs::create_dir_all(broken.join("share/cargo-lbin")).unwrap();
+        std::fs::write(broken.join("share/cargo-lbin/manifest.json"), "not json").unwrap();
+        let mut app = App::new(&here).unwrap();
+        app.jump_to_prefix(broken.clone());
+        assert_eq!(app.prefix, broken);
+        let text = app
+            .message
+            .as_ref()
+            .map(|m| m.text.clone())
+            .unwrap_or_default();
+        assert!(
+            !text.contains("now at"),
+            "\"now at\" would bury the one thing worth knowing: {text}"
+        );
+        assert!(text.contains("cannot be loaded"), "{text}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_fresh_report_opens_at_its_headline() {
+        // The scroll survives dismissal only as a field; pinning the
+        // next report must zero it, or a long verify's leftover offset
+        // would open the next failure somewhere in its middle.
+        let prefix = std::env::temp_dir().join("cargo-lbin-test-tui-scroll");
+        let _ = std::fs::create_dir_all(prefix.join("share/cargo-lbin"));
+        let _ = std::fs::create_dir_all(prefix.join("bin"));
+        let mut app = App::new(&prefix).unwrap();
+        app.report_scroll = 7;
+        app.finish_verify(Ok(crate::VerifyReport {
+            crates: Some(1),
+            errors: vec!["`foo`: managed binary is missing".into()],
+            warnings: Vec::new(),
+        }));
+        let report = app.build_report.as_ref().expect("findings pin a panel");
+        assert!(report.failed, "an invariant violation is a failed panel");
+        assert_eq!(app.report_scroll, 0, "a fresh report starts at the top");
         let _ = std::fs::remove_dir_all(&prefix);
     }
 
