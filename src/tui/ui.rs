@@ -191,7 +191,13 @@ fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
 /// The sticky report panel: a failure's tail and log path, or a
 /// success's warnings. Split from `draw_details` for exactly the reason
 /// clippy suggests — it is its own panel with its own rules.
-fn draw_report(frame: &mut Frame, report: &crate::tui::BuildReport, scroll: u16, area: Rect) {
+fn draw_report(
+    frame: &mut Frame,
+    app: &App,
+    report: &crate::tui::BuildReport,
+    scroll: u16,
+    area: Rect,
+) {
     let color = if report.failed {
         Color::Red
     } else {
@@ -216,6 +222,9 @@ fn draw_report(frame: &mut Frame, report: &crate::tui::BuildReport, scroll: u16,
     let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
     let total_rows = u16::try_from(paragraph.line_count(inner_w)).unwrap_or(u16::MAX);
     let max_scroll = total_rows.saturating_sub(inner_h);
+    // Written back for the key handler's clamp; display still clamps
+    // below, so a stale bound costs one keypress, never a wrong frame.
+    app.report_scroll_max.set(max_scroll);
     let effective = scroll.min(max_scroll);
     let block = Block::default()
         .borders(Borders::ALL)
@@ -232,7 +241,7 @@ fn draw_details(frame: &mut Frame, app: &App, area: Rect) {
     // A build's report owns the panel until dismissed: either kind must
     // survive longer than one keypress.
     if let Some(report) = &app.build_report {
-        draw_report(frame, report, app.report_scroll, area);
+        draw_report(frame, app, report, app.report_scroll, area);
         return;
     }
     // A finished search takes over the panel until dismissed; it is the

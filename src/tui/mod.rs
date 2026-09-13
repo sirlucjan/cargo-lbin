@@ -442,6 +442,13 @@ pub struct App {
     /// Sticky-report scroll offset, reset by `pin_report`, clamped at
     /// draw time; a report that hides its own tail is no durable record.
     pub report_scroll: u16,
+    /// The report panel's real scroll bound, written back by the
+    /// renderer each frame (a `Cell`: `draw` takes `&App`). The key
+    /// handler clamps against it, so the offset can no longer run past
+    /// the tail and demand symmetric presses on the way back; the
+    /// renderer still clamps for display, so a stale frame's bound
+    /// costs one keypress, never a wrong picture.
+    pub report_scroll_max: std::cell::Cell<u16>,
     pub show_help: bool,
     pending: Option<PendingAction>,
     /// A captured install waiting for the run loop (sudo preauth first).
@@ -507,6 +514,7 @@ impl App {
             build_report: None,
             manifest_error: None,
             report_scroll: 0,
+            report_scroll_max: std::cell::Cell::new(0),
             pending_build: None,
             ticks: 0,
             show_help: false,
@@ -1620,16 +1628,21 @@ impl App {
                     self.message = None;
                     return;
                 }
-                // While the report owns the panel the arrows scroll it — its tail
-                // must be reachable; clamped at draw time, where the width is known.
+                // While the report owns the panel the arrows scroll it — its
+                // tail must be reachable. Down-moves clamp against the bound
+                // the renderer wrote back last frame (not a guessed cap — the
+                // old guess once hid the tail of a line that wrapped fifteen
+                // ways), so the offset never runs past the tail and Up answers
+                // on the first press.
                 KeyCode::Up => {
                     self.report_scroll = self.report_scroll.saturating_sub(1);
                     return;
                 }
                 KeyCode::Down => {
-                    // No stored bound: a guessed cap once hid the tail of a line that
-                    // wrapped fifteen ways; the renderer clamps against the real height.
-                    self.report_scroll = self.report_scroll.saturating_add(1);
+                    self.report_scroll = self
+                        .report_scroll
+                        .saturating_add(1)
+                        .min(self.report_scroll_max.get());
                     return;
                 }
                 KeyCode::PageUp => {
@@ -1637,7 +1650,18 @@ impl App {
                     return;
                 }
                 KeyCode::PageDown => {
-                    self.report_scroll = self.report_scroll.saturating_add(5);
+                    self.report_scroll = self
+                        .report_scroll
+                        .saturating_add(5)
+                        .min(self.report_scroll_max.get());
+                    return;
+                }
+                KeyCode::Home => {
+                    self.report_scroll = 0;
+                    return;
+                }
+                KeyCode::End => {
+                    self.report_scroll = self.report_scroll_max.get();
                     return;
                 }
                 _ => {}
@@ -3495,6 +3519,34 @@ mod tests {
         );
         assert!(text.contains("cannot be loaded"), "{text}");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_report_scroll_stops_at_the_rendered_bound() {
+        // The old debt: a held Down ran the offset far past the tail and
+        // Up owed symmetric presses; the renderer's written-back bound
+        // now clamps at the keypress, and End/Home jump to it and back.
+        let prefix = std::env::temp_dir().join("cargo-lbin-test-tui-clamp");
+        let _ = std::fs::create_dir_all(prefix.join("share/cargo-lbin"));
+        let _ = std::fs::create_dir_all(prefix.join("bin"));
+        let mut app = App::new(&prefix).unwrap();
+        app.pin_report(BuildReport {
+            title: "x".into(),
+            lines: vec!["l".into(); 40],
+            failed: true,
+        });
+        app.report_scroll_max.set(9); // what a draw of this report wrote back
+        for _ in 0..50 {
+            app.on_key(KeyEvent::from(KeyCode::Down));
+        }
+        assert_eq!(app.report_scroll, 9, "Down cannot outrun the bound");
+        app.on_key(KeyEvent::from(KeyCode::Up));
+        assert_eq!(app.report_scroll, 8, "Up answers on the first press");
+        app.on_key(KeyEvent::from(KeyCode::Home));
+        assert_eq!(app.report_scroll, 0);
+        app.on_key(KeyEvent::from(KeyCode::End));
+        assert_eq!(app.report_scroll, 9);
+        let _ = std::fs::remove_dir_all(&prefix);
     }
 
     #[test]
