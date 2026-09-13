@@ -103,7 +103,8 @@ pub fn search(query: &str, limit: usize) -> Result<Vec<Hit>> {
         bail!("empty search query");
     }
     throttle();
-    let response = ureq::get(API_BASE)
+    let response = crate::index::agent()
+        .get(API_BASE)
         .set("User-Agent", USER_AGENT)
         .query("q", query)
         .query("per_page", &limit.to_string())

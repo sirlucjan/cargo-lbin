@@ -9,6 +9,31 @@ use semver::Version;
 use serde::Deserialize;
 
 const INDEX_BASE: &str = "https://index.crates.io";
+/// Connect and whole-request limits for every crates.io call. A stalled
+/// response — the TCP alive, the bytes not coming — would otherwise hang
+/// `checkupdate`/`search`/`info` forever: ureq's default has no overall
+/// timeout, Ctrl-C saves the CLI, and the TUI's one-shot workers have no
+/// cancel door, so the limit here is what guarantees a worker returns.
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The one shared agent behind both crates.io boundaries (`index` and
+/// `api`): one place for the timeout policy, so the two clients cannot
+/// drift on it.
+pub(crate) fn agent() -> &'static ureq::Agent {
+    static AGENT: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
+    AGENT.get_or_init(|| agent_with(CONNECT_TIMEOUT, REQUEST_TIMEOUT))
+}
+
+/// The constructor the shared agent uses, split out so a test can build
+/// one with a short limit and prove the limit actually binds.
+fn agent_with(connect: std::time::Duration, overall: std::time::Duration) -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .timeout_connect(connect)
+        .timeout(overall)
+        .build()
+}
+
 pub(crate) const USER_AGENT: &str = concat!(
     env!("CARGO_PKG_NAME"),
     "/",
@@ -69,7 +94,7 @@ pub fn not_found(name: &str) -> anyhow::Error {
 /// crate — an answer, distinct from a failed request.
 pub fn releases(name: &str) -> Result<Option<Vec<Release>>> {
     let url = format!("{INDEX_BASE}/{}", index_path(name));
-    let response = match ureq::get(&url).set("User-Agent", USER_AGENT).call() {
+    let response = match agent().get(&url).set("User-Agent", USER_AGENT).call() {
         Ok(response) => response,
         Err(ureq::Error::Status(404, _)) => return Ok(None),
         Err(other) => bail!("index request for `{name}` failed: {other}"),
@@ -179,6 +204,32 @@ pub fn latest_relevant(versions: &[Version], current: &Version) -> Option<Versio
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_request_timeout_actually_binds() {
+        use std::io::Read;
+        use std::time::{Duration, Instant};
+        // A server that accepts and never answers — the exact stall the
+        // overall timeout exists for; without it this read blocks forever.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hold = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = sock.read(&mut buf);
+            std::thread::sleep(Duration::from_secs(5));
+        });
+        let agent = agent_with(Duration::from_millis(500), Duration::from_millis(500));
+        let started = Instant::now();
+        let result = agent.get(&format!("http://{addr}/")).call();
+        assert!(result.is_err(), "a stalled response must be an error");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "the limit binds: {:?}",
+            started.elapsed()
+        );
+        drop(hold);
+    }
 
     #[test]
     fn index_path_matches_rfc_scheme() {
