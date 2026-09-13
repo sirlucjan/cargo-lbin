@@ -105,6 +105,7 @@ cargo lbin tui
 | `migrate <crate>... --to <prefix> [--yes]` | Rebuild installed crates under another prefix, then retire them here |
 | `migrate --all --to <prefix> [--yes]` | Migrate every managed crate to another prefix |
 | `verify` | Check the manifest's claims against the disk, read-only; non-zero exit on verification errors |
+| `clean [--dry-run] [--stages] [--logs-older-than DAYS]` | Remove build debris from the cache; every removal is opt-in — name at least one of the two |
 | `search <terms>... [--limit N]` | Find crates by keyword |
 | `info <crate>...` | Show exact-name crate information and installed state |
 | `tui` | Interactive frontend over the same operations, when the `tui` feature is enabled |
@@ -545,6 +546,10 @@ its key bar advertises only what still works. One honest note on
 scope: the `v` audit itself never writes, while a TUI *session*, like
 every TUI session, prepares the state lock when it starts — strict
 read-only-ness belongs to `cargo lbin verify`, the command.
+
+## Clean
+
+The mutating half of the pair `verify` opens: `verify` names cache debris read-only, `clean` removes it — through the very same liveness test, so the two can never disagree about what debris is. Every removal is opt-in — a mutating command does nothing it was not explicitly asked to do, and bare `clean` is an error. `--stages` removes the stage directories `verify` reports as ownerless, through the very same liveness test, so the two can never disagree about what ownerless means. Ownerless is a heuristic, not proof: the owning cargo-lbin process is gone (a dead PID, or a name that is not a PID at all), but a build it spawned may survive it and still hold the directory — which is why stage removal is explicit and never a default. `--logs-older-than DAYS` removes failure logs past that age; the person names the retention, lbin does not invent one. Unlike `verify` (read-only, silent over an unreadable cache), `clean` refuses to report success over a cache it could not read: a missing directory is an empty one, any other read error is an error. `--dry-run` lists what would go and removes nothing. The cache is the user's own: no lock is taken, no sudo is ever used, and a stage owned by a live cargo-lbin run — on any prefix — is spared by the liveness test itself. Failed removals are reported and the command exits non-zero; `nothing to clean` exits zero.
 
 ## Remove
 

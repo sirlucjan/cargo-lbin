@@ -119,6 +119,29 @@ enum Cmd {
     /// otherwise describes the state and leaves the decision to you;
     /// verify itself never writes, prompts, or escalates.
     Verify,
+    /// Remove build debris from the cache; every removal is opt-in
+    ///
+    /// `--stages` removes the stage directories `verify` reports as
+    /// ownerless — the set is `verify`'s own, so the two cannot drift.
+    /// Ownerless is a liveness heuristic, not proof: the owning
+    /// cargo-lbin is gone, but a build it spawned may survive it and
+    /// still hold the directory, which is why removal is explicit and
+    /// never a default. `--logs-older-than DAYS` removes failure logs
+    /// past that age — the person names the retention, lbin does not
+    /// invent one. The cache is the user's own; no lock is taken and
+    /// sudo is never used. `--dry-run` lists what would go and removes
+    /// nothing.
+    Clean {
+        /// List what would be removed without removing anything
+        #[arg(long)]
+        dry_run: bool,
+        /// Remove stage directories whose owning cargo-lbin is gone
+        #[arg(long)]
+        stages: bool,
+        /// Remove build logs older than this many days
+        #[arg(long, value_name = "DAYS")]
+        logs_older_than: Option<u64>,
+    },
     /// Pin crates to their installed version
     ///
     /// A pin declares the version, not just a hold against the next
@@ -292,6 +315,11 @@ fn main() -> ExitCode {
         Cmd::Info { ref crates } => cmd_info(&cli.prefix, crates),
         Cmd::Search { ref query, limit } => cmd_search(&cli.prefix, query, limit),
         Cmd::Checkupdate { json } => return cmd_checkupdate(&cli.prefix, json),
+        Cmd::Clean {
+            dry_run,
+            stages,
+            logs_older_than,
+        } => cmd_clean(dry_run, stages, logs_older_than),
         Cmd::Completions { shell } => {
             cmd_completions(shell);
             Ok(())
@@ -1124,19 +1152,19 @@ pub(crate) fn verify_prefix(
     // one place that lists it. One aggregated finding — forty directories
     // must not bury the one that matters; an unreadable cache contributes
     // silence, not failure.
-    if let Ok(cache) = cache_dir() {
-        let stale = stale_stages(&cache);
-        if !stale.is_empty() {
-            warnings.push(format!(
-                "{} stage director{} under {} whose owning cargo-lbin process is \
-                 gone — possible leftover build debris; inspect and remove when \
-                 safe (a PID can be reused, and an orphaned build may still hold \
-                 the directory)",
-                stale.len(),
-                if stale.len() == 1 { "y" } else { "ies" },
-                cache.join("stage").display()
-            ));
-        }
+    if let Ok(cache) = cache_dir()
+        && let Ok(stale) = scan_stale_stages(&cache)
+        && !stale.is_empty()
+    {
+        warnings.push(format!(
+            "{} stage director{} under {} whose owning cargo-lbin process is \
+             gone — possible leftover build debris; inspect and remove when \
+             safe (a PID can be reused, and an orphaned build may still hold \
+             the directory)",
+            stale.len(),
+            if stale.len() == 1 { "y" } else { "ies" },
+            cache.join("stage").display()
+        ));
     }
     // Sanitized once, at the report boundary, for both renderers — and
     // last, so the stale-stage line is covered: everything here travelled
@@ -1345,14 +1373,25 @@ fn verify_entries(prefix: &Path, manifest: &Manifest) -> (Vec<String>, Vec<Strin
 }
 
 /// Stage directories not owned by a live PID — dead-PID and non-PID
-/// names alike are debris; stages are named by PID and kept on failure,
-/// so liveness is the exact test.
-fn stale_stages(cache: &Path) -> Vec<PathBuf> {
+/// names alike; stages are named by the owning cargo-lbin's PID and
+/// kept on failure. Owner liveness is what the scan measures, and only
+/// that: a heuristic, not proof a build is dead — an orphaned cargo may
+/// outlive the cargo-lbin that spawned it and still hold the directory.
+/// The one definition of ownerless, shared by `verify` and `clean`;
+/// error *policy* is the caller's: read errors come back unflattened,
+/// verify silences them (read-only, a possibly-wrong warning is worse
+/// than none), clean propagates them (a mutating command must not
+/// report success over a cache it could not read). NotFound is an
+/// empty cache for both.
+fn scan_stale_stages(cache: &Path) -> std::io::Result<Vec<PathBuf>> {
     let mut stale = Vec::new();
-    let Ok(entries) = fs::read_dir(cache.join("stage")) else {
-        return stale;
+    let entries = match fs::read_dir(cache.join("stage")) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(stale),
+        Err(e) => return Err(e),
     };
-    for entry in entries.flatten() {
+    for entry in entries {
+        let entry = entry?;
         let alive = entry
             .file_name()
             .to_str()
@@ -1363,7 +1402,132 @@ fn stale_stages(cache: &Path) -> Vec<PathBuf> {
         }
     }
     stale.sort();
-    stale
+    Ok(stale)
+}
+
+/// The mutating half of the pair `verify` opens: `verify` names the
+/// debris read-only, `clean` removes it — through the very same
+/// `scan_stale_stages`, so the two can never disagree on what debris is.
+/// Old failure logs join in: they are written on every failed build
+/// and nothing else ever prunes them. The cache is the user's own —
+/// no prefix lock, no sudo; a PID alive on *any* prefix's build is
+/// spared by the liveness test itself.
+fn cmd_clean(dry_run: bool, stages: bool, logs_older_than_days: Option<u64>) -> Result<()> {
+    clean_cache(&cache_dir()?, dry_run, stages, logs_older_than_days)
+}
+
+fn clean_cache(
+    cache: &Path,
+    dry_run: bool,
+    stages: bool,
+    logs_older_than_days: Option<u64>,
+) -> Result<()> {
+    // Every removal is opt-in: a mutating command does nothing it was
+    // not explicitly asked to do.
+    if !stages && logs_older_than_days.is_none() {
+        bail!("nothing requested: name --stages and/or --logs-older-than DAYS");
+    }
+    // The removal set for stages is scan_stale_stages' answer — verify's
+    // function, so diagnosis and cleanup cannot drift. But that answer
+    // is a liveness heuristic over the *owning* cargo-lbin, not proof
+    // of a dead build: an orphaned cargo may survive its parent and
+    // still hold the directory — which is why --stages is opt-in and
+    // this loop stays behind it. Unlike verify (read-only, silence over
+    // a possibly-wrong warning), a mutating command must not report
+    // success over a cache it could not read: NotFound is an empty
+    // cache, every other read error is an error.
+    let stale = if stages {
+        scan_stale_stages(cache)
+            .with_context(|| format!("reading {}", cache.join("stage").display()))?
+    } else {
+        Vec::new()
+    };
+    // Both range checks are errors, never a silently different cutoff:
+    // checked_mul so a u64 from the CLI cannot wrap, and checked_sub so
+    // a value that multiplies fine but predates the epoch cannot turn
+    // "remove logs older than N" into "scan nothing and report success".
+    let cutoff = match logs_older_than_days {
+        Some(days) => {
+            let seconds = days
+                .checked_mul(86_400)
+                .context("--logs-older-than is too large")?;
+            Some(
+                std::time::SystemTime::now()
+                    .checked_sub(std::time::Duration::from_secs(seconds))
+                    .context("--logs-older-than is too large")?,
+            )
+        }
+        None => None,
+    };
+    let mut old_logs = Vec::new();
+    if let Some(cutoff) = cutoff {
+        let logs_dir = cache.join("logs");
+        let entries = match fs::read_dir(&logs_dir) {
+            Ok(entries) => Some(entries),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => {
+                return Err(e).with_context(|| format!("reading {}", logs_dir.display()));
+            }
+        };
+        if let Some(entries) = entries {
+            for entry in entries {
+                let entry = entry.with_context(|| format!("reading {}", logs_dir.display()))?;
+                let path = entry.path();
+                if path.extension().is_none_or(|e| e != "log") {
+                    continue;
+                }
+                // An unreadable log is an error, not a skipped removal:
+                // the person asked for a retention, and "done" must mean
+                // the whole set was considered.
+                let modified = entry
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .with_context(|| format!("inspecting {}", path.display()))?;
+                if modified < cutoff {
+                    old_logs.push(path);
+                }
+            }
+        }
+    }
+    old_logs.sort();
+    if stale.is_empty() && old_logs.is_empty() {
+        println!("nothing to clean");
+        return Ok(());
+    }
+    let verb = if dry_run { "would remove" } else { "removing" };
+    let mut failures = 0usize;
+    for dir in &stale {
+        println!("{verb} ownerless stage {}", dir.display());
+        if !dry_run && let Err(e) = fs::remove_dir_all(dir) {
+            eprintln!("error: removing {}: {e}", dir.display());
+            failures += 1;
+        }
+    }
+    let days = logs_older_than_days.unwrap_or_default();
+    for log in &old_logs {
+        println!("{verb} log older than {days} day(s): {}", log.display());
+        if !dry_run && let Err(e) = fs::remove_file(log) {
+            eprintln!("error: removing {}: {e}", log.display());
+            failures += 1;
+        }
+    }
+    // Failures preempt the summary: "removed 3 stage(s)" counts
+    // candidates, and printing it above "1 removal(s) failed" would be
+    // the summary contradicting the verdict. The per-item lines already
+    // say what was attempted.
+    if failures > 0 {
+        bail!("{failures} removal(s) failed");
+    }
+    let done = if dry_run { "would remove" } else { "removed" };
+    let mut parts = Vec::new();
+    if stages {
+        parts.push(format!("{} ownerless stage(s)", stale.len()));
+    }
+    if logs_older_than_days.is_some() {
+        parts.push(format!("{} old log(s)", old_logs.len()));
+    }
+    println!("{done} {}", parts.join(", "));
+    Ok(())
 }
 
 /// The CLI's words over `verify_prefix`'s data: findings to stderr,
@@ -4373,13 +4537,83 @@ mod tests {
     }
 
     #[test]
-    fn stale_stages_reports_dead_pids_and_spares_the_living() {
+    fn clean_removes_exactly_what_was_asked_and_nothing_unasked() {
+        // The contract after the opt-in turn: nothing requested is an
+        // error; --stages removes exactly scan_stale_stages' answer (the
+        // lockstep with verify) and spares logs; a named retention takes
+        // old logs and spares stages; dry-run touches nothing; an
+        // overflowed retention errors without removing a byte.
+        let cache = std::env::temp_dir().join("cargo-lbin-test-clean");
+        let _ = fs::remove_dir_all(&cache);
+        let live = cache.join("stage").join(std::process::id().to_string());
+        let dead = cache.join("stage").join(u32::MAX.to_string());
+        let junk = cache.join("stage").join("not-a-pid");
+        for d in [&live, &dead, &junk] {
+            fs::create_dir_all(d).unwrap();
+        }
+        let logs = cache.join("logs");
+        fs::create_dir_all(&logs).unwrap();
+        let old_log = logs.join("build-old.log");
+        let new_log = logs.join("build-new.log");
+        fs::write(&old_log, "old").unwrap();
+        fs::write(&new_log, "new").unwrap();
+        let ancient = std::time::SystemTime::now() - std::time::Duration::from_secs(90 * 86_400);
+        fs::File::options()
+            .write(true)
+            .open(&old_log)
+            .unwrap()
+            .set_modified(ancient)
+            .unwrap();
+
+        // A mutating command does nothing it was not asked to do.
+        assert!(clean_cache(&cache, false, false, None).is_err());
+        assert!(
+            dead.exists() && old_log.exists(),
+            "the refusal removed nothing"
+        );
+
+        // The removal set is scan_stale_stages' answer, by construction.
+        let named = scan_stale_stages(&cache).unwrap();
+        assert!(named.contains(&dead) && named.contains(&junk) && !named.contains(&live));
+
+        clean_cache(&cache, true, true, Some(30)).unwrap();
+        assert!(
+            dead.exists() && junk.exists() && old_log.exists(),
+            "dry-run removed something"
+        );
+
+        // An absurd DAYS is an error, never a wrapped cutoff.
+        assert!(clean_cache(&cache, false, true, Some(u64::MAX)).is_err());
+        assert!(
+            dead.exists() && old_log.exists(),
+            "the overflow attempt removed nothing"
+        );
+
+        // Logs alone: stages are spared even when ownerless.
+        clean_cache(&cache, false, false, Some(30)).unwrap();
+        assert!(dead.exists() && junk.exists(), "unasked stages are spared");
+        assert!(!old_log.exists(), "the old log is gone");
+        assert!(new_log.exists(), "the fresh log stays");
+
+        // Stages alone: exactly verify's set, logs untouched.
+        clean_cache(&cache, false, true, None).unwrap();
+        assert!(live.exists(), "the living stage is spared");
+        assert!(
+            !dead.exists() && !junk.exists(),
+            "verify-named debris is gone"
+        );
+        assert!(new_log.exists(), "unasked logs are spared");
+        let _ = fs::remove_dir_all(&cache);
+    }
+
+    #[test]
+    fn scan_stale_stages_reports_dead_pids_and_spares_the_living() {
         let root = std::env::temp_dir().join("cargo-lbin-test-verify-stages");
         let _ = fs::remove_dir_all(&root);
         let cache = root.join("cache");
 
         // No stage directory at all: silence, not an error.
-        assert!(stale_stages(&cache).is_empty());
+        assert!(scan_stale_stages(&cache).unwrap().is_empty());
 
         // A live PID (ours), a PID /proc cannot know, and a name that is
         // not a PID at all.
@@ -4389,7 +4623,7 @@ mod tests {
         for d in [&live, &dead, &junk] {
             fs::create_dir_all(d).unwrap();
         }
-        let stale = stale_stages(&cache);
+        let stale = scan_stale_stages(&cache).unwrap();
         assert!(
             !stale.contains(&live),
             "a running instance's stage is not debris"
