@@ -1,4 +1,4 @@
-//! Machine-readable output for `list --json` and `checkupdate --json`.
+//! Machine-readable command output (`--json`).
 //!
 //! A contract: every document carries `schema`; existing fields are
 //! never renamed, removed, retyped or re-semanticized without a bump;
@@ -216,6 +216,54 @@ impl CheckOutput {
     }
 }
 
+fn clone_finding(f: &crate::Finding) -> crate::Finding {
+    crate::Finding {
+        kind: f.kind,
+        message: f.message.clone(),
+        krate: f.krate.clone(),
+        bin: f.bin.clone(),
+        path: f.path.clone(),
+        hint: f.hint.clone(),
+    }
+}
+
+/// `verify --json`: the audit's findings as data. Every finding
+/// carries `kind` (a stable machine name), `message` (the human
+/// finding text, hint embedded; the text renderers add their own
+/// framing, e.g. the severity word), the subjects `crate`/`bin`/`path`
+/// where the finding has them (else `null`), and `hint` — the bare
+/// pasteable repair command where one is unambiguous: a reinstall for
+/// a broken binary; stale-stages carries none. `crates` is `null` when
+/// the manifest could not be counted — the same Option honesty as the
+/// text verdict.
+#[derive(Serialize)]
+pub(crate) struct VerifyOutput {
+    schema: u32,
+    prefix: PathBuf,
+    crates: Option<usize>,
+    errors: Vec<crate::Finding>,
+    warnings: Vec<crate::Finding>,
+}
+
+impl VerifyOutput {
+    pub(crate) fn build(prefix: PathBuf, report: &crate::VerifyReport) -> Self {
+        Self {
+            schema: SCHEMA,
+            prefix,
+            crates: report.crates,
+            errors: report.errors.iter().map(clone_finding).collect(),
+            warnings: report.warnings.iter().map(clone_finding).collect(),
+        }
+    }
+}
+
+/// The whole `verify --json` document, prefix anchored the same way
+/// every other document anchors it, printed like every other document.
+pub(crate) fn print_verify(prefix: &std::path::Path, report: &crate::VerifyReport) -> Result<()> {
+    let identity = crate::report::identity(prefix)?;
+    print(&VerifyOutput::build(identity, report))
+}
+
 /// Pretty-printed, one document, trailing newline.
 pub fn print<T: Serialize>(value: &T) -> Result<()> {
     let mut out = serde_json::to_string_pretty(value).context("serializing JSON output")?;
@@ -281,6 +329,87 @@ mod tests {
                 },
             ],
         }
+    }
+
+    #[test]
+    fn verify_output_golden() {
+        let report = crate::VerifyReport {
+            crates: Some(2),
+            errors: vec![crate::Finding {
+                kind: "binary-missing",
+                message: "`foo`: managed binary /usr/local/bin/foo is missing — reinstall: \
+                          cargo lbin install foo --prefix=/usr/local"
+                    .into(),
+                krate: Some("foo".into()),
+                bin: Some("foo".into()),
+                path: Some(PathBuf::from("/usr/local/bin/foo")),
+                hint: Some("cargo lbin install foo --prefix=/usr/local".into()),
+            }],
+            warnings: vec![crate::Finding {
+                kind: "stale-stages",
+                message: "1 stage directory under /home/u/.cache/cargo-lbin/stage whose owning \
+                          cargo-lbin process is gone — possible leftover build debris; \
+                          inspect, then `cargo lbin clean --stages` when safe"
+                    .into(),
+                krate: None,
+                bin: None,
+                path: Some(PathBuf::from("/home/u/.cache/cargo-lbin/stage")),
+                hint: None,
+            }],
+        };
+        let out = VerifyOutput::build(PathBuf::from("/usr/local"), &report);
+        let json = serde_json::to_string_pretty(&out).unwrap();
+        let expected = r#"{
+  "schema": 1,
+  "prefix": "/usr/local",
+  "crates": 2,
+  "errors": [
+    {
+      "kind": "binary-missing",
+      "message": "`foo`: managed binary /usr/local/bin/foo is missing — reinstall: cargo lbin install foo --prefix=/usr/local",
+      "crate": "foo",
+      "bin": "foo",
+      "path": "/usr/local/bin/foo",
+      "hint": "cargo lbin install foo --prefix=/usr/local"
+    }
+  ],
+  "warnings": [
+    {
+      "kind": "stale-stages",
+      "message": "1 stage directory under /home/u/.cache/cargo-lbin/stage whose owning cargo-lbin process is gone — possible leftover build debris; inspect, then `cargo lbin clean --stages` when safe",
+      "crate": null,
+      "bin": null,
+      "path": "/home/u/.cache/cargo-lbin/stage",
+      "hint": null
+    }
+  ]
+}"#;
+        assert_eq!(json, expected);
+    }
+
+    #[test]
+    fn verify_output_uncounted_is_null_not_zero() {
+        // The Option honesty crosses into the document: an unparseable
+        // manifest is "crates": null, never an invented 0.
+        let report = crate::VerifyReport {
+            crates: None,
+            errors: vec![crate::Finding {
+                kind: "manifest-unparseable",
+                message: "the manifest cannot be parsed".into(),
+                krate: None,
+                bin: None,
+                path: None,
+                hint: None,
+            }],
+            warnings: Vec::new(),
+        };
+        let out = VerifyOutput::build(PathBuf::from("/usr/local"), &report);
+        let json = serde_json::to_string_pretty(&out).unwrap();
+        assert!(json.contains("\"crates\": null"), "{json}");
+        assert!(
+            json.contains("\"kind\": \"manifest-unparseable\""),
+            "{json}"
+        );
     }
 
     /// The representation as emitted, byte for byte: editing this test is

@@ -118,7 +118,11 @@ enum Cmd {
     /// names the repair command where lbin has an unambiguous one, and
     /// otherwise describes the state and leaves the decision to you;
     /// verify itself never writes, prompts, or escalates.
-    Verify,
+    Verify {
+        /// Machine-readable output (schema documented in README)
+        #[arg(long)]
+        json: bool,
+    },
     /// Remove build debris from the cache; every removal is opt-in
     ///
     /// `--stages` removes the stage directories `verify` reports as
@@ -305,7 +309,7 @@ fn main() -> ExitCode {
     let result = match cli.cmd {
         Cmd::Install { ref crates, locked } => cmd_install(&cli.prefix, crates, locked),
         Cmd::Remove { ref crates } => cmd_remove(&cli.prefix, crates),
-        Cmd::Verify => cmd_verify(&cli.prefix),
+        Cmd::Verify { json } => cmd_verify(&cli.prefix, json),
         Cmd::Pin { ref crates } => cmd_set_pinned(&cli.prefix, crates, true),
         Cmd::Unpin { ref crates } => cmd_set_pinned(&cli.prefix, crates, false),
         Cmd::Pinned { check, json } => return cmd_pinned(&cli.prefix, check, json),
@@ -1035,6 +1039,36 @@ fn shadow_warnings(prefix: &Path, bins: &[String]) -> Vec<String> {
         .collect()
 }
 
+/// The verify-side sibling of `shadow_notes`: the same scan, but each
+/// shadow keeps its subjects as data — `bin` and the shadowing `path` —
+/// so a `--json` consumer reads fields, not `message`.
+fn shadow_findings(prefix: &Path, bins: &[String]) -> Vec<Finding> {
+    if bins.is_empty() {
+        return Vec::new();
+    }
+    let Some(path_var) = std::env::var_os("PATH") else {
+        return Vec::new();
+    };
+    let Ok(cwd) = std::env::current_dir() else {
+        return Vec::new();
+    };
+    let prefix_bin = prefix.join("bin");
+    shadow::find_shadows(&path_var, &prefix_bin, bins, &cwd, shadow::is_executable)
+        .iter()
+        .map(|s| {
+            let owner = shadow::owner_of(&s.existing);
+            Finding {
+                bin: Some(s.bin.clone()),
+                path: Some(s.existing.clone()),
+                ..Finding::plain(
+                    "path-shadow",
+                    shadow::describe(s, &prefix_bin, owner.as_deref()),
+                )
+            }
+        })
+        .collect()
+}
+
 /// `shadow_warnings` without the severity word: the raw
 /// `shadow::describe` lines, for callers that add their own framing.
 fn shadow_notes(prefix: &Path, bins: &[String]) -> Vec<String> {
@@ -1069,6 +1103,57 @@ fn install_needs_privilege(policy: privileged::Policy, prefix: &Path) -> Result<
         || policy.probe_destination(&prefix.join("share/cargo-lbin"))?)
 }
 
+/// One verify finding as data: `message` is the human finding text
+/// (hint embedded; the text renderers add their own framing, e.g. the
+/// severity word) and every other field is the datum a `--json`
+/// consumer would otherwise have to parse back out of it — `kind` a
+/// stable machine name, `crate`/`bin`/`path` the subjects where the
+/// finding has them (else null), `hint` the bare pasteable repair
+/// command where one is unambiguous (a reinstall for a broken binary;
+/// stale-stages carries none — its removal is a heuristic's verdict).
+/// The text surfaces read only `message` and stay byte-identical.
+#[derive(Debug, serde::Serialize)]
+pub(crate) struct Finding {
+    pub(crate) kind: &'static str,
+    pub(crate) message: String,
+    #[serde(rename = "crate")]
+    pub(crate) krate: Option<String>,
+    pub(crate) bin: Option<String>,
+    pub(crate) path: Option<PathBuf>,
+    pub(crate) hint: Option<String>,
+}
+
+impl Finding {
+    fn plain(kind: &'static str, message: String) -> Self {
+        Self {
+            kind,
+            message,
+            krate: None,
+            bin: None,
+            path: None,
+            hint: None,
+        }
+    }
+    fn for_crate(kind: &'static str, krate: &str, message: String) -> Self {
+        Self {
+            krate: Some(krate.to_owned()),
+            ..Self::plain(kind, message)
+        }
+    }
+    fn for_bin(kind: &'static str, krate: &str, bin: &str, message: String) -> Self {
+        Self {
+            bin: Some(bin.to_owned()),
+            ..Self::for_crate(kind, krate, message)
+        }
+    }
+}
+
+impl std::fmt::Display for Finding {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
 /// Everything `verify` found, split as the exit status needs it:
 /// errors are broken invariants *and* claims that could not be checked
 /// (hence "verification error(s)" in the summaries); warnings are
@@ -1080,8 +1165,8 @@ pub(crate) struct VerifyReport {
     /// brace may hide forty entries, and "0 crates" there would be the
     /// audit guessing in its own verdict line.
     pub(crate) crates: Option<usize>,
-    pub(crate) errors: Vec<String>,
-    pub(crate) warnings: Vec<String>,
+    pub(crate) errors: Vec<Finding>,
+    pub(crate) warnings: Vec<Finding>,
 }
 
 /// The whole audit, read-only in the strictest sense: verify does not
@@ -1107,7 +1192,12 @@ pub(crate) fn verify_prefix(
             // Two worlds: an I/O failure says nothing about the content (no
             // "restore" advice); only bytes serde refused earn repair-or-restore.
             Err(e) => {
-                let finding = if e.downcast_ref::<std::io::Error>().is_some() {
+                let kind = if e.downcast_ref::<std::io::Error>().is_some() {
+                    "manifest-unreadable"
+                } else {
+                    "manifest-unparseable"
+                };
+                let message = if kind == "manifest-unreadable" {
                     format!(
                         "the manifest cannot be inspected: {e:#} — no further \
                          manifest-dependent checks can be performed"
@@ -1119,9 +1209,13 @@ pub(crate) fn verify_prefix(
                         Manifest::path(prefix).display()
                     )
                 };
+                let finding = Finding {
+                    path: Some(Manifest::path(prefix)),
+                    ..Finding::plain(kind, message)
+                };
                 return Ok(VerifyReport {
                     crates: None,
-                    errors: vec![text::sanitize(&finding)],
+                    errors: vec![sanitize_finding(finding)],
                     warnings: Vec::new(),
                 });
             }
@@ -1136,18 +1230,25 @@ pub(crate) fn verify_prefix(
     let also = prefixes::also_installed(prefix);
     for name in &names {
         for a in also.get(name).map_or(&[][..], Vec::as_slice) {
-            warnings.push(format!(
-                "`{name}` is also installed under {} @{} — legal; `cargo lbin remove` \
-                 the unwanted side if both were not meant",
-                a.prefix.display(),
-                a.version
-            ));
+            warnings.push(Finding {
+                path: Some(a.prefix.clone()),
+                ..Finding::for_crate(
+                    "also-installed",
+                    name,
+                    format!(
+                        "`{name}` is also installed under {} @{} — legal; `cargo lbin remove` \
+                         the unwanted side if both were not meant",
+                        a.prefix.display(),
+                        a.version
+                    ),
+                )
+            });
         }
     }
     // The install-time name scan, bare of the severity word; neutral on
     // purpose — `describe` says which side PATH resolves first, and a
     // same-named executable is worth seeing whichever side wins.
-    warnings.extend(shadow_notes(prefix, &all_bins));
+    warnings.extend(shadow_findings(prefix, &all_bins));
     // Cache debris is kept deliberately (forensics), and verify is the
     // one place that lists it. One aggregated finding — forty directories
     // must not bury the one that matters; an unreadable cache contributes
@@ -1156,24 +1257,48 @@ pub(crate) fn verify_prefix(
         && let Ok(stale) = scan_stale_stages(&cache)
         && !stale.is_empty()
     {
-        warnings.push(format!(
-            "{} stage director{} under {} whose owning cargo-lbin process is \
-             gone — possible leftover build debris; inspect and remove when \
-             safe (a PID can be reused, and an orphaned build may still hold \
-             the directory)",
-            stale.len(),
-            if stale.len() == 1 { "y" } else { "ies" },
-            cache.join("stage").display()
-        ));
+        // No hint: the finding is a liveness heuristic, not an
+        // unambiguous repair — an orphaned build may still hold the
+        // directory, so the message names the tool and keeps the
+        // caution instead of promising a command is safe to paste.
+        warnings.push(Finding {
+            path: Some(cache.join("stage")),
+            ..Finding::plain(
+                "stale-stages",
+                format!(
+                    "{} stage director{} under {} whose owning cargo-lbin process is \
+                     gone — possible leftover build debris; inspect, then \
+                     `cargo lbin clean --stages` when safe (a PID can be reused, \
+                     and an orphaned build may still hold the directory)",
+                    stale.len(),
+                    if stale.len() == 1 { "y" } else { "ies" },
+                    cache.join("stage").display()
+                ),
+            )
+        });
     }
     // Sanitized once, at the report boundary, for both renderers — and
     // last, so the stale-stage line is covered: everything here travelled
     // through `load_unvalidated` and is untrusted terminal text.
     Ok(VerifyReport {
         crates,
-        errors: errors.iter().map(|e| text::sanitize(e)).collect(),
-        warnings: warnings.iter().map(|w| text::sanitize(w)).collect(),
+        errors: errors.into_iter().map(sanitize_finding).collect(),
+        warnings: warnings.into_iter().map(sanitize_finding).collect(),
     })
+}
+
+/// The sanitization boundary, over exactly the field rendered to a
+/// human: `message` travelled through `load_unvalidated` and is
+/// untrusted terminal text. The data fields stay raw — a smuggled
+/// control character in a crate name IS the broken state a `--json`
+/// consumer is diagnosing, JSON's serializer escapes it safely, and a
+/// laundered copy would hide the very bytes that matter (`hint` is
+/// built from validated names and the prefix, or is a constant).
+fn sanitize_finding(f: Finding) -> Finding {
+    Finding {
+        message: text::sanitize(&f.message),
+        ..f
+    }
 }
 
 /// POSIX single-quote shell quoting for the one command lbin invites a
@@ -1248,7 +1373,7 @@ fn reinstall_hint(prefix: &Path, name: &str, entry: &Entry) -> Option<String> {
 /// dangling one is a symlink finding, not a lying "missing". Scope
 /// stays structural — `pacman -Qk`, not `-Qkk`: no hashes, by the same
 /// decision that makes migrate rebuild rather than copy.
-fn verify_entries(prefix: &Path, manifest: &Manifest) -> (Vec<String>, Vec<String>) {
+fn verify_entries(prefix: &Path, manifest: &Manifest) -> (Vec<Finding>, Vec<String>) {
     use std::os::unix::fs::PermissionsExt;
     let mut errors = Vec::new();
     let mut checkable: Vec<String> = Vec::new();
@@ -1262,17 +1387,27 @@ fn verify_entries(prefix: &Path, manifest: &Manifest) -> (Vec<String>, Vec<Strin
     // Pass 1 — the validate mirror, over everything.
     for (name, entry) in &manifest.crates {
         if validate_name(name).is_err() {
-            errors.push(format!("`{name}` is not a valid crate name — {by_hand}"));
+            errors.push(Finding::for_crate(
+                "invalid-crate-name",
+                name,
+                format!("`{name}` is not a valid crate name — {by_hand}"),
+            ));
         }
         if Version::parse(&entry.version).is_err() {
-            errors.push(format!(
-                "`{name}`: manifest version `{}` is unparseable — {by_hand}",
-                entry.version
+            errors.push(Finding::for_crate(
+                "unparseable-version",
+                name,
+                format!(
+                    "`{name}`: manifest version `{}` is unparseable — {by_hand}",
+                    entry.version
+                ),
             ));
         }
         if entry.bins.is_empty() {
-            errors.push(format!(
-                "`{name}`: declares no binaries — a state lbin never writes; {by_hand}"
+            errors.push(Finding::for_crate(
+                "no-binaries",
+                name,
+                format!("`{name}`: declares no binaries — a state lbin never writes; {by_hand}"),
             ));
         }
         let mut seen: BTreeSet<&str> = BTreeSet::new();
@@ -1281,14 +1416,20 @@ fn verify_entries(prefix: &Path, manifest: &Manifest) -> (Vec<String>, Vec<Strin
                 // Deliberately not joined under bin/, not claimed, not
                 // scanned: the name is the breach, and following it to
                 // the disk could lead outside the prefix.
-                errors.push(format!(
-                    "`{name}`: bin entry `{bin}` is not one plain filename — {by_hand}"
+                errors.push(Finding::for_bin(
+                    "invalid-bin-name",
+                    name,
+                    bin,
+                    format!("`{name}`: bin entry `{bin}` is not one plain filename — {by_hand}"),
                 ));
                 continue;
             }
             if !seen.insert(bin.as_str()) {
-                errors.push(format!(
-                    "`{name}`: binary `{bin}` is listed twice — {by_hand}"
+                errors.push(Finding::for_bin(
+                    "duplicate-bin-in-entry",
+                    name,
+                    bin,
+                    format!("`{name}`: binary `{bin}` is listed twice — {by_hand}"),
                 ));
                 continue;
             }
@@ -1306,10 +1447,16 @@ fn verify_entries(prefix: &Path, manifest: &Manifest) -> (Vec<String>, Vec<Strin
                 .map(|n| format!("`{n}`"))
                 .collect::<Vec<_>>()
                 .join(" and ");
-            errors.push(format!(
-                "binary `{bin}` is claimed by {owners} — a state lbin never \
-                 writes; {by_hand}"
-            ));
+            errors.push(Finding {
+                bin: Some((*bin).clone()),
+                ..Finding::plain(
+                    "duplicate-bin-claim",
+                    format!(
+                        "binary `{bin}` is claimed by {owners} — a state lbin never \
+                         writes; {by_hand}"
+                    ),
+                )
+            });
         }
     }
     // Pass 2 — the disk audit over names pass 1 let through; hints only
@@ -1323,10 +1470,15 @@ fn verify_entries(prefix: &Path, manifest: &Manifest) -> (Vec<String>, Vec<Strin
             if validate::validate_bin_name(bin).is_err() || !seen.insert(bin.as_str()) {
                 continue;
             }
+            let hint = if loadable {
+                reinstall_hint(prefix, name, entry)
+            } else {
+                None
+            };
             let remedy = if !loadable {
                 " — reinstall once the manifest findings above are repaired".to_owned()
             } else {
-                match reinstall_hint(prefix, name, entry) {
+                match hint.clone() {
                     Some(hint) => format!(" — reinstall: {hint}"),
                     // Loadable manifest, unspellable prefix: the repair is still a
                     // reinstall, there is just no command worth pasting.
@@ -1338,33 +1490,77 @@ fn verify_entries(prefix: &Path, manifest: &Manifest) -> (Vec<String>, Vec<Strin
             };
             let path = bin_dir.join(bin);
             match fs::symlink_metadata(&path) {
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => errors.push(format!(
-                    "`{name}`: managed binary {} is missing{remedy}",
-                    path.display()
-                )),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => errors.push(Finding {
+                    path: Some(path.clone()),
+                    hint: hint.clone(),
+                    ..Finding::for_bin(
+                        "binary-missing",
+                        name,
+                        bin,
+                        format!(
+                            "`{name}`: managed binary {} is missing{remedy}",
+                            path.display()
+                        ),
+                    )
+                }),
                 // EACCES, EIO, a symlink loop: "missing" would be a lie — the honest
                 // finding is that the claim could not be checked.
-                Err(e) => errors.push(format!(
-                    "`{name}`: managed binary {} cannot be inspected: {e} — the \
-                     manifest's claim could not be checked",
-                    path.display()
-                )),
-                Ok(md) if md.file_type().is_symlink() => errors.push(format!(
-                    "`{name}`: managed binary {} is a symlink, not the regular \
-                     file lbin placed — remove it, then{}",
-                    path.display(),
-                    remedy.trim_start_matches(" —")
-                )),
-                Ok(md) if !md.is_file() => errors.push(format!(
-                    "`{name}`: managed binary {} is not a regular file — remove \
-                     whatever took its place, then{}",
-                    path.display(),
-                    remedy.trim_start_matches(" —")
-                )),
-                Ok(md) if md.permissions().mode() & 0o111 == 0 => errors.push(format!(
-                    "`{name}`: managed binary {} is not executable{remedy}",
-                    path.display()
-                )),
+                Err(e) => errors.push(Finding {
+                    path: Some(path.clone()),
+                    ..Finding::for_bin(
+                        "binary-uninspectable",
+                        name,
+                        bin,
+                        format!(
+                            "`{name}`: managed binary {} cannot be inspected: {e} — the \
+                             manifest's claim could not be checked",
+                            path.display()
+                        ),
+                    )
+                }),
+                Ok(md) if md.file_type().is_symlink() => errors.push(Finding {
+                    path: Some(path.clone()),
+                    hint: hint.clone(),
+                    ..Finding::for_bin(
+                        "binary-is-a-symlink",
+                        name,
+                        bin,
+                        format!(
+                            "`{name}`: managed binary {} is a symlink, not the regular \
+                             file lbin placed — remove it, then{}",
+                            path.display(),
+                            remedy.trim_start_matches(" —")
+                        ),
+                    )
+                }),
+                Ok(md) if !md.is_file() => errors.push(Finding {
+                    path: Some(path.clone()),
+                    hint: hint.clone(),
+                    ..Finding::for_bin(
+                        "binary-not-a-regular-file",
+                        name,
+                        bin,
+                        format!(
+                            "`{name}`: managed binary {} is not a regular file — remove \
+                             whatever took its place, then{}",
+                            path.display(),
+                            remedy.trim_start_matches(" —")
+                        ),
+                    )
+                }),
+                Ok(md) if md.permissions().mode() & 0o111 == 0 => errors.push(Finding {
+                    path: Some(path.clone()),
+                    hint: hint.clone(),
+                    ..Finding::for_bin(
+                        "binary-not-executable",
+                        name,
+                        bin,
+                        format!(
+                            "`{name}`: managed binary {} is not executable{remedy}",
+                            path.display()
+                        ),
+                    )
+                }),
                 Ok(_) => {}
             }
         }
@@ -1533,27 +1729,37 @@ fn clean_cache(
 /// The CLI's words over `verify_prefix`'s data: findings to stderr,
 /// verdict to stdout, exit status measuring consistency alone —
 /// warnings by themselves exit zero.
-fn cmd_verify(prefix: &Path) -> Result<()> {
+fn cmd_verify(prefix: &Path, json: bool) -> Result<()> {
     // Lock-wait notice to stderr: a silent multi-minute wait is
     // indistinguishable from a hang.
     let report = verify_prefix(prefix, &mut |m: &str| eprintln!("{m}"))?;
-    for e in &report.errors {
-        eprintln!("error: {e}");
-    }
-    for w in &report.warnings {
-        eprintln!("warning: {w}");
+    if json {
+        // The document is stdout's only content; findings do not repeat
+        // on stderr — the JSON contract, same as list and checkupdate.
+        // The exit status stays the text mode's: the summary lives in
+        // the bail below, on stderr, where a script's log wants it.
+        crate::json::print_verify(prefix, &report)?;
+    } else {
+        for e in &report.errors {
+            eprintln!("error: {e}");
+        }
+        for w in &report.warnings {
+            eprintln!("warning: {w}");
+        }
     }
     if report.errors.is_empty() {
         // Zero errors implies a counted manifest (`None` only on the early
         // error return); the fallback keeps that a comment, not a panic.
         let crates = report.crates.unwrap_or(0);
-        if report.warnings.is_empty() {
-            println!("ok: {crates} managed crate(s)");
-        } else {
-            println!(
-                "ok: {crates} managed crate(s), {} warning(s)",
-                report.warnings.len()
-            );
+        if !json {
+            if report.warnings.is_empty() {
+                println!("ok: {crates} managed crate(s)");
+            } else {
+                println!(
+                    "ok: {crates} managed crate(s), {} warning(s)",
+                    report.warnings.len()
+                );
+            }
         }
         return Ok(());
     }
@@ -4036,20 +4242,25 @@ mod tests {
         fs::remove_file(prefix.join("bin/okcrate")).unwrap();
         let (errors, _) = verify_entries(&prefix, &manifest);
         assert_eq!(errors.len(), 1);
-        assert!(errors[0].contains("is missing"), "{errors:?}");
+        assert!(errors[0].message.contains("is missing"), "{errors:?}");
         assert!(
-            errors[0].contains("install okcrate"),
+            errors[0].message.contains("install okcrate"),
             "the finding names the repair: {errors:?}"
         );
         assert!(
-            errors[0].contains(&format!("--prefix={}", prefix.display())),
+            errors[0]
+                .message
+                .contains(&format!("--prefix={}", prefix.display())),
             "the hint repairs the prefix that was audited, not the default: {errors:?}"
         );
 
         // Wrong type: a directory answers to the name.
         fs::create_dir(prefix.join("bin/okcrate")).unwrap();
         let (errors, _) = verify_entries(&prefix, &manifest);
-        assert!(errors[0].contains("not a regular file"), "{errors:?}");
+        assert!(
+            errors[0].message.contains("not a regular file"),
+            "{errors:?}"
+        );
         fs::remove_dir(prefix.join("bin/okcrate")).unwrap();
 
         // A symlink is structural drift even when its target runs fine:
@@ -4057,7 +4268,7 @@ mod tests {
         std::os::unix::fs::symlink("/bin/sh", prefix.join("bin/okcrate")).unwrap();
         let (errors, _) = verify_entries(&prefix, &manifest);
         assert!(
-            errors[0].contains("is a symlink"),
+            errors[0].message.contains("is a symlink"),
             "a healthy target does not excuse the drift: {errors:?}"
         );
         fs::remove_file(prefix.join("bin/okcrate")).unwrap();
@@ -4067,7 +4278,7 @@ mod tests {
         std::os::unix::fs::symlink("/nonexistent/target", prefix.join("bin/okcrate")).unwrap();
         let (errors, _) = verify_entries(&prefix, &manifest);
         assert!(
-            errors[0].contains("is a symlink") && !errors[0].contains("missing"),
+            errors[0].message.contains("is a symlink") && !errors[0].message.contains("missing"),
             "{errors:?}"
         );
         fs::remove_file(prefix.join("bin/okcrate")).unwrap();
@@ -4080,7 +4291,7 @@ mod tests {
         )
         .unwrap();
         let (errors, _) = verify_entries(&prefix, &manifest);
-        assert!(errors[0].contains("not executable"), "{errors:?}");
+        assert!(errors[0].message.contains("not executable"), "{errors:?}");
         fs::set_permissions(
             prefix.join("bin/okcrate"),
             fs::Permissions::from_mode(0o755),
@@ -4094,7 +4305,7 @@ mod tests {
         fs::remove_file(prefix.join("bin/okcrate")).unwrap();
         let (errors, _) = verify_entries(&prefix, &pinned);
         assert!(
-            errors[0].contains("install okcrate@0.1.0"),
+            errors[0].message.contains("install okcrate@0.1.0"),
             "the pinned remedy is the exact re-pin: {errors:?}"
         );
 
@@ -4104,7 +4315,7 @@ mod tests {
         locked.crates.get_mut("okcrate").unwrap().locked = true;
         let (errors, _) = verify_entries(&prefix, &locked);
         assert!(
-            errors[0].contains("--locked"),
+            errors[0].message.contains("--locked"),
             "the locked remedy keeps the policy: {errors:?}"
         );
         fs::write(prefix.join("bin/okcrate"), "#!/bin/sh\ntrue\n").unwrap();
@@ -4118,7 +4329,7 @@ mod tests {
         let mut broken = Manifest::load(&prefix).unwrap();
         broken.crates.get_mut("okcrate").unwrap().version = "not-a-version".into();
         let (errors, _) = verify_entries(&prefix, &broken);
-        assert!(errors[0].contains("unparseable"), "{errors:?}");
+        assert!(errors[0].message.contains("unparseable"), "{errors:?}");
 
         // Duplicate claim: two entries, one binary name — a state lbin
         // never writes, so only a hand-built manifest can carry it.
@@ -4134,9 +4345,9 @@ mod tests {
         );
         let (errors, _) = verify_entries(&prefix, &dup);
         assert!(
-            errors.iter().any(|e| e.contains("claimed by")
-                && e.contains("`okcrate`")
-                && e.contains("`othercrate`")),
+            errors.iter().any(|e| e.message.contains("claimed by")
+                && e.message.contains("`okcrate`")
+                && e.message.contains("`othercrate`")),
             "the duplicate claim names both owners: {errors:?}"
         );
         let _ = fs::remove_dir_all(&root);
@@ -4242,11 +4453,11 @@ mod tests {
         let manifest = Manifest::load_unvalidated(&prefix).unwrap();
         let (errors, _) = verify_entries(&prefix, &manifest);
         assert!(
-            errors.iter().any(|e| e.contains("unparseable")),
+            errors.iter().any(|e| e.message.contains("unparseable")),
             "the bad version became a finding: {errors:?}"
         );
         assert!(
-            errors.iter().any(|e| e.contains("claimed by")),
+            errors.iter().any(|e| e.message.contains("claimed by")),
             "the duplicate claim became a finding: {errors:?}"
         );
         let _ = fs::remove_dir_all(&root);
@@ -4262,7 +4473,7 @@ mod tests {
         let report = verify_prefix(&prefix, &mut |_| {}).unwrap();
         assert_eq!(report.errors.len(), 1, "{:?}", report.errors);
         assert!(
-            report.errors[0].contains("cannot be parsed"),
+            report.errors[0].message.contains("cannot be parsed"),
             "the deepest inconsistency is a finding, not a failed audit: {:?}",
             report.errors
         );
@@ -4271,7 +4482,7 @@ mod tests {
             "behind a missing brace may sit forty entries — the count is unknown"
         );
         assert!(
-            report.errors[0].contains("repair"),
+            report.errors[0].message.contains("repair"),
             "serde refused the bytes, so repair-or-restore is honest: {:?}",
             report.errors
         );
@@ -4281,12 +4492,12 @@ mod tests {
         fs::write(Manifest::path(&prefix), b"\xff\xfe not utf8").unwrap();
         let report = verify_prefix(&prefix, &mut |_| {}).unwrap();
         assert!(
-            report.errors[0].contains("cannot be parsed"),
+            report.errors[0].message.contains("cannot be parsed"),
             "corrupt bytes are corruption, not I/O: {:?}",
             report.errors
         );
         assert!(
-            report.errors[0].contains("repair"),
+            report.errors[0].message.contains("repair"),
             "read bytes that serde refused earn repair-or-restore: {:?}",
             report.errors
         );
@@ -4297,12 +4508,12 @@ mod tests {
         fs::create_dir(Manifest::path(&prefix)).unwrap();
         let report = verify_prefix(&prefix, &mut |_| {}).unwrap();
         assert!(
-            report.errors[0].contains("cannot be inspected"),
+            report.errors[0].message.contains("cannot be inspected"),
             "an I/O failure says nothing about the content: {:?}",
             report.errors
         );
         assert!(
-            !report.errors[0].contains("restore"),
+            !report.errors[0].message.contains("restore"),
             "no repair advice over bytes nobody has seen: {:?}",
             report.errors
         );
@@ -4332,7 +4543,7 @@ mod tests {
         let (errors, _) = verify_entries(&prefix, &manifest);
         assert_eq!(errors.len(), 1, "{errors:?}");
         assert!(
-            errors[0].contains("cannot be inspected"),
+            errors[0].message.contains("cannot be inspected"),
             "not-NotFound is not \"missing\": {errors:?}"
         );
         let _ = fs::remove_dir_all(&root);
@@ -4350,7 +4561,7 @@ mod tests {
         let (errors, _) = verify_entries(&prefix, &manifest);
         let expected = format!("--prefix='{}/cargo lbin'\\''s test'", root.display());
         assert!(
-            errors[0].contains(&expected),
+            errors[0].message.contains(&expected),
             "the prefix is single-quoted with the classic apostrophe dance:\n  \
              finding: {}\n  expected fragment: {expected}",
             errors[0]
@@ -4363,11 +4574,11 @@ mod tests {
         let manifest = Manifest::load(&sneaky).unwrap();
         let (errors, _) = verify_entries(&sneaky, &manifest);
         assert!(
-            !errors[0].contains("cargo lbin install"),
+            !errors[0].message.contains("cargo lbin install"),
             "a command the sanitizer would falsify is no command: {errors:?}"
         );
         assert!(
-            errors[0].contains("cannot be spelled"),
+            errors[0].message.contains("cannot be spelled"),
             "the finding says why no command is offered: {errors:?}"
         );
         let _ = fs::remove_dir_all(&root);
@@ -4429,14 +4640,16 @@ mod tests {
         let (errors, _) = verify_entries(&prefix, &manifest);
         let missing = errors
             .iter()
-            .find(|e| e.contains("is missing"))
+            .find(|e| e.message.contains("is missing"))
             .expect("the sound crate's disk finding still exists");
         assert!(
-            !missing.contains("cargo lbin install"),
+            !missing.message.contains("cargo lbin install"),
             "a hint that bounces off load is no hint: {missing}"
         );
         assert!(
-            missing.contains("once the manifest findings above are repaired"),
+            missing
+                .message
+                .contains("once the manifest findings above are repaired"),
             "the finding says why the command is withheld: {missing}"
         );
         let _ = fs::remove_dir_all(&root);
@@ -4480,30 +4693,99 @@ mod tests {
         );
         let (errors, checkable) = verify_entries(&prefix, &manifest);
         assert!(
-            errors.iter().any(|e| e.contains("not a valid crate name")),
+            errors
+                .iter()
+                .any(|e| e.message.contains("not a valid crate name")),
             "{errors:?}"
         );
         assert!(
-            errors.iter().any(|e| e.contains("declares no binaries")),
+            errors
+                .iter()
+                .any(|e| e.message.contains("declares no binaries")),
             "{errors:?}"
         );
         assert!(
-            errors.iter().any(|e| e.contains("not one plain filename")),
+            errors
+                .iter()
+                .any(|e| e.message.contains("not one plain filename")),
             "{errors:?}"
         );
         assert!(
-            errors.iter().any(|e| e.contains("listed twice")),
+            errors.iter().any(|e| e.message.contains("listed twice")),
             "{errors:?}"
         );
         assert!(
-            !errors.iter().any(|e| e.contains("outside")
-                && (e.contains("missing") || e.contains("not executable"))),
+            !errors.iter().any(|e| e.message.contains("outside")
+                && (e.message.contains("missing") || e.message.contains("not executable"))),
             "the path-like name produced a disk verdict — it was stat'd: {errors:?}"
         );
         assert_eq!(
             checkable,
             vec!["good".to_owned()],
             "only sound names reach the PATH scan"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn verify_findings_carry_their_subjects_as_data() {
+        // The reason --json exists: kind/crate/bin/path/hint as fields,
+        // not regexes over message — through the real disk pass.
+        let root = std::env::temp_dir().join("cargo-lbin-test-verify-data");
+        let _ = fs::remove_dir_all(&root);
+        let prefix = seeded_prefix(&root, "prefix", "okcrate", true, true);
+        fs::remove_file(prefix.join("bin/okcrate")).unwrap();
+        let report = verify_prefix(&prefix, &mut |_| {}).unwrap();
+        let f = &report.errors[0];
+        assert_eq!(f.kind, "binary-missing");
+        assert_eq!(f.krate.as_deref(), Some("okcrate"));
+        assert_eq!(f.bin.as_deref(), Some("okcrate"));
+        assert_eq!(
+            f.path.as_deref(),
+            Some(prefix.join("bin/okcrate").as_path())
+        );
+        let hint = f
+            .hint
+            .as_deref()
+            .expect("a missing binary names its repair");
+        assert!(hint.starts_with("cargo lbin install okcrate@"), "{hint}");
+        assert!(
+            f.message.contains(hint),
+            "the human line embeds the same command the field carries"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn verify_data_fields_carry_the_raw_bytes() {
+        // The data IS the diagnosis: a control char smuggled into a
+        // crate name reaches the Finding's fields unlaundered (JSON
+        // escapes it safely), while the human-rendered message is
+        // sanitized as before.
+        let root = std::env::temp_dir().join("cargo-lbin-test-verify-raw");
+        let _ = fs::remove_dir_all(&root);
+        let prefix = root.join("prefix");
+        fs::create_dir_all(prefix.join("bin")).unwrap();
+        fs::create_dir_all(prefix.join("share/cargo-lbin")).unwrap();
+        fs::write(
+            Manifest::path(&prefix),
+            r#"{"crates":{"esc\u001bcrate":{"version":"0.1.0","bins":["esccrate"]}}}"#,
+        )
+        .unwrap();
+        let report = verify_prefix(&prefix, &mut |_| {}).unwrap();
+        let f = report
+            .errors
+            .iter()
+            .find(|f| f.kind == "invalid-crate-name")
+            .expect("the smuggled name is invalid");
+        assert!(
+            f.krate.as_deref().is_some_and(|k| k.contains('\u{1b}')),
+            "the crate field keeps the real bytes: {:?}",
+            f.krate
+        );
+        assert!(
+            !f.message.contains('\u{1b}'),
+            "the human line stays terminal-safe"
         );
         let _ = fs::remove_dir_all(&root);
     }
@@ -4527,7 +4809,8 @@ mod tests {
             !report.errors.is_empty(),
             "the smuggled version is at least unparseable"
         );
-        for line in report.errors.iter().chain(report.warnings.iter()) {
+        for finding in report.errors.iter().chain(report.warnings.iter()) {
+            let line = &finding.message;
             assert!(
                 !line.chars().any(|c| c.is_control() && c != '\t'),
                 "a finding reached the boundary with a control char: {line:?}"

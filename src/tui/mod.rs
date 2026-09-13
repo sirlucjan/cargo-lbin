@@ -2287,13 +2287,13 @@ impl App {
         let failed = !report.errors.is_empty();
         // No sanitize: VerifyReport is the one boundary — a second pass
         // would suggest the first is optional.
-        let mut lines: Vec<String> = report.errors.clone();
+        let mut lines: Vec<String> = report.errors.iter().map(|f| f.message.clone()).collect();
         if !report.warnings.is_empty() {
             if !lines.is_empty() {
                 lines.push(String::new());
             }
             lines.push("warnings:".to_owned());
-            lines.extend(report.warnings.iter().cloned());
+            lines.extend(report.warnings.iter().map(|f| f.message.clone()));
         }
         let title = if failed {
             format!(
@@ -3560,7 +3560,14 @@ mod tests {
         app.report_scroll = 7;
         app.finish_verify(Ok(crate::VerifyReport {
             crates: Some(1),
-            errors: vec!["`foo`: managed binary is missing".into()],
+            errors: vec![crate::Finding {
+                kind: "binary-missing",
+                message: "`foo`: managed binary is missing".into(),
+                krate: None,
+                bin: None,
+                path: None,
+                hint: None,
+            }],
             warnings: Vec::new(),
         }));
         let report = app.build_report.as_ref().expect("findings pin a panel");

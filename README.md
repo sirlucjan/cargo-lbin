@@ -104,7 +104,7 @@ cargo lbin tui
 | `update --all [--yes]` | Update every managed crate with an available update; `--yes` skips confirmation |
 | `migrate <crate>... --to <prefix> [--yes]` | Rebuild installed crates under another prefix, then retire them here |
 | `migrate --all --to <prefix> [--yes]` | Migrate every managed crate to another prefix |
-| `verify` | Check the manifest's claims against the disk, read-only; non-zero exit on verification errors |
+| `verify [--json]` | Check the manifest's claims against the disk, read-only; non-zero exit on verification errors |
 | `clean [--dry-run] [--stages] [--logs-older-than DAYS]` | Remove build debris from the cache; every removal is opt-in — name at least one of the two |
 | `search <terms>... [--limit N]` | Find crates by keyword |
 | `info <crate>...` | Show exact-name crate information and installed state |
@@ -255,6 +255,8 @@ A successful check writes a full per-prefix snapshot, not merely the outdated en
 ### JSON output
 
 `list --json` and `checkupdate --json` print one JSON document on stdout and nothing else; warnings stay on stderr and exit codes are unchanged. The shape is a contract: every document carries a `schema` number, fields are only ever added within a schema version, and any rename, retype or removal is a schema bump.
+
+`verify --json` fields: `prefix` and `schema` as above; `crates` is the managed crate count, or `null` when the manifest could not be read or parsed — the count is then unknown, not zero; `errors` and `warnings` are arrays of findings, each with `kind` (a stable machine name such as `binary-missing`, `duplicate-bin-claim`, `manifest-unparseable`, `path-shadow`, `stale-stages`), `message` (the human finding text, repair hint included; the text renderer adds its own `error:`/`warning:` framing), the finding's subjects as data — `crate`, `bin` and `path`, each `null` where the finding has none — and `hint`, the bare pasteable repair command where one is unambiguous (a reinstall for a broken binary), else `null`. A consumer never parses `message`. Only `message` is terminal-sanitized: the data fields carry the raw bytes (JSON escapes them safely) — a control character smuggled into a crate name is the broken state being diagnosed, and a laundered copy would hide it. The document is stdout's only content; on verification errors the exit status is non-zero and the error verdict goes to stderr, as in text mode.
 
 ```json
 {
@@ -546,6 +548,8 @@ its key bar advertises only what still works. One honest note on
 scope: the `v` audit itself never writes, while a TUI *session*, like
 every TUI session, prepares the state lock when it starts — strict
 read-only-ness belongs to `cargo lbin verify`, the command.
+
+`verify --json` emits the findings as one JSON document — stdout's only content (schema below). The exit status is the text mode's; on verification errors the error verdict goes to stderr, and a clean run prints nothing but the document.
 
 ## Clean
 
