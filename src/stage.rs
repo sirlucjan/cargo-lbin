@@ -19,6 +19,15 @@ use std::process::Command;
 
 const CRATES_IO_SOURCE: &str = "registry+https://github.com/rust-lang/crates.io-index";
 
+/// The directory under the cache where leased runs will live: a
+/// namespace a 0.12 binary does not know and therefore cannot sweep.
+/// The old binary's `clean --stages` classifies any non-PID name under
+/// `stage/` as debris — a leased run placed there could be removed,
+/// live lock and all, by a concurrently installed 0.12. One cache must
+/// be shareable by both binaries during an upgrade window, so the
+/// formats do not share a directory.
+pub const RUN_NAMESPACE: &str = "stage-v2";
+
 /// A directory name in a stage namespace under the cache, as the
 /// scanners read it.
 ///

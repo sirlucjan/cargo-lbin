@@ -1272,7 +1272,7 @@ pub(crate) fn verify_prefix(
         // directory, so the message names the tool and keeps the
         // caution instead of promising a command is safe to paste.
         warnings.push(Finding {
-            path: Some(cache.join("stage")),
+            path: Some(cache.clone()),
             ..Finding::plain(
                 "stale-stages",
                 format!(
@@ -1282,7 +1282,7 @@ pub(crate) fn verify_prefix(
                      and an orphaned build may still hold the directory)",
                     stale.len(),
                     if stale.len() == 1 { "y" } else { "ies" },
-                    cache.join("stage").display()
+                    cache.display()
                 ),
             )
         });
@@ -1609,31 +1609,53 @@ fn verify_entries(prefix: &Path, manifest: &Manifest) -> (Vec<Finding>, Vec<Stri
 /// empty cache for both.
 fn scan_stale_stages(cache: &Path) -> std::io::Result<Vec<PathBuf>> {
     let mut stale = Vec::new();
-    let entries = match fs::read_dir(cache.join("stage")) {
+    // Two namespaces, two formats — and the namespace is part of the
+    // format version. stage/ is 0.12's: a run there is a bare PID and
+    // nothing else. stage-v2/ is the leased runs' home: a run there is
+    // <pid>-<nonce> and nothing else. A name wearing the other
+    // namespace's format is not a run at all, just debris owed no
+    // protection story: a bare PID in stage-v2 must not borrow /proc's
+    // vote, and a leased name in stage/ — where nothing legally writes
+    // one — must not earn a sparing it never signed up for.
+    for (namespace, leased) in [("stage", false), (stage::RUN_NAMESPACE, true)] {
+        scan_stage_dir(&cache.join(namespace), leased, &mut stale)?;
+    }
+    stale.sort();
+    Ok(stale)
+}
+
+/// One namespace's scan, appending to the shared verdict list.
+/// `leased` names the one format that is legal here; everything else
+/// is judged as debris.
+fn scan_stage_dir(dir: &Path, leased: bool, stale: &mut Vec<PathBuf>) -> std::io::Result<()> {
+    let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(stale),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(e),
     };
     for entry in entries {
         let entry = entry?;
-        let stale_entry = match entry.file_name().to_str().and_then(stage::parse_run_dir) {
+        let run = entry.file_name().to_str().and_then(stage::parse_run_dir);
+        let stale_entry = match (leased, run) {
             // The heuristic, for the layout that has nothing better —
             // with both of its known lies left standing.
-            Some(stage::StageRun::LegacyPid(pid)) => !Path::new(&format!("/proc/{pid}")).exists(),
-            // Never stale here: liveness for this layout is the lease,
-            // and until the probe exists the only safe answer is to
-            // spare the run. A wrong "stale" is a deletable lie; a
-            // wrong "leave it" costs disk until the next pass.
-            Some(stage::StageRun::LeasedRun { .. }) => false,
-            // Not a run at all: debris keeps its existing verdict.
-            None => true,
+            (false, Some(stage::StageRun::LegacyPid(pid))) => {
+                !Path::new(&format!("/proc/{pid}")).exists()
+            }
+            // Never stale here yet: liveness for this layout is the
+            // lease, and until the probe exists the only safe answer
+            // is to spare the run. A wrong "stale" is a deletable lie;
+            // a wrong "leave it" costs disk until the next pass.
+            (true, Some(stage::StageRun::LeasedRun { .. })) => false,
+            // Junk names, and run names wearing the other namespace's
+            // format: not a run at all, debris.
+            _ => true,
         };
         if stale_entry {
             stale.push(entry.path());
         }
     }
-    stale.sort();
-    Ok(stale)
+    Ok(())
 }
 
 /// The mutating half of the pair `verify` opens: `verify` names the
@@ -1669,7 +1691,7 @@ fn clean_cache(
     // cache, every other read error is an error.
     let stale = if stages {
         scan_stale_stages(cache)
-            .with_context(|| format!("reading {}", cache.join("stage").display()))?
+            .with_context(|| format!("reading the stage namespaces under {}", cache.display()))?
     } else {
         Vec::new()
     };
@@ -5059,16 +5081,35 @@ mod tests {
         assert_eq!(scan_stale_stages(&cache).unwrap(), Vec::<PathBuf>::new());
 
         // A live PID (ours), a PID /proc cannot know, a name that is
-        // not a PID at all — and a leased-layout run whose PID is just
-        // as dead, which is exactly why it must be spared: its liveness
-        // is the lease's to answer, not /proc's.
+        // not a PID at all — and, in the v2 namespace, a leased-layout
+        // run whose PID is just as dead (its liveness is the lease's to
+        // answer, not /proc's) plus junk, because one rule judges both
+        // namespaces.
         let live = cache.join("stage").join(std::process::id().to_string());
         let dead = cache.join("stage").join(u32::MAX.to_string());
         let junk = cache.join("stage").join("not-a-pid");
         let leased = cache
-            .join("stage")
+            .join(crate::stage::RUN_NAMESPACE)
             .join(format!("{}-0123456789abcdef", u32::MAX));
-        for d in [&live, &dead, &junk, &leased] {
+        let junk_v2 = cache.join(crate::stage::RUN_NAMESPACE).join("not-a-run");
+        // Cross-namespace names: a LIVE bare PID in stage-v2 (so /proc
+        // could only spare it — proving it gets no vote there), and a
+        // leased name in stage/ where nothing legally writes one.
+        let legacy_in_v2 = cache
+            .join(crate::stage::RUN_NAMESPACE)
+            .join(std::process::id().to_string());
+        let leased_in_legacy = cache
+            .join("stage")
+            .join(format!("{}-00000000000000cd", u32::MAX));
+        for d in [
+            &live,
+            &dead,
+            &junk,
+            &leased,
+            &junk_v2,
+            &legacy_in_v2,
+            &leased_in_legacy,
+        ] {
             fs::create_dir_all(d).unwrap();
         }
         let stale = scan_stale_stages(&cache).unwrap();
@@ -5081,6 +5122,15 @@ mod tests {
         assert!(
             !stale.contains(&leased),
             "a leased-layout run is never the /proc heuristic's to condemn"
+        );
+        assert!(stale.contains(&junk_v2), "junk is junk in stage-v2 too");
+        assert!(
+            stale.contains(&legacy_in_v2),
+            "a bare PID in stage-v2 is debris: /proc has no vote outside stage/"
+        );
+        assert!(
+            stale.contains(&leased_in_legacy),
+            "a leased name in stage/ is debris: nothing legally writes one there"
         );
         let _ = fs::remove_dir_all(&root);
     }
