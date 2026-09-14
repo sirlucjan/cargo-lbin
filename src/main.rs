@@ -2071,7 +2071,8 @@ fn cmd_pinned(prefix: &Path, check: bool, json: bool) -> ExitCode {
         let report = if check {
             Some(Report::new(
                 prefix,
-                check_versions(manifest.crates.iter().filter(|(_, e)| e.pinned))?,
+                check_versions(manifest.crates.iter().filter(|(_, e)| e.pinned), || false)?
+                    .expect("a `|| false` token never cancels"),
             )?)
         } else {
             match cache_dir().and_then(|cache| Report::load(&cache, prefix)) {
@@ -2254,11 +2255,20 @@ fn select_targets(manifest: &Manifest, crates: &[String]) -> Result<BTreeSet<Str
 /// Query the index for the given entries and record every answer;
 /// network errors abort rather than under-report. Nothing relevant
 /// offered counts as current.
+/// One index request per crate, `should_cancel` consulted between them:
+/// `Ok(None)` is a cancelled run — an answer, distinct from a failure,
+/// and the check happens before each request so a cancel never pays for
+/// one more round-trip than the one already in flight. The CLI passes
+/// `|| false`; the TUI passes its cancel token.
 fn check_versions<'a>(
     entries: impl IntoIterator<Item = (&'a String, &'a Entry)>,
-) -> Result<Vec<Checked>> {
+    should_cancel: impl Fn() -> bool,
+) -> Result<Option<Vec<Checked>>> {
     let mut checked = Vec::new();
     for (name, entry) in entries {
+        if should_cancel() {
+            return Ok(None);
+        }
         let current = Version::parse(&entry.version)
             .with_context(|| format!("manifest holds unparsable version for `{name}`"))?;
         let versions = index::published_versions(name)?;
@@ -2271,7 +2281,7 @@ fn check_versions<'a>(
             latest,
         });
     }
-    Ok(checked)
+    Ok(Some(checked))
 }
 
 /// A release as `info` prints it: the version, flagged if yanked.
@@ -2613,7 +2623,10 @@ fn cmd_checkupdate(prefix: &Path, json: bool) -> ExitCode {
             let _lock = StateLock::acquire(prefix, &Mode::Shared)?;
             Manifest::load(prefix)?
         };
-        Report::new(prefix, check_versions(&manifest.crates)?)
+        Report::new(
+            prefix,
+            check_versions(&manifest.crates, || false)?.expect("a `|| false` token never cancels"),
+        )
     })();
     match outcome {
         Ok(report) => {
@@ -2703,7 +2716,9 @@ fn cmd_update(prefix: &Path, crates: &[String], all: bool, yes: bool) -> Result<
             .crates
             .iter()
             .filter(|(name, _)| targets.contains(name.as_str())),
+        || false,
     )?
+    .expect("a `|| false` token never cancels")
     .into_iter()
     .filter(Checked::is_outdated)
     .collect();
@@ -4983,6 +4998,25 @@ mod tests {
         );
         assert!(new_log.exists(), "unasked logs are spared");
         let _ = fs::remove_dir_all(&cache);
+    }
+
+    #[test]
+    fn check_versions_honors_the_cancel_before_the_first_request() {
+        // Deterministic and offline by design: the token is consulted
+        // before each index request, so a pre-set cancel returns Ok(None)
+        // without touching the network at all.
+        let entry = Entry {
+            version: "1.0.0".into(),
+            bins: vec!["x".into()],
+            locked: false,
+            pinned: false,
+        };
+        let name = "anything".to_owned();
+        let result = check_versions([(&name, &entry)], || true).unwrap();
+        assert!(
+            result.is_none(),
+            "a cancelled run is an answer, not a report"
+        );
     }
 
     #[test]

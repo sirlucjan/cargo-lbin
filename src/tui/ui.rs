@@ -350,12 +350,20 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         // The degraded key bar advertises only what the gate lets
         // through — a bar promising `u update · i install` over a
         // manifest that will not load is instructions for a door that
-        // is locked — and it renames `r` to what `r` now does.
-        " manifest unavailable · v verify · r retry load · B other prefix · ? help · q quit"
+        // is locked — and it renames `r` to what `r` now does. With a
+        // one-shot running (a degraded verify), its cancel door is one
+        // of the working keys, so the bar says so.
+        if app.oneshot_running() {
+            " manifest unavailable · c cancel · ? help · q quit"
+        } else {
+            " manifest unavailable · v verify · r retry load · B other prefix · ? help · q quit"
+        }
     } else if app.build_running() {
         // Deliberately uncategorical: the hint describes the controls; the
         // truthful per-press outcome is the runtime message's job.
         " ↑/↓ select · c cancel/escalate · Ctrl-C cancel/quit"
+    } else if app.oneshot_running() {
+        " ↑/↓ select · c cancel · ? help · q quit"
     } else {
         " ↑/↓ select · Tab filter · Enter/u update · U update all · i install · x remove · \
          m migrate · M migrate all · B other prefix · p pin · D downgrade · v verify · r check · s search · ? help · q quit"
@@ -456,10 +464,11 @@ fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
     // The degraded help is its own short page, not the normal one grayed
     // out: the one function still standing must not hand out
     // instructions for locked doors — worst of all `r`, renamed by the
-    // footer. Five keys work; the page lists five.
+    // footer. The page lists only the keys that remain useful here.
     if app.manifest_error.is_some() {
         let lines = [
             "v           verify: audit the broken managed state",
+            "c           cancel the running verify (its result is discarded)",
             "r           retry loading the manifest",
             "B           switch to the other known prefix",
             "q / Esc     quit (from the list)",
@@ -493,7 +502,9 @@ fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
         "c           cancel the running build (again, or automatically",
         "            after ~2s of no effect: SIGKILL); past the placement",
         "            door a cancel is too late: an install finishes placing,",
-        "            a migration proceeds through its retirement attempt",
+        "            a migration proceeds through its retirement attempt;",
+        "            for r/v/s: request cancellation — the update check stops",
+        "            between requests, a verify/search result is discarded",
         "B           jump to the other prefix (/usr/local <-> ~/.local);",
         "            the selection follows the crate when it is visible there",
         "p           pin / unpin selected crate; a pin declares the version:",

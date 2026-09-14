@@ -12,8 +12,9 @@ const INDEX_BASE: &str = "https://index.crates.io";
 /// Connect and whole-request limits for every crates.io call. A stalled
 /// response — the TCP alive, the bytes not coming — would otherwise hang
 /// `checkupdate`/`search`/`info` forever: ureq's default has no overall
-/// timeout, Ctrl-C saves the CLI, and the TUI's one-shot workers have no
-/// cancel door, so the limit here is what guarantees a worker returns.
+/// timeout, Ctrl-C saves the CLI, and the TUI's one-shot cancel is
+/// cooperative — it never interrupts the request already in flight — so
+/// the limit here is still what bounds every wait.
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 

@@ -337,20 +337,44 @@ pub struct BuildReport {
 /// log file.
 const BUILD_TAIL: usize = 40;
 
+/// A one-shot's whole cancel model: a shared flag. Running, cancel
+/// requested (flag set, slot still held until the worker returns —
+/// single-flight stands), finished or cancelled. No grace, no
+/// escalation, no "too late": those belong to builds, which have a
+/// child process and a placement door — a one-shot has neither.
+type CancelFlag = std::sync::Arc<std::sync::atomic::AtomicBool>;
+
+fn cancel_flag() -> CancelFlag {
+    CancelFlag::default()
+}
+
+impl App {
+    /// Idempotent on purpose: a second press changes nothing — there is
+    /// no escalation to offer.
+    fn request_oneshot_cancel(cancel: &CancelFlag) {
+        cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// Background work in flight — at most one, so the busy label is
 /// unambiguous.
 enum Job {
-    Check(Receiver<Result<Vec<Checked>>>),
+    Check {
+        rx: Receiver<Result<Option<Vec<Checked>>>>,
+        cancel: CancelFlag,
+    },
     /// The read-only audit on a worker thread (slow storage; the UI stays
     /// responsive on principle), in the build's framed panel; findings
     /// land in the sticky report — the CLI's severity split.
     Verify {
         rx: Receiver<Result<crate::VerifyReport>>,
         started: std::time::Instant,
+        cancel: CancelFlag,
     },
     Search {
         query: String,
         rx: Receiver<Result<Vec<api::Hit>>>,
+        cancel: CancelFlag,
     },
     /// A captured single-crate install streaming over `rx`.
     Build {
@@ -392,9 +416,31 @@ enum Job {
 impl Job {
     fn label(&self) -> String {
         match self {
-            Job::Check(_) => "checking crates.io for updates…".to_owned(),
-            Job::Verify { .. } => "verifying the prefix…".to_owned(),
-            Job::Search { query, .. } => format!("searching crates.io for `{query}`…"),
+            Job::Check { cancel, .. } => {
+                if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                    "cancelling the update check…".to_owned()
+                } else {
+                    "checking crates.io for updates…".to_owned()
+                }
+            }
+            Job::Verify { cancel, .. } => {
+                if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                    // "requested", not "cancelling": the audit is not
+                    // interrupted — it finishes and its report is
+                    // discarded. The label must not suggest a power the
+                    // door does not have.
+                    "verify: cancel requested…".to_owned()
+                } else {
+                    "verifying the prefix…".to_owned()
+                }
+            }
+            Job::Search { query, cancel, .. } => {
+                if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                    format!("search `{query}`: cancel requested…")
+                } else {
+                    format!("searching crates.io for `{query}`…")
+                }
+            }
             Job::Build { name, .. } => format!("building {name}…"),
         }
     }
@@ -599,6 +645,15 @@ impl App {
         matches!(self.job, Some(Job::Build { .. }))
     }
 
+    /// A one-shot (check, verify, search) holds the slot; the footer
+    /// advertises its cancel door.
+    pub fn oneshot_running(&self) -> bool {
+        matches!(
+            self.job,
+            Some(Job::Check { .. } | Job::Verify { .. } | Job::Search { .. })
+        )
+    }
+
     /// Anything running or queued — the union every in-place mutation and
     /// the jump consult: a batch between members has an empty job slot
     /// and a full queue, and both count.
@@ -668,10 +723,20 @@ impl App {
         const FRAMES: [char; 8] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧'];
         // A running verify borrows the build's framed panel: one mechanism,
         // so the two cannot drift apart by hand.
-        if let Some(Job::Verify { started, .. }) = &self.job {
+        if let Some(Job::Verify {
+            started, cancel, ..
+        }) = &self.job
+        {
             let frame = FRAMES[self.ticks % FRAMES.len()];
+            // The panel tells the same truth as the footer label: after c
+            // the state is cancel-requested, not "still checking".
+            let state = if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                "cancel requested"
+            } else {
+                "checking"
+            };
             return Some(format!(
-                "{frame} verify: checking {} · elapsed {}",
+                "{frame} verify: {state} {} · elapsed {}",
                 self.prefix.display(),
                 format_elapsed(started.elapsed())
             ));
@@ -1690,6 +1755,11 @@ impl App {
                 | KeyCode::Char('?')
                 | KeyCode::Char('B')
                 | KeyCode::Esc => {}
+                // The cancel door the degraded verify opened: v works
+                // here on purpose, so c must reach its running job — the
+                // gate swallowing it would answer a cancel with repair
+                // instructions.
+                KeyCode::Char('c') if self.oneshot_running() => {}
                 KeyCode::Char('r') => {
                     match self.reload() {
                         Ok(ReloadOutcome::Loaded) => {
@@ -1728,26 +1798,51 @@ impl App {
                     self.should_quit = true;
                 }
             }
-            // Cancel and stay: first press SIGTERMs the group, a second
-            // SIGKILLs. Without a build, silence — nothing else could be meant.
+            // Cancel and stay. Builds escalate: first press SIGTERMs the
+            // group, a second SIGKILLs. One-shots set a flag and nothing
+            // more. With no job, silence — nothing else could be meant.
             KeyCode::Char('c') => {
-                if let Some(Job::Build { name, control, .. }) = &self.job {
-                    let name = name.clone();
-                    match control.request_cancel() {
-                        crate::CancelOutcome::Accepted => {
-                            self.arm_cancel_grace();
-                            self.info(&format!("cancelling {name}… (c again sends SIGKILL)"));
-                        }
-                        crate::CancelOutcome::Killed => {
-                            self.warn(&format!("SIGKILL sent to the {name} build"));
-                        }
-                        crate::CancelOutcome::AlreadyStopping => {
-                            self.info("the build is already stopping");
-                        }
-                        crate::CancelOutcome::TooLate => {
-                            self.info("placement already started; too late to cancel");
+                match &self.job {
+                    Some(Job::Build { name, control, .. }) => {
+                        let name = name.clone();
+                        match control.request_cancel() {
+                            crate::CancelOutcome::Accepted => {
+                                self.arm_cancel_grace();
+                                self.info(&format!("cancelling {name}… (c again sends SIGKILL)"));
+                            }
+                            crate::CancelOutcome::Killed => {
+                                self.warn(&format!("SIGKILL sent to the {name} build"));
+                            }
+                            crate::CancelOutcome::AlreadyStopping => {
+                                self.info("the build is already stopping");
+                            }
+                            crate::CancelOutcome::TooLate => {
+                                self.info("placement already started; too late to cancel");
+                            }
                         }
                     }
+                    // One-shots: a flag, not the build's machinery — no
+                    // grace, no escalation, no "too late". The slot stays
+                    // held until the worker returns: the check worker
+                    // exits between index requests, search is bounded by
+                    // the agent's timeouts, and verify may sit in the
+                    // shared-lock wait — none of which this door
+                    // interrupts; results arriving after the flag are
+                    // discarded.
+                    Some(Job::Check { cancel, .. }) => {
+                        Self::request_oneshot_cancel(cancel);
+                        self.info("cancelling the update check…");
+                    }
+                    Some(Job::Verify { cancel, .. }) => {
+                        Self::request_oneshot_cancel(cancel);
+                        self.info("verify: cancel requested — the result will be discarded");
+                    }
+                    Some(Job::Search { query, cancel, .. }) => {
+                        let note = format!("search `{query}`: cancel requested…");
+                        Self::request_oneshot_cancel(cancel);
+                        self.info(&note);
+                    }
+                    None => {}
                 }
             }
             KeyCode::Char('?') => self.show_help = true,
@@ -2262,6 +2357,7 @@ impl App {
         self.job = Some(Job::Verify {
             rx,
             started: std::time::Instant::now(),
+            cancel: cancel_flag(),
         });
     }
 
@@ -2365,10 +2461,16 @@ impl App {
             })
             .collect();
         let (tx, rx) = mpsc::channel();
+        let cancel = cancel_flag();
+        let token = cancel.clone();
         thread::spawn(move || {
-            let _ = tx.send(crate::check_versions(&entries));
+            // Consulted between index requests: a cancel stops after the
+            // round-trip already in flight, never pays for another.
+            let _ = tx.send(crate::check_versions(&entries, || {
+                token.load(std::sync::atomic::Ordering::Relaxed)
+            }));
         });
-        self.job = Some(Job::Check(rx));
+        self.job = Some(Job::Check { rx, cancel });
         self.message = None;
     }
 
@@ -2381,7 +2483,11 @@ impl App {
         thread::spawn(move || {
             let _ = tx.send(api::search(&q, SEARCH_HITS));
         });
-        self.job = Some(Job::Search { query, rx });
+        self.job = Some(Job::Search {
+            query,
+            rx,
+            cancel: cancel_flag(),
+        });
         self.message = None;
     }
 
@@ -2393,23 +2499,59 @@ impl App {
             return Ok(());
         };
         match job {
-            Job::Check(rx) => match rx.try_recv() {
-                Ok(result) => self.finish_check(result),
-                Err(TryRecvError::Empty) => self.job = Some(Job::Check(rx)),
+            Job::Check { rx, cancel } => match rx.try_recv() {
+                Ok(result) => {
+                    // The collector is the last cancel boundary: the flag
+                    // can flip while the final request is in flight, and
+                    // the worker's completed answer — Ok(Some(...)) or an
+                    // Err alike — arrives after the person already said
+                    // no. Persisting that report, or reporting "failed",
+                    // would both contradict the cancel the UI accepted.
+                    if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                        self.info("update check cancelled");
+                    } else {
+                        self.finish_check(result);
+                    }
+                }
+                Err(TryRecvError::Empty) => self.job = Some(Job::Check { rx, cancel }),
                 Err(TryRecvError::Disconnected) => {
                     bail!("update check worker aborted; the terminal was reset by the panic")
                 }
             },
-            Job::Verify { rx, started } => match rx.try_recv() {
-                Ok(result) => self.finish_verify(result),
-                Err(TryRecvError::Empty) => self.job = Some(Job::Verify { rx, started }),
+            Job::Verify {
+                rx,
+                started,
+                cancel,
+            } => match rx.try_recv() {
+                Ok(result) => {
+                    // The audit ran to completion either way; a requested
+                    // cancel discards the report instead of pinning it.
+                    if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                        self.info("verify cancelled — the result was discarded");
+                    } else {
+                        self.finish_verify(result);
+                    }
+                }
+                Err(TryRecvError::Empty) => {
+                    self.job = Some(Job::Verify {
+                        rx,
+                        started,
+                        cancel,
+                    });
+                }
                 Err(TryRecvError::Disconnected) => {
                     bail!("verify worker aborted; the terminal was reset by the panic")
                 }
             },
-            Job::Search { query, rx } => match rx.try_recv() {
-                Ok(result) => self.finish_search(query, result),
-                Err(TryRecvError::Empty) => self.job = Some(Job::Search { query, rx }),
+            Job::Search { query, rx, cancel } => match rx.try_recv() {
+                Ok(result) => {
+                    if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                        self.info(&format!("search for `{query}` cancelled"));
+                    } else {
+                        self.finish_search(query, result);
+                    }
+                }
+                Err(TryRecvError::Empty) => self.job = Some(Job::Search { query, rx, cancel }),
                 Err(TryRecvError::Disconnected) => {
                     bail!("search worker aborted; the terminal was reset by the panic")
                 }
@@ -2508,8 +2650,22 @@ impl App {
     /// Same semantics as `checkupdate`: reaching the index is success
     /// even if the report could not persist — shown from memory, the
     /// persistence failure a warning.
-    fn finish_check(&mut self, result: Result<Vec<Checked>>) {
-        let report = match result.and_then(|checked| Report::new(&self.prefix, checked)) {
+    fn finish_check(&mut self, result: Result<Option<Vec<Checked>>>) {
+        let checked = match result {
+            // `Ok(None)` is the worker honoring the cancel between index
+            // requests: no report to build, nothing to persist — the
+            // partial answer is discarded, not stored as if complete.
+            Ok(None) => {
+                self.info("update check cancelled");
+                return;
+            }
+            Ok(Some(checked)) => checked,
+            Err(e) => {
+                self.error(&format!("update check failed: {e:#}"));
+                return;
+            }
+        };
+        let report = match Report::new(&self.prefix, checked) {
             Ok(report) => report,
             Err(e) => {
                 self.error(&format!("update check failed: {e:#}"));
@@ -3430,6 +3586,17 @@ mod tests {
             app.busy().is_some(),
             "the audit runs from the degraded state"
         );
+
+        // ...and so is its cancel door: the gate must not swallow c and
+        // answer a cancel with repair instructions.
+        app.on_key(KeyEvent::from(KeyCode::Char('c')));
+        let Some(Job::Verify { cancel, .. }) = &app.job else {
+            panic!("verify still owns the slot");
+        };
+        assert!(
+            cancel.load(std::sync::atomic::Ordering::Relaxed),
+            "c reached the running verify through the degraded gate"
+        );
         app.job = None; // the verify worker's slot, released for the test
 
         // ? opens the degraded page: the gate lets the key through and the
@@ -3519,6 +3686,93 @@ mod tests {
         );
         assert!(text.contains("cannot be loaded"), "{text}");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_check_result_arriving_after_the_cancel_is_discarded() {
+        // The race the collector boundary closes: the flag flips while
+        // the last request is in flight, the worker's completed answer
+        // arrives anyway — Ok(Some) and Err alike. Persisting that
+        // report, or saying "failed", would contradict the cancel the UI
+        // already accepted.
+        let prefix = std::env::temp_dir().join("cargo-lbin-test-check-race");
+        let _ = std::fs::create_dir_all(prefix.join("share/cargo-lbin"));
+        let _ = std::fs::create_dir_all(prefix.join("bin"));
+        let mut app = App::new(&prefix).unwrap();
+        app.cache = prefix.join("cache-isolated");
+
+        // Ok(Some) after the flag: discarded, nothing persisted.
+        let (tx, rx) = mpsc::channel();
+        app.job = Some(Job::Check {
+            rx,
+            cancel: cancel_flag(),
+        });
+        app.on_key(KeyEvent::from(KeyCode::Char('c')));
+        tx.send(Ok(Some(Vec::new()))).unwrap();
+        app.poll_job().unwrap();
+        assert!(app.job.is_none(), "the slot is freed");
+        let text = app.message.as_ref().unwrap().text.clone();
+        assert!(text.contains("cancelled"), "{text}");
+        assert!(
+            !app.cache.exists(),
+            "a cancelled check persists nothing — the report store was never touched"
+        );
+
+        // Err after the flag: still "cancelled", never "failed".
+        let (tx, rx) = mpsc::channel();
+        app.job = Some(Job::Check {
+            rx,
+            cancel: cancel_flag(),
+        });
+        app.on_key(KeyEvent::from(KeyCode::Char('c')));
+        tx.send(Err(anyhow::anyhow!("network died mid-flight")))
+            .unwrap();
+        app.poll_job().unwrap();
+        let text = app.message.as_ref().unwrap().text.clone();
+        assert!(
+            text.contains("cancelled") && !text.contains("failed"),
+            "an error after the cancel is the cancel's outcome, not a failure: {text}"
+        );
+        let _ = std::fs::remove_dir_all(&prefix);
+    }
+
+    #[test]
+    fn a_oneshot_cancel_is_a_flag_and_a_discarded_result() {
+        // The whole model in one walk: running -> c sets the flag and the
+        // label says so -> the arrived result is discarded, the slot
+        // freed, one cancelled note shown. No grace, no escalation.
+        let prefix = std::env::temp_dir().join("cargo-lbin-test-oneshot-cancel");
+        let _ = std::fs::create_dir_all(prefix.join("share/cargo-lbin"));
+        let _ = std::fs::create_dir_all(prefix.join("bin"));
+        let mut app = App::new(&prefix).unwrap();
+        let (tx, rx) = mpsc::channel();
+        app.job = Some(Job::Search {
+            query: "tokio".into(),
+            rx,
+            cancel: cancel_flag(),
+        });
+        assert!(app.job.as_ref().unwrap().label().starts_with("searching"));
+        app.on_key(KeyEvent::from(KeyCode::Char('c')));
+        let Some(Job::Search { cancel, .. }) = &app.job else {
+            panic!("the slot stays held until the worker returns");
+        };
+        assert!(cancel.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(
+            app.job
+                .as_ref()
+                .unwrap()
+                .label()
+                .contains("cancel requested"),
+            "the label names the state, not a power the door lacks"
+        );
+        // The worker returns a full result; the cancel discards it.
+        tx.send(Ok(Vec::new())).unwrap();
+        app.poll_job().unwrap();
+        assert!(app.job.is_none(), "the slot is freed");
+        assert!(app.search_result.is_none(), "the result was discarded");
+        let text = app.message.as_ref().unwrap().text.clone();
+        assert!(text.contains("cancelled"), "{text}");
+        let _ = std::fs::remove_dir_all(&prefix);
     }
 
     #[test]

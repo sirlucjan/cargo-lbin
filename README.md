@@ -624,7 +624,7 @@ The TUI starts entirely from disk — the manifest and the last `checkupdate` re
 | `m` | Migrate the selected crate to the other prefix (asks first; known pair only) |
 | `M` | Migrate every crate to the other prefix (asks first; `c` cancels the batch) |
 | `B` | Jump to the other prefix of the known pair; the selection follows the crate |
-| `c` | Cancel the running in-place build (a second `c` sends SIGKILL) |
+| `c` | Cancel the running operation: for a build, a second `c` sends SIGKILL; for `r`/`v`/`s`, a cancel request — the update check stops between requests, a verify/search result is discarded on arrival |
 | `p` | Pin or unpin the selected crate; in place unless pinning needs `sudo` |
 | `D` | Downgrade the selected crate; the version prompt appears in the terminal |
 | `r` | Run `checkupdate` and refresh the saved report |
