@@ -107,7 +107,7 @@ cargo lbin tui
 | `verify [--json]` | Check the manifest's claims against the disk, read-only; non-zero exit on verification errors |
 | `clean [--dry-run] [--stages] [--logs-older-than DAYS]` | Remove build debris from the cache; every removal is opt-in — name at least one of the two |
 | `search <terms>... [--limit N]` | Find crates by keyword |
-| `info <crate>...` | Show exact-name crate information and installed state |
+| `info <crate>... [--versions]` | Show exact-name crate information and installed state |
 | `tui` | Interactive frontend over the same operations, when the `tui` feature is enabled |
 | `completions <shell>` | Print a shell completion script for the commands and flags |
 | `man DIR` | Write man pages (roff) for cargo-lbin and every subcommand into DIR |
@@ -174,7 +174,7 @@ Example:
 
 The displayed version prefers the newest stable version reported by crates.io. If none is available, `cargo-lbin` falls back to crates.io's default version and then its legacy newest-version field. No matches is a valid answer, not an error.
 
-Search results are only a discovery view. Use `info` when you want the exact release history and update eligibility for a chosen crate.
+Search results are only a discovery view. Use `info` for exact crate details and update eligibility, and `info --versions` when you want the full published version history.
 
 ## Info
 
@@ -206,6 +206,17 @@ bat
 `latest` and `pre-release` describe published history. They may name a yanked release, which is shown explicitly as `[yanked]`. The pre-release line is shown only when that release is newer than the latest stable release.
 
 The `installed` verdict is a separate question. It uses the same non-yanked update rules as `checkupdate`, so `info` does not call something "up to date" when `checkupdate` would disagree. If a crate has no non-yanked releases left, that is reported explicitly. An installed crate also shows its manifest entry in full — `pinned`, `locked`, and the binaries it provides — so `info` is the complete single-crate view of what `list` shows in aggregate. If the other known prefix carries the crate too, `info` names it with its version (`also in:`), whether or not this prefix has a copy — the other manifest is read without any lock, like every cross-prefix annotation, so the answer never waits behind a foreign build.
+
+`--versions` appends the full published version set to each crate's block, in descending SemVer order, with yanked releases marked:
+
+```text
+  versions:
+    14.1.1
+    14.1.0
+    14.0.3 [yanked]
+```
+
+It lists everything — pre-releases and yanked included — because it answers "install `foo@X`, but which X exists?", and that question is about history, not eligibility; the `installed` verdict above it already applies the eligibility rules. The order is the version axis, not publication time: a `1.9.7` backported after `2.0.0` still sorts below it, which is exactly what the `foo@X` question wants. No separate `versions` command: this is still information about the crate.
 
 Unknown names do not stop the rest of a batch. They are reported after the successful results, with a hint to use `search`; the command exits non-zero if any exact lookup failed.
 

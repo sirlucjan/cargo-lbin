@@ -192,9 +192,18 @@ enum Cmd {
     Tui,
     /// Show one or more crates exactly by name: latest versions and
     /// whether they are installed under the prefix
+    ///
+    /// `--versions` appends the full published version set, in
+    /// descending `SemVer` order, with yanked releases marked — the
+    /// answer to "install foo@X, but which X exists?". It is still
+    /// information about the crate, so it lives here and not in a
+    /// command of its own.
     Info {
         #[arg(required = true)]
         crates: Vec<String>,
+        /// List every published release, highest version first ([yanked] marked)
+        #[arg(long)]
+        versions: bool,
     },
     /// Find crates on crates.io by keyword; marks the ones installed
     /// under the prefix
@@ -328,7 +337,10 @@ fn main() -> ExitCode {
         Cmd::List { json } => cmd_list(&cli.prefix, json),
         #[cfg(feature = "tui")]
         Cmd::Tui => tui::run(&cli.prefix),
-        Cmd::Info { ref crates } => cmd_info(&cli.prefix, crates),
+        Cmd::Info {
+            ref crates,
+            versions,
+        } => cmd_info(&cli.prefix, crates, versions),
         Cmd::Search { ref query, limit } => cmd_search(&cli.prefix, query, limit),
         Cmd::Checkupdate { json } => return cmd_checkupdate(&cli.prefix, json),
         Cmd::Clean {
@@ -2480,6 +2492,26 @@ fn check_versions<'a>(
     Ok(Some(checked))
 }
 
+/// The full published version set, in descending `SemVer` order, one
+/// release per line with `release_label`'s yanked mark. `SemVer` order,
+/// not reverse chronology, on purpose: the question the section
+/// answers — "install foo@X, but which X exists?" — lives on the
+/// version axis, so a 1.9.7 backported *after* 2.0.0 still sorts below
+/// it (the index stores publication order, which is neither). Everything
+/// is listed, pre-releases and yanked included: this is history, and
+/// eligibility is the `installed` line's business, not this section's.
+fn describe_versions(releases: &[index::Release]) -> String {
+    let mut out = String::from("  versions:\n");
+    let mut sorted: Vec<&index::Release> = releases.iter().collect();
+    sorted.sort_by(|a, b| b.version.cmp(&a.version));
+    for release in sorted {
+        // Formatting into a String cannot fail; see `describe_info`.
+        use std::fmt::Write as _;
+        let _ = writeln!(out, "    {}", release_label(release));
+    }
+    out
+}
+
 /// A release as `info` prints it: the version, flagged if yanked.
 fn release_label(release: &index::Release) -> String {
     if release.yanked {
@@ -2568,7 +2600,7 @@ fn describe_info(
 /// Read-only and network-bound like `checkupdate`: manifest snapshot
 /// under a shared lock, queries unlocked; each name independent, exit
 /// code says whether everything was found.
-fn cmd_info(prefix: &Path, crates: &[String]) -> Result<()> {
+fn cmd_info(prefix: &Path, crates: &[String], versions: bool) -> Result<()> {
     for name in crates {
         validate_name(name)?;
     }
@@ -2605,6 +2637,9 @@ fn cmd_info(prefix: &Path, crates: &[String]) -> Result<()> {
                         also.get(*name).map_or(&[][..], Vec::as_slice)
                     )
                 );
+                if versions {
+                    print!("{}", describe_versions(&releases));
+                }
                 shown += 1;
             }
             // `info` is exact by design; the fuzzy question lives one
@@ -3659,6 +3694,42 @@ mod tests {
         assert!(out.contains("also in:"), "{out}");
     }
 
+    /// The history section: descending `SemVer` order — not reverse
+    /// chronology; the index's publication order is neither — with
+    /// everything listed: yanked flagged, pre-releases included,
+    /// because this is history, and eligibility is the `installed`
+    /// line's business.
+    #[test]
+    fn versions_section_lists_history_in_descending_semver_with_yanked_marks() {
+        let rel = |v: &str, yanked: bool| index::Release {
+            version: Version::parse(v).unwrap(),
+            yanked,
+        };
+        // Deliberately out of order and mixed: whatever order came in,
+        // descending `SemVer` comes out.
+        let releases = [
+            rel("2.2.0", true),
+            rel("2.4.0", false),
+            rel("2.3.0", false),
+            rel("2.5.0-rc.1", false),
+            rel("2.3.1", false),
+        ];
+        let out = describe_versions(&releases);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(
+            lines,
+            [
+                "  versions:",
+                "    2.5.0-rc.1",
+                "    2.4.0",
+                "    2.3.1",
+                "    2.3.0",
+                "    2.2.0 [yanked]",
+            ],
+            "{out}"
+        );
+    }
+
     #[test]
     fn cli_shape_is_verified() {
         use clap::CommandFactory;
@@ -3679,6 +3750,9 @@ mod tests {
         assert!(Cli::try_parse_from(["cargo-lbin", "--json", "list"]).is_err());
         assert!(Cli::try_parse_from(["cargo-lbin", "install", "--json", "bat"]).is_err());
         assert!(Cli::try_parse_from(["cargo-lbin", "update", "foo", "bar", "-y"]).is_ok());
+        assert!(Cli::try_parse_from(["cargo-lbin", "info", "foo", "--versions"]).is_ok());
+        // Per command, like --json: accepted only where it does something.
+        assert!(Cli::try_parse_from(["cargo-lbin", "list", "--versions"]).is_err());
         // The cargo-subcommand form strips "lbin" in main(); the parser
         // itself must not accept it.
         assert!(Cli::try_parse_from(["cargo-lbin", "lbin", "update", "--all"]).is_err());
