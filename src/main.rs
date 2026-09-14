@@ -1208,7 +1208,11 @@ pub(crate) struct VerifyReport {
 /// even prepare the lock — shared only where one exists, lockless
 /// otherwise (atomic manifest placement keeps that safe from torn
 /// files). Never writes, prompts or escalates; a finding names the
-/// repair only where lbin has an unambiguous one.
+/// repair only where lbin has an unambiguous one. It never modifies
+/// managed state or filesystem contents; for lease-aware build stages
+/// it may briefly acquire and immediately release a *shared* lease,
+/// solely to determine liveness — a lock no writer can mistake for
+/// ownership and no fellow probe can mistake for a writer.
 ///
 /// Two phases by lock scope: hard invariants under the shared lock;
 /// environmental observations after it drops — nobody's install should
@@ -1301,10 +1305,11 @@ pub(crate) fn verify_prefix(
             ..Finding::plain(
                 "stale-stages",
                 format!(
-                    "{} stage director{} under {} whose owning cargo-lbin process is \
-                     gone — possible leftover build debris; inspect, then \
-                     `cargo lbin clean --stages` when safe (a PID can be reused, \
-                     and an orphaned build may still hold the directory)",
+                    "{} stage director{} under {} with no live owner — possible \
+                     leftover build debris; inspect, then `cargo lbin clean --stages` \
+                     when safe (for pre-lease stages the owner test is a PID \
+                     heuristic: a PID can be reused, and an orphaned build may \
+                     still hold the directory)",
                     stale.len(),
                     if stale.len() == 1 { "y" } else { "ies" },
                     cache.display()
@@ -1667,11 +1672,15 @@ fn scan_stage_dir(dir: &Path, leased: bool, stale: &mut Vec<PathBuf>) -> std::io
             (false, Some(stage::StageRun::LegacyPid(pid))) => {
                 !Path::new(&format!("/proc/{pid}")).exists()
             }
-            // Never stale here yet: liveness for this layout is the
-            // lease, and until the probe exists the only safe answer
-            // is to spare the run. A wrong "stale" is a deletable lie;
-            // a wrong "leave it" costs disk until the next pass.
-            (true, Some(stage::StageRun::LeasedRun { .. })) => false,
+            // Liveness for this layout is the lease's to answer, and
+            // only "released" convicts: held is a live writer, unknown
+            // (no lease, or one that would not open or lock — a
+            // symlinked run path among them) is the creation window or
+            // worse and proves nothing. A wrong "stale" is a deletable
+            // lie; a wrong "leave it" costs disk until the next pass.
+            (true, Some(stage::StageRun::LeasedRun { .. })) => {
+                stage::probe_lease(&entry.path()) == stage::LeaseState::Released
+            }
             // Junk names, and run names wearing the other namespace's
             // format: not a run at all, debris.
             _ => true,
@@ -5104,17 +5113,19 @@ mod tests {
         assert_eq!(scan_stale_stages(&cache).unwrap(), Vec::<PathBuf>::new());
 
         // A live PID (ours), a PID /proc cannot know, a name that is
-        // not a PID at all — and, in the v2 namespace, a leased-layout
-        // run whose PID is just as dead (its liveness is the lease's to
-        // answer, not /proc's) plus junk, because one rule judges both
-        // namespaces.
+        // not a PID at all — and, in the v2 namespace, one leased run
+        // per probe answer, junk, both cross-namespace shapes and a
+        // symlinked bait. The leased runs' PIDs are all dead on
+        // purpose: /proc must have no vote in stage-v2.
         let live = cache.join("stage").join(std::process::id().to_string());
         let dead = cache.join("stage").join(u32::MAX.to_string());
         let junk = cache.join("stage").join("not-a-pid");
-        let leased = cache
+        let junk_v2 = cache.join(crate::stage::RUN_NAMESPACE).join("not-a-run");
+        // Unknown: the run name is published but .lease is not there —
+        // the creation window, frozen.
+        let window = cache
             .join(crate::stage::RUN_NAMESPACE)
             .join(format!("{}-0123456789abcdef", u32::MAX));
-        let junk_v2 = cache.join(crate::stage::RUN_NAMESPACE).join("not-a-run");
         // Cross-namespace names: a LIVE bare PID in stage-v2 (so /proc
         // could only spare it — proving it gets no vote there), and a
         // leased name in stage/ where nothing legally writes one.
@@ -5124,17 +5135,39 @@ mod tests {
         let leased_in_legacy = cache
             .join("stage")
             .join(format!("{}-00000000000000cd", u32::MAX));
+        // Held: a lease this test keeps alive across the scan.
+        let held = cache
+            .join(crate::stage::RUN_NAMESPACE)
+            .join(format!("{}-00000000000000aa", u32::MAX));
+        // Released: a lease acquired and dropped — the one answer that
+        // convicts.
+        let released = cache
+            .join(crate::stage::RUN_NAMESPACE)
+            .join(format!("{}-00000000000000bb", u32::MAX));
+        // A symlinked "run" wearing a valid name, pointing at a
+        // directory with an unlocked lease: the probe must answer
+        // unknown, never follow.
+        let outside = root.join("outside");
+        fs::create_dir_all(outside.join("keep")).unwrap();
+        fs::write(outside.join(".lease"), b"").unwrap();
+        let linked = cache
+            .join(crate::stage::RUN_NAMESPACE)
+            .join(format!("{}-00000000000000ce", u32::MAX));
+        fs::create_dir_all(cache.join(crate::stage::RUN_NAMESPACE)).unwrap();
+        std::os::unix::fs::symlink(&outside, &linked).unwrap();
         for d in [
             &live,
             &dead,
             &junk,
-            &leased,
+            &window,
             &junk_v2,
             &legacy_in_v2,
             &leased_in_legacy,
         ] {
             fs::create_dir_all(d).unwrap();
         }
+        let _holder = crate::stage::Lease::acquire(&held).unwrap();
+        drop(crate::stage::Lease::acquire(&released).unwrap());
         let stale = scan_stale_stages(&cache).unwrap();
         assert!(
             !stale.contains(&live),
@@ -5143,8 +5176,16 @@ mod tests {
         assert!(stale.contains(&dead), "a dead PID's stage is debris");
         assert!(stale.contains(&junk), "a non-PID name is debris");
         assert!(
-            !stale.contains(&leased),
-            "a leased-layout run is never the /proc heuristic's to condemn"
+            !stale.contains(&window),
+            "a run without a lease is unknown, and unknown is spared"
+        );
+        assert!(
+            !stale.contains(&held),
+            "a held lease is a live writer, dead PID or not"
+        );
+        assert!(
+            stale.contains(&released),
+            "a released lease is the one answer that convicts"
         );
         assert!(stale.contains(&junk_v2), "junk is junk in stage-v2 too");
         assert!(
@@ -5154,6 +5195,14 @@ mod tests {
         assert!(
             stale.contains(&leased_in_legacy),
             "a leased name in stage/ is debris: nothing legally writes one there"
+        );
+        assert!(
+            !stale.contains(&linked),
+            "a symlinked run path probes as unknown: spared, never followed"
+        );
+        assert!(
+            outside.join("keep").exists() && outside.join(".lease").exists(),
+            "zero traversal: the link's target is untouched by the scan"
         );
         let _ = fs::remove_dir_all(&root);
     }

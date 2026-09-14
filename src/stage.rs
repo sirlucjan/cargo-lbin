@@ -327,6 +327,59 @@ pub fn release_and_remove_run(lease: Lease, run_dir: &Path) {
     // with. Either way the run stays, and stays somebody's finding.
 }
 
+/// What a shared, non-blocking probe of a run's lease learned.
+///
+/// Three answers, not two, and the third is the one that keeps the
+/// mechanism honest: creation is not atomic — `mkdir` publishes the
+/// run name before `.lease` exists — so a missing or unopenable lease
+/// proves nothing about liveness, and unknown must be spared exactly
+/// like held. Only a lease that was there and takeable convicts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LeaseState {
+    /// The lease is held: a writer, or something it spawned, is alive.
+    Held,
+    /// The lease was takeable: no writer remains.
+    Released,
+    /// No `.lease`, or one that would not open or lock: the creation
+    /// window, or a filesystem with opinions — not evidence.
+    Unknown,
+}
+
+/// Probe a run's lease with `LOCK_SH | LOCK_NB` and let go at once.
+///
+/// Shared on purpose: the live writer holds `LOCK_EX`, so any probe
+/// against a real owner blocks either way — but two concurrent probes
+/// must not see *each other* as owners, and with `LOCK_EX` probes they
+/// would, a false classification manufactured by the probe's own
+/// implementation. `LOCK_SH` lets every reader through and stops at
+/// exactly the thing that matters: a writer. The probe's own lock ends
+/// when `file` drops on return.
+#[must_use]
+pub fn probe_lease(run_dir: &Path) -> LeaseState {
+    use std::os::fd::AsRawFd;
+    // A run path that is not a real directory is not a run: probing
+    // through a top-level symlink would read someone else's lease as
+    // this run's, and a released-through-a-link answer could then hand
+    // clean a removal license for the link's target. Not evidence.
+    if require_real_run_dir(run_dir).is_err() {
+        return LeaseState::Unknown;
+    }
+    let Ok(file) = fs::File::open(run_dir.join(LEASE_FILE)) else {
+        return LeaseState::Unknown;
+    };
+    // SAFETY: flock(2) on an owned, open descriptor; no memory is
+    // passed.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) } == 0 {
+        LeaseState::Released
+    } else if std::io::Error::last_os_error().kind() == std::io::ErrorKind::WouldBlock {
+        LeaseState::Held
+    } else {
+        // A lock that failed for any reason but contention answered a
+        // different question: not evidence.
+        LeaseState::Unknown
+    }
+}
+
 /// A fresh `<pid>-<nonce>` name for this run. The nonce comes from
 /// `getrandom(2)`: no seed to manage, no clock to collide on, and no
 /// file descriptor to leak — two runs in the same nanosecond are a
@@ -1252,6 +1305,56 @@ mod tests {
             "a close-on-exec lease dies with this process — the one lifetime it must outlive"
         );
         drop(lease);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The probe's three answers, plus the property the shared mode
+    /// was chosen for: two probes at once both pass — a fellow reader
+    /// is not a writer — while an exclusive taker is refused as long
+    /// as any reader is inside.
+    #[test]
+    fn probing_answers_unknown_held_released_and_readers_coexist() {
+        use std::os::fd::AsRawFd;
+        let root = std::env::temp_dir().join("cargo-lbin-test-lease-probe");
+        let _ = fs::remove_dir_all(&root);
+
+        // Published name, no lease yet: the creation window. A
+        // separate directory — acquire's create_dir enforces the
+        // fresh-name promise and would rightly refuse a pre-made one.
+        let window = root.join("12345-00000000000000ee");
+        fs::create_dir_all(&window).unwrap();
+        assert_eq!(probe_lease(&window), LeaseState::Unknown);
+
+        let run = root.join("12345-00000000000000cc");
+        let lease = Lease::acquire(&run).unwrap();
+        assert_eq!(probe_lease(&run), LeaseState::Held);
+
+        // Two readers at once: probe A holds LOCK_SH while probe B
+        // runs; B must still see the writer, not the reader.
+        drop(lease);
+        let reader = fs::File::open(run.join(LEASE_FILE)).unwrap();
+        // SAFETY: flock(2) on an owned, open descriptor.
+        assert_eq!(
+            unsafe { libc::flock(reader.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) },
+            0,
+            "no writer left: the reader's shared lock goes through"
+        );
+        assert_eq!(
+            probe_lease(&run),
+            LeaseState::Released,
+            "a fellow reader must never register as an owner"
+        );
+        // And the exclusive side of the same coin: while a reader is
+        // inside, a would-be exclusive taker is refused.
+        let taker = fs::File::open(run.join(LEASE_FILE)).unwrap();
+        // SAFETY: as above.
+        assert_eq!(
+            unsafe { libc::flock(taker.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            -1,
+            "a reader inside refuses the exclusive taker"
+        );
+        drop(reader);
+        assert_eq!(probe_lease(&run), LeaseState::Released);
         let _ = fs::remove_dir_all(&root);
     }
 
