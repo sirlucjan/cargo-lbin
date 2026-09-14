@@ -5292,6 +5292,121 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    /// The feature's core claim, end to end through the real producer
+    /// path: the lease belongs to the open file description, not to
+    /// cargo-lbin. A fake cargo backgrounds a sleeper (which inherits
+    /// the descriptor — the exec-survival the `FD_CLOEXEC` clearing
+    /// exists for) and exits 1, so the install fails, keeps its run as
+    /// forensics, and drops the creator's descriptor on return — the
+    /// same closure a process death performs. While the orphan runs,
+    /// verify must call the run owned and clean must not touch it; the
+    /// moment the orphan exits, released is the verdict and clean may
+    /// take the lease and finish. Deadlines watch the lease itself,
+    /// not /proc: an unreaped zombie still has a /proc entry, but the
+    /// kernel closed its descriptors at exit — the lock is the truth.
+    #[test]
+    fn a_lease_outlives_its_creator_while_any_inheritor_runs() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join("cargo-lbin-test-lease-inheritance");
+        let _ = fs::remove_dir_all(&root);
+        let prefix = root.join("prefix");
+        fs::create_dir_all(prefix.join("bin")).unwrap();
+        fs::create_dir_all(prefix.join("share/cargo-lbin")).unwrap();
+        let cache = root.join("cache");
+        let fake_bin = root.join("fakebin");
+        fs::create_dir_all(&fake_bin).unwrap();
+
+        let pid_file = root.join("orphan.pid");
+        let stop_file = root.join("orphan.stop");
+        let script = fake_bin.join("cargo");
+        fs::write(
+            &script,
+            format!(
+                // The iteration cap is the orphan's own safety net: a
+                // test panicking before the stop file exists must not
+                // strand a sleeper on the runner forever.
+                "#!/bin/sh\n\
+                 sh -c 'echo $$ > \"{pid}\"; n=0; \
+                 while [ ! -e \"{stop}\" ] && [ \"$n\" -lt 600 ]; do n=$((n+1)); sleep 0.05; done' &\n\
+                 exit 1\n",
+                pid = pid_file.display(),
+                stop = stop_file.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        let _fake = crate::stage::FakeCargo::install(&script);
+
+        let err = install_and_commit(
+            &prefix,
+            &cache,
+            &mut Manifest::default(),
+            "ghostcrate",
+            None,
+            false,
+            PinPolicy::Infer,
+            &mut Frontend::Terminal,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("failed"),
+            "the fake build fails by design: {err:#}"
+        );
+
+        // The failed run is kept as forensics, lease file included.
+        let runs: Vec<PathBuf> = fs::read_dir(cache.join(crate::stage::RUN_NAMESPACE))
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        assert_eq!(runs.len(), 1, "one failed run, kept: {runs:?}");
+        let run = runs[0].clone();
+
+        // The orphan announced itself; the creator's descriptor is
+        // already gone — install_and_commit returned above.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !pid_file.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the orphan never announced itself"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(
+            crate::stage::probe_lease(&run),
+            crate::stage::LeaseState::Held,
+            "creator dead, inheritor alive: the lease stands"
+        );
+        assert_eq!(
+            scan_stale_stages(&cache).unwrap(),
+            Vec::<PathBuf>::new(),
+            "an owned run is nobody's debris"
+        );
+        clean_cache(&cache, false, true, None).unwrap();
+        assert!(run.exists(), "clean must not touch an owned run");
+
+        // The orphan exits; its descriptors close with it, reaped or
+        // not — the lease is the thing to watch. A fresh deadline: the
+        // release gets its full allowance, not whatever the startup
+        // wait left over.
+        fs::write(&stop_file, b"").unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while crate::stage::probe_lease(&run) != crate::stage::LeaseState::Released {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the lease never released after the last inheritor exited"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let stale = scan_stale_stages(&cache).unwrap();
+        assert!(
+            stale.contains(&run),
+            "with the last inheritor gone, released convicts"
+        );
+        clean_cache(&cache, false, true, None).unwrap();
+        assert!(!run.exists(), "clean takes the lease and finishes the job");
+        let _ = fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn check_versions_honors_the_cancel_before_the_first_request() {
         // Deterministic and offline by design: the token is consulted
