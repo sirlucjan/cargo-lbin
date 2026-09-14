@@ -3979,6 +3979,91 @@ mod tests {
         );
     }
 
+    /// The decision matrix from the Phase V plan, at the facts level —
+    /// the single authority both surfaces render from, so parity is by
+    /// construction and this matrix is the parity test. The renderer's
+    /// own shape (exactly three lines per fact, order preserved) is
+    /// pinned alongside: a multi-crate batch must not lose a duplicate
+    /// between deciding and wording.
+    #[test]
+    fn cross_prefix_duplicate_decision_matrix() {
+        use std::collections::BTreeMap;
+        let here = PathBuf::from("/tmp/custom prefix");
+        let mut also: BTreeMap<String, Vec<prefixes::AlsoIn>> = BTreeMap::new();
+        // `both` is managed under BOTH known others — legal exactly when
+        // the current prefix is a custom one — and `there` under one.
+        also.insert(
+            "both".to_owned(),
+            vec![
+                prefixes::AlsoIn {
+                    prefix: PathBuf::from("/usr/local"),
+                    version: "1.0.0".to_owned(),
+                },
+                prefixes::AlsoIn {
+                    prefix: PathBuf::from("/home/u/.local"),
+                    version: "1.1.0".to_owned(),
+                },
+            ],
+        );
+        also.insert(
+            "there".to_owned(),
+            vec![prefixes::AlsoIn {
+                prefix: PathBuf::from("/usr/local"),
+                version: "2.0.0".to_owned(),
+            }],
+        );
+        let local = manifest_with(&["here-only", "there"]);
+
+        // Only local: no duplicate to create.
+        let d = cross_prefix_duplicates_from(&also, &here, &local, std::iter::once("here-only"));
+        assert!(d.is_empty(), "local-only never warns");
+        // Local AND foreign: the duplication stands already — silence.
+        let d = cross_prefix_duplicates_from(&also, &here, &local, std::iter::once("there"));
+        assert!(
+            d.is_empty(),
+            "a standing duplicate is verify's, not install's"
+        );
+        // Foreign only: one entry, with an honest quoted hint — the
+        // custom prefix needs its space quoted.
+        let empty = Manifest::default();
+        let d = cross_prefix_duplicates_from(&also, &here, &empty, std::iter::once("there"));
+        assert_eq!(d.len(), 1);
+        assert_eq!(d[0].other_version, "2.0.0");
+        assert_eq!(
+            d[0].migrate_hint.as_deref(),
+            Some("cargo lbin migrate there --prefix=/usr/local --to='/tmp/custom prefix'"),
+            "{:?}",
+            d[0].migrate_hint
+        );
+        // Managed under both known others: one block per foreign copy —
+        // the docs' promise, pinned.
+        let d = cross_prefix_duplicates_from(&also, &here, &empty, std::iter::once("both"));
+        assert_eq!(d.len(), 2, "one entry per foreign managed copy");
+        assert_eq!(d[0].other_version, "1.0.0");
+        assert_eq!(d[1].other_version, "1.1.0");
+        // Unknown everywhere: silence.
+        assert!(
+            cross_prefix_duplicates_from(&also, &here, &empty, std::iter::once("nowhere"))
+                .is_empty()
+        );
+
+        // The renderer: three lines per fact, order preserved — the
+        // multi-copy batch loses nothing between deciding and wording.
+        let lines = duplicate_install_warning_lines(&d_all(&also, &here, &empty), &here);
+        assert_eq!(lines.len(), 3 * 3, "{lines:?}");
+        assert!(lines[0].contains("`both`") && lines[3].contains("`both`"));
+        assert!(lines[6].contains("`there`"));
+    }
+
+    /// The matrix's batch, in input order: both requested names.
+    fn d_all(
+        also: &std::collections::BTreeMap<String, Vec<prefixes::AlsoIn>>,
+        here: &Path,
+        manifest: &Manifest,
+    ) -> Vec<CrossPrefixDuplicate> {
+        cross_prefix_duplicates_from(also, here, manifest, ["both", "there"].into_iter())
+    }
+
     #[test]
     fn cli_shape_is_verified() {
         use clap::CommandFactory;
