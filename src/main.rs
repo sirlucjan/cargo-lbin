@@ -1692,9 +1692,101 @@ fn scan_stage_dir(dir: &Path, leased: bool, stale: &mut Vec<PathBuf>) -> std::io
     Ok(())
 }
 
+/// One candidate's fate, and the summary is built from exactly these —
+/// a deferral is not a failure, but it is not a removal either, and
+/// "removed 2" over a directory still standing would be the summary
+/// lying about the filesystem.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemoveOutcome {
+    /// Gone, by this pass's hand (or named, under `--dry-run`).
+    Removed,
+    /// Left standing on purpose: the lease was held this instant.
+    Deferred,
+    /// Gone before this pass reached it — a racing clean's hand.
+    AlreadyGone,
+    /// The one outcome that flips the exit code.
+    Failed,
+}
+
+/// One candidate's removal. Two disciplines by layout. Legacy runs
+/// have nothing to take, so the heuristic's answer is all there is.
+/// Leased runs get the real thing: take `LOCK_EX` and hold it through
+/// the whole removal — the take, not the scan, is the removal license,
+/// which is what closes the check-then-delete race.
+fn remove_stale_stage(dir: &Path, dry_run: bool) -> RemoveOutcome {
+    let verb = if dry_run { "would remove" } else { "removing" };
+    // The lease discipline applies exactly where a lease can legally
+    // exist: a leased-format name inside stage-v2. A leased name in
+    // stage/ is cross-namespace debris — nothing legally writes one
+    // there, so there is no lease to take, and sending it through the
+    // take would let a NotFound read as "already removed" and spare
+    // the debris forever.
+    let leased = dir
+        .parent()
+        .and_then(Path::file_name)
+        .is_some_and(|n| n == stage::RUN_NAMESPACE)
+        && dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(stage::parse_run_dir)
+            .is_some_and(|r| matches!(r, stage::StageRun::LeasedRun { .. }));
+    if dry_run {
+        println!("{verb} ownerless stage {}", dir.display());
+        return RemoveOutcome::Removed;
+    }
+    let held = if leased {
+        match stage::take_lease_for_removal(dir) {
+            Ok(Some(held)) => Some(held),
+            // Held this instant — a writer still exiting, or a verify
+            // probe passing through. The safe side of the race: skip,
+            // say so, and let a later pass answer.
+            Ok(None) => {
+                println!("deferring {}: its lease is held right now", dir.display());
+                return RemoveOutcome::Deferred;
+            }
+            // Already removed by a racing clean: nothing left to do
+            // here counts as done, not as failed.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                println!("skipping {}: already removed", dir.display());
+                return RemoveOutcome::AlreadyGone;
+            }
+            // A mutating command must not report success over a lease
+            // it could not judge.
+            Err(e) => {
+                eprintln!("error: taking the lease of {}: {e}", dir.display());
+                return RemoveOutcome::Failed;
+            }
+        }
+    } else {
+        None
+    };
+    println!("{verb} ownerless stage {}", dir.display());
+    // Leased runs go payload-first, lease-last — see remove_leased_run:
+    // a failed removal leaves the run still wearing its lease, so it
+    // stays visible to the next pass instead of becoming a lease-less
+    // unknown spared forever. Legacy stages have no lease to keep for
+    // last.
+    let removal = if held.is_some() {
+        stage::remove_leased_run(dir)
+    } else {
+        fs::remove_dir_all(dir)
+    };
+    if let Err(e) = removal {
+        eprintln!("error: removing {}: {e}", dir.display());
+        return RemoveOutcome::Failed;
+    }
+    // `held` drops here, after the removal: the lock outlives the
+    // delete, never the other way around.
+    drop(held);
+    RemoveOutcome::Removed
+}
+
 /// The mutating half of the pair `verify` opens: `verify` names the
 /// debris read-only, `clean` removes it — through the very same
-/// `scan_stale_stages`, so the two can never disagree on what debris is.
+/// `scan_stale_stages`, so the two can never disagree on what debris
+/// is. For leased runs the scan is only candidate selection: the
+/// removal license is the exclusive take of the run's lease, held
+/// through the whole removal.
 /// Old failure logs join in: they are written on every failed build
 /// and nothing else ever prunes them. The cache is the user's own —
 /// no prefix lock, no sudo; a PID alive on *any* prefix's build is
@@ -1783,11 +1875,15 @@ fn clean_cache(
     }
     let verb = if dry_run { "would remove" } else { "removing" };
     let mut failures = 0usize;
+    let (mut removed, mut deferred) = (0usize, 0usize);
     for dir in &stale {
-        println!("{verb} ownerless stage {}", dir.display());
-        if !dry_run && let Err(e) = fs::remove_dir_all(dir) {
-            eprintln!("error: removing {}: {e}", dir.display());
-            failures += 1;
+        match remove_stale_stage(dir, dry_run) {
+            RemoveOutcome::Removed => removed += 1,
+            RemoveOutcome::Deferred => deferred += 1,
+            // Gone is the goal either way; whose hand got there first
+            // is a per-item line, not a summary category.
+            RemoveOutcome::AlreadyGone => {}
+            RemoveOutcome::Failed => failures += 1,
         }
     }
     let days = logs_older_than_days.unwrap_or_default();
@@ -1808,7 +1904,13 @@ fn clean_cache(
     let done = if dry_run { "would remove" } else { "removed" };
     let mut parts = Vec::new();
     if stages {
-        parts.push(format!("{} ownerless stage(s)", stale.len()));
+        // The summary counts what happened, never the candidate list:
+        // "removed 2" over a deferred directory still standing would
+        // be the summary lying about the filesystem.
+        parts.push(format!("{removed} ownerless stage(s)"));
+        if deferred > 0 {
+            parts.push(format!("{deferred} deferred (lease held)"));
+        }
     }
     if logs_older_than_days.is_some() {
         parts.push(format!("{} old log(s)", old_logs.len()));
@@ -5082,6 +5184,112 @@ mod tests {
         );
         assert!(new_log.exists(), "unasked logs are spared");
         let _ = fs::remove_dir_all(&cache);
+    }
+
+    /// The race the exclusive take exists for, in test form. A reader
+    /// (a concurrent verify probe, frozen mid-flight) holds `LOCK_SH`:
+    /// the scan still classifies the run as released — readers coexist
+    /// by design — but clean's `LOCK_EX` is refused, so the pass skips it
+    /// without failing, and the pass after the reader leaves removes
+    /// it. The safe side of the race, chosen by the lock mode.
+    #[test]
+    fn clean_takes_the_lease_and_defers_to_a_reader_inside() {
+        use std::os::fd::AsRawFd;
+        let root = std::env::temp_dir().join("cargo-lbin-test-clean-lease");
+        let _ = fs::remove_dir_all(&root);
+        let cache = root.join("cache");
+        let released = cache
+            .join(crate::stage::RUN_NAMESPACE)
+            .join("1-00000000000000aa");
+        let probed = cache
+            .join(crate::stage::RUN_NAMESPACE)
+            .join("1-00000000000000bb");
+        drop(crate::stage::Lease::acquire(&released).unwrap());
+        drop(crate::stage::Lease::acquire(&probed).unwrap());
+
+        // The frozen verify probe: a shared lock held across clean.
+        let reader = fs::File::open(probed.join(".lease")).unwrap();
+        // SAFETY: flock(2) on an owned, open descriptor.
+        assert_eq!(
+            unsafe { libc::flock(reader.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) },
+            0
+        );
+
+        // Both are scan candidates: the reader is not a writer.
+        let named = scan_stale_stages(&cache).unwrap();
+        assert!(named.contains(&released) && named.contains(&probed));
+
+        // The fates, asked one candidate at a time — these are the
+        // counts the summary is built from, so "removed" and
+        // "deferred" must never blur into one number.
+        assert_eq!(
+            remove_stale_stage(&probed, false),
+            RemoveOutcome::Deferred,
+            "a reader inside is a deferral, not a removal and not a failure"
+        );
+        assert!(probed.exists(), "a deferred run is left standing");
+
+        // One removed, one deferred — and deferring is not failing.
+        clean_cache(&cache, false, true, None).unwrap();
+        assert!(!released.exists(), "a released run is taken and removed");
+        assert!(
+            probed.exists(),
+            "a reader inside defers the removal to a later pass"
+        );
+        assert_eq!(
+            remove_stale_stage(&released, false),
+            RemoveOutcome::AlreadyGone,
+            "a candidate gone before this pass is done, not failed"
+        );
+
+        drop(reader);
+        clean_cache(&cache, false, true, None).unwrap();
+        assert!(
+            !probed.exists(),
+            "the pass after the reader leaves finishes the job"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The whole pipeline against the top-level symlink bait: a valid
+    /// run name in stage-v2 linking to a directory that contains an
+    /// unlocked `.lease` — exactly what a followed link would read as
+    /// "released" and then remove. The scan must spare it (unknown),
+    /// clean must leave both the link and its target untouched, and a
+    /// cross-namespace leased name in stage/ must go through the plain
+    /// debris path and actually be removed.
+    #[test]
+    fn clean_never_follows_a_symlinked_run_and_sweeps_cross_namespace_debris() {
+        let root = std::env::temp_dir().join("cargo-lbin-test-clean-toplink");
+        let _ = fs::remove_dir_all(&root);
+        let cache = root.join("cache");
+        let outside = root.join("outside");
+        fs::create_dir_all(outside.join("keep")).unwrap();
+        fs::write(outside.join(".lease"), b"").unwrap();
+        let linked = cache
+            .join(crate::stage::RUN_NAMESPACE)
+            .join("77-00000000000000ee");
+        fs::create_dir_all(cache.join(crate::stage::RUN_NAMESPACE)).unwrap();
+        std::os::unix::fs::symlink(&outside, &linked).unwrap();
+        // Cross-namespace debris: a leased name in stage/, no lease
+        // discipline owed — the plain path must remove it.
+        let crosswise = cache.join("stage").join("77-00000000000000dd");
+        fs::create_dir_all(&crosswise).unwrap();
+
+        clean_cache(&cache, false, true, None).unwrap();
+        assert!(
+            fs::symlink_metadata(&linked).is_ok(),
+            "the symlinked run is unknown: spared, not a candidate"
+        );
+        assert!(
+            outside.join("keep").exists() && outside.join(".lease").exists(),
+            "zero traversal: the link's target is untouched by clean"
+        );
+        assert!(
+            !crosswise.exists(),
+            "cross-namespace debris goes through the plain path and is removed"
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
