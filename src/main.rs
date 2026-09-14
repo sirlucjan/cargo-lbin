@@ -2492,7 +2492,12 @@ fn release_label(release: &index::Release) -> String {
 /// One crate's `info` block, two sources: history lines may name a
 /// yanked release (flagged); the `installed` verdict uses
 /// `checkupdate`'s rules and must never contradict it.
-fn describe_info(name: &str, releases: &[index::Release], installed: Option<&Entry>) -> String {
+fn describe_info(
+    name: &str,
+    releases: &[index::Release],
+    installed: Option<&Entry>,
+    also: &[prefixes::AlsoIn],
+) -> String {
     // Formatting into a String cannot fail; the `let _ =` discards the
     // Result the macros return for the general `fmt::Write` case.
     use std::fmt::Write as _;
@@ -2511,8 +2516,23 @@ fn describe_info(name: &str, releases: &[index::Release], installed: Option<&Ent
         let _ = write!(out, " ({} yanked)", summary.yanked);
     }
     out.push('\n');
+    // The other prefix's copy is worth naming whether or not this
+    // prefix has one: version skew is the point when both exist, and a
+    // "not here, but over there" answers exactly the question asked.
+    let mut also_lines = String::new();
+    for other in also {
+        // Sanitized like every human-readable cross-prefix line —
+        // prefixes::describe already runs its output through
+        // text::sanitize, because a prefix can come from the
+        // environment; this new representation of the same data must
+        // not carry a weaker policy. The version needs nothing: it is
+        // semver-validated at the manifest boundary.
+        let prefix = text::sanitize(&other.prefix.display().to_string());
+        let _ = writeln!(also_lines, "  also in:     {prefix} @{}", other.version);
+    }
     let Some(entry) = installed else {
         out.push_str("  installed:   no\n");
+        out.push_str(&also_lines);
         return out;
     };
     let _ = write!(out, "  installed:   {}", entry.version);
@@ -2541,6 +2561,7 @@ fn describe_info(name: &str, releases: &[index::Release], installed: Option<&Ent
     let _ = writeln!(out, "  pinned:      {}", flag(entry.pinned));
     let _ = writeln!(out, "  locked:      {}", flag(entry.locked));
     let _ = writeln!(out, "  binaries:    {}", entry.bins.join(", "));
+    out.push_str(&also_lines);
     out
 }
 
@@ -2555,6 +2576,10 @@ fn cmd_info(prefix: &Path, crates: &[String]) -> Result<()> {
         let _lock = StateLock::acquire(prefix, &Mode::Shared)?;
         Manifest::load(prefix)?
     };
+    // The other prefix, read once for the whole batch — lockless by
+    // prefixes' own charter: an annotation must never wait behind
+    // someone's ten-minute build.
+    let also = prefixes::also_installed(prefix);
     // Input order, first occurrence wins: answers read in the order asked
     // (`update` sorts — a build sequence should not depend on typing).
     let mut names: Vec<&str> = Vec::new();
@@ -2573,7 +2598,12 @@ fn cmd_info(prefix: &Path, crates: &[String]) -> Result<()> {
                 }
                 print!(
                     "{}",
-                    describe_info(name, &releases, manifest.crates.get(*name))
+                    describe_info(
+                        name,
+                        &releases,
+                        manifest.crates.get(*name),
+                        also.get(*name).map_or(&[][..], Vec::as_slice)
+                    )
                 );
                 shown += 1;
             }
@@ -3581,6 +3611,54 @@ mod tests {
         m
     }
 
+    /// The other prefix's copy is named whether or not this prefix has
+    /// one: skew is the point when both exist, and "not here, but over
+    /// there" answers exactly the question asked.
+    #[test]
+    fn info_names_the_other_prefixes_copy() {
+        let rel = index::Release {
+            version: Version::parse("1.2.0").unwrap(),
+            yanked: false,
+        };
+        let releases = [rel];
+        let also = [prefixes::AlsoIn {
+            prefix: PathBuf::from("/usr/local"),
+            version: "1.1.0".to_owned(),
+        }];
+
+        // Installed here too: the entry block first, the skew after it.
+        let m = manifest_with(&["foo"]);
+        let out = describe_info("foo", &releases, m.crates.get("foo"), &also);
+        assert!(out.contains("binaries:    foo"), "{out}");
+        assert!(out.contains("also in:     /usr/local @1.1.0"), "{out}");
+        assert!(
+            out.find("binaries:").unwrap() < out.find("also in:").unwrap(),
+            "this prefix's facts first, the other prefix's after: {out}"
+        );
+
+        // Not installed here: the foreign copy is still the answer.
+        let out = describe_info("foo", &releases, None, &also);
+        assert!(out.contains("installed:   no"), "{out}");
+        assert!(out.contains("also in:     /usr/local @1.1.0"), "{out}");
+
+        // Nothing foreign: no line, not an empty one.
+        let out = describe_info("foo", &releases, None, &[]);
+        assert!(!out.contains("also in:"), "{out}");
+
+        // A prefix is environment-borne: control characters in it are
+        // neutralized, the same policy prefixes::describe applies.
+        let hostile = [prefixes::AlsoIn {
+            prefix: PathBuf::from("/usr/\x1b[31mlocal"),
+            version: "1.1.0".to_owned(),
+        }];
+        let out = describe_info("foo", &releases, None, &hostile);
+        assert!(
+            !out.contains('\x1b'),
+            "the escape byte must not reach the terminal: {out:?}"
+        );
+        assert!(out.contains("also in:"), "{out}");
+    }
+
     #[test]
     fn cli_shape_is_verified() {
         use clap::CommandFactory;
@@ -3656,7 +3734,7 @@ mod tests {
         let m = manifest_with(&["foo"]);
         let installed = m.crates.get("foo");
 
-        let out = describe_info("foo", &releases, installed);
+        let out = describe_info("foo", &releases, installed, &[]);
         assert!(out.contains("latest:      1.2.0"), "{out}");
         assert!(out.contains("pre-release: 2.0.0-rc.1"), "{out}");
         assert!(out.contains("releases:    4 (1 yanked)"), "{out}");
@@ -3670,7 +3748,7 @@ mod tests {
         assert!(out.contains("locked:      no"), "{out}");
         assert!(out.contains("binaries:    foo"), "{out}");
 
-        let out = describe_info("foo", &releases, None);
+        let out = describe_info("foo", &releases, None, &[]);
         assert!(out.contains("installed:   no"), "{out}");
         assert!(
             !out.contains("pinned:") && !out.contains("binaries:"),
@@ -3685,7 +3763,7 @@ mod tests {
             e.locked = true;
             e.bins = vec!["foo".into(), "fooctl".into()];
         }
-        let out = describe_info("foo", &releases, m.crates.get("foo"));
+        let out = describe_info("foo", &releases, m.crates.get("foo"), &[]);
         assert!(out.contains("pinned:      yes"), "{out}");
         assert!(out.contains("locked:      yes"), "{out}");
         assert!(out.contains("binaries:    foo, fooctl"), "{out}");
@@ -3693,20 +3771,20 @@ mod tests {
         // Installed at the newest stable: up to date, rc still not offered.
         let mut m = manifest_with(&["foo"]);
         m.crates.get_mut("foo").unwrap().version = "1.2.0".to_owned();
-        let out = describe_info("foo", &releases, m.crates.get("foo"));
+        let out = describe_info("foo", &releases, m.crates.get("foo"), &[]);
         assert!(out.contains("installed:   1.2.0 (up to date)"), "{out}");
 
         // History and eligibility diverge: the newest stable is yanked, so
         // it is shown flagged, while the installed 1.0.0 has nowhere to go.
         let releases = [rel("1.0.0", false), rel("1.1.0", true)];
-        let out = describe_info("foo", &releases, installed);
+        let out = describe_info("foo", &releases, installed, &[]);
         assert!(out.contains("latest:      1.1.0 [yanked]"), "{out}");
         assert!(out.contains("installed:   1.0.0 (up to date)"), "{out}");
 
         // Everything yanked: `checkupdate` would refuse this crate, and
         // `info` must not call it "up to date".
         let releases = [rel("1.0.0", true)];
-        let out = describe_info("foo", &releases, installed);
+        let out = describe_info("foo", &releases, installed, &[]);
         assert!(out.contains("latest:      1.0.0 [yanked]"), "{out}");
         assert!(
             out.contains("installed:   1.0.0 (no non-yanked releases)"),

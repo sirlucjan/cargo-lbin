@@ -194,6 +194,7 @@ ripgrep
   pinned:      no
   locked:      yes
   binaries:    rg
+  also in:     /usr/local @14.0.3
 
 bat
   latest:      0.26.0
@@ -204,7 +205,7 @@ bat
 
 `latest` and `pre-release` describe published history. They may name a yanked release, which is shown explicitly as `[yanked]`. The pre-release line is shown only when that release is newer than the latest stable release.
 
-The `installed` verdict is a separate question. It uses the same non-yanked update rules as `checkupdate`, so `info` does not call something "up to date" when `checkupdate` would disagree. If a crate has no non-yanked releases left, that is reported explicitly. An installed crate also shows its manifest entry in full — `pinned`, `locked`, and the binaries it provides — so `info` is the complete single-crate view of what `list` shows in aggregate.
+The `installed` verdict is a separate question. It uses the same non-yanked update rules as `checkupdate`, so `info` does not call something "up to date" when `checkupdate` would disagree. If a crate has no non-yanked releases left, that is reported explicitly. An installed crate also shows its manifest entry in full — `pinned`, `locked`, and the binaries it provides — so `info` is the complete single-crate view of what `list` shows in aggregate. If the other known prefix carries the crate too, `info` names it with its version (`also in:`), whether or not this prefix has a copy — the other manifest is read without any lock, like every cross-prefix annotation, so the answer never waits behind a foreign build.
 
 Unknown names do not stop the rest of a batch. They are reported after the successful results, with a hint to use `search`; the command exits non-zero if any exact lookup failed.
 
