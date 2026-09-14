@@ -4843,11 +4843,14 @@ mod tests {
     }
 
     #[test]
-    fn verify_data_fields_carry_the_raw_bytes() {
-        // The data IS the diagnosis: a control char smuggled into a
-        // crate name reaches the Finding's fields unlaundered (JSON
-        // escapes it safely), while the human-rendered message is
-        // sanitized as before.
+    fn verify_data_fields_keep_control_characters_unlaundered() {
+        // The scope this pins is textual: a control character smuggled
+        // into a crate name reaches the Finding's String fields
+        // unlaundered — JSON escaping preserves it without laundering
+        // the diagnosed value — while the human-rendered message is
+        // sanitized as before. It deliberately claims nothing about
+        // arbitrary non-UTF-8 bytes in a PathBuf; that is not what
+        // these fields carry.
         let root = std::env::temp_dir().join("cargo-lbin-test-verify-raw");
         let _ = fs::remove_dir_all(&root);
         let prefix = root.join("prefix");

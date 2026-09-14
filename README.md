@@ -255,9 +255,7 @@ A successful check writes a full per-prefix snapshot, not merely the outdated en
 
 ### JSON output
 
-`list --json` and `checkupdate --json` print one JSON document on stdout and nothing else; warnings stay on stderr and exit codes are unchanged. The shape is a contract: every document carries a `schema` number, fields are only ever added within a schema version, and any rename, retype or removal is a schema bump.
-
-`verify --json` fields: `prefix` and `schema` as above; `crates` is the managed crate count, or `null` when the manifest could not be read or parsed — the count is then unknown, not zero; `errors` and `warnings` are arrays of findings, each with `kind` (a stable machine name such as `binary-missing`, `duplicate-bin-claim`, `manifest-unparseable`, `path-shadow`, `stale-stages`), `message` (the human finding text, repair hint included; the text renderer adds its own `error:`/`warning:` framing), the finding's subjects as data — `crate`, `bin` and `path`, each `null` where the finding has none — and `hint`, the bare pasteable repair command where one is unambiguous (a reinstall for a broken binary), else `null`. A consumer never parses `message`. Only `message` is terminal-sanitized: the data fields carry the raw bytes (JSON escapes them safely) — a control character smuggled into a crate name is the broken state being diagnosed, and a laundered copy would hide it. The document is stdout's only content; on verification errors the exit status is non-zero and the error verdict goes to stderr, as in text mode.
+`list`, `pinned`, `checkupdate` and `verify` take `--json` and print one JSON document on stdout and nothing else; warnings stay on stderr and exit codes are unchanged. The shape is a contract: every document carries a `schema` number, fields are only ever added within a schema version, and any rename, retype or removal is a schema bump.
 
 ```json
 {
@@ -289,11 +287,16 @@ A successful check writes a full per-prefix snapshot, not merely the outdated en
 
 `list --json` fields: `prefix` is the absolute, normalized prefix; `checked_at` is the Unix time of the last recorded check, or `null` if there is none; `pinned` mirrors the `pin` state; `status` is one of `up_to_date`, `outdated` or `unknown` (not covered by the last check — installed or updated since); `latest` is the newest version that check found, or `null` when the status is `unknown`. An empty prefix is `"crates": []`, not a message.
 
+`pinned --json` uses the same per-crate shape as `list --json`; without `--check`, it is the pinned subset of the same recorded snapshot, entry for entry — details under [Pinned](#pinned).
+
 `checkupdate --json` prints the snapshot the check just took, with the same `schema`, `prefix` and `checked_at`, and per crate `name`, `current`, `latest` and a derived `outdated` boolean:
 
 ```bash
 cargo lbin checkupdate --json | jq -r '.crates[] | select(.outdated) | .name'
 ```
+
+`verify --json` fields: `prefix` and `schema` as above; `crates` is the managed crate count, or `null` when the manifest could not be read or parsed — the count is then unknown, not zero; `errors` and `warnings` are arrays of findings, each with `kind` (a stable machine name such as `binary-missing`, `duplicate-bin-claim`, `manifest-unparseable`, `path-shadow`, `stale-stages`), `message` (the human finding text, repair hint included; the text renderer adds its own `error:`/`warning:` framing), the finding's subjects as data — `crate`, `bin` and `path`, each `null` where the finding has none — and `hint`, the bare pasteable repair command where one is unambiguous (a reinstall for a broken binary), else `null`. A consumer never parses `message`. Only `message` is terminal-sanitized. Data fields retain their original textual values; JSON escaping preserves control characters without laundering the diagnosed value. The document is stdout's only content; on verification errors the exit status is non-zero and the error verdict goes to stderr, as in text mode.
+
 
 ## Update
 
@@ -627,6 +630,7 @@ The TUI starts entirely from disk — the manifest and the last `checkupdate` re
 | `c` | Cancel the running operation: for a build, a second `c` sends SIGKILL; for `r`/`v`/`s`, a cancel request — the update check stops between requests, a verify/search result is discarded on arrival |
 | `p` | Pin or unpin the selected crate; in place unless pinning needs `sudo` |
 | `D` | Downgrade the selected crate; the version prompt appears in the terminal |
+| `v` | Verify the prefix; findings open in the report panel |
 | `r` | Run `checkupdate` and refresh the saved report |
 | `s` | Search crates.io by keyword |
 | `1`..`9` | With search results open, pick a visible hit into the install line |
