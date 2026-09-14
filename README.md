@@ -110,6 +110,7 @@ cargo lbin tui
 | `info <crate>...` | Show exact-name crate information and installed state |
 | `tui` | Interactive frontend over the same operations, when the `tui` feature is enabled |
 | `completions <shell>` | Print a shell completion script for the commands and flags |
+| `man DIR` | Write man pages (roff) for cargo-lbin and every subcommand into DIR |
 
 ## Install
 

@@ -222,6 +222,15 @@ enum Cmd {
         #[arg(value_enum)]
         shell: clap_complete::Shell,
     },
+    /// Write man pages (roff) for cargo-lbin and every subcommand into DIR
+    ///
+    /// For packagers: one page per command, named `cargo-lbin.1` and
+    /// `cargo-lbin-<subcommand>.1`, generated from the same clap
+    /// definitions --help prints — the two can never drift.
+    Man {
+        /// Directory to write the pages into (created if missing)
+        dir: PathBuf,
+    },
     /// Rebuild an installed crate under another prefix, then retire it
     /// here
     ///
@@ -324,6 +333,7 @@ fn main() -> ExitCode {
             stages,
             logs_older_than,
         } => cmd_clean(dry_run, stages, logs_older_than),
+        Cmd::Man { ref dir } => cmd_man(dir),
         Cmd::Completions { shell } => {
             cmd_completions(shell);
             Ok(())
@@ -2440,7 +2450,50 @@ fn cmd_search(prefix: &Path, query: &[String], limit: u8) -> Result<()> {
     Ok(())
 }
 
-/// Generate a static completion script from the Clap command definition.
+/// One roff page per command, from the same clap definitions `--help`
+/// prints — the man page and the help text cannot drift. Pages land as
+/// files (not stdout): there are many, and a packager's %install wants
+/// paths, not a stream to split.
+fn cmd_man(dir: &Path) -> Result<()> {
+    use clap::CommandFactory;
+    fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    // build() finalizes and propagates the global args (--prefix,
+    // --user) into the subcommands, so each page documents the flags
+    // the command actually accepts.
+    let mut cmd = Cli::command();
+    cmd.build();
+    let write = |name: &str, cmd: clap::Command| -> Result<()> {
+        let mut buf = Vec::new();
+        // `.title()` names the page header; the SYNOPSIS comes from the
+        // command's bin_name, which the caller sets to the real
+        // invocation — mangen falls back to the bare subcommand name
+        // otherwise, and a SYNOPSIS saying `install [OPTIONS]` would
+        // document a command nobody can type.
+        clap_mangen::Man::new(cmd)
+            .title(name.to_uppercase())
+            .render(&mut buf)
+            .with_context(|| format!("rendering man page for {name}"))?;
+        let path = dir.join(format!("{name}.1"));
+        fs::write(&path, buf).with_context(|| format!("writing {}", path.display()))?;
+        println!("wrote {}", path.display());
+        Ok(())
+    };
+    write("cargo-lbin", cmd.clone().bin_name("cargo-lbin"))?;
+    for sub in cmd.get_subcommands() {
+        // Skip clap's implicit help pseudo-command; every real
+        // subcommand gets its page.
+        if sub.get_name() == "help" {
+            continue;
+        }
+        write(
+            &format!("cargo-lbin-{}", sub.get_name()),
+            sub.clone()
+                .bin_name(format!("cargo-lbin {}", sub.get_name())),
+        )?;
+    }
+    Ok(())
+}
+
 fn cmd_completions(shell: clap_complete::Shell) {
     use clap::CommandFactory;
     let mut cmd = Cli::command();
@@ -4817,6 +4870,49 @@ mod tests {
             );
         }
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn man_writes_one_roff_page_per_command() {
+        // The contract: a page for the top command and one per real
+        // subcommand, each a roff document (.TH header), none for
+        // clap's implicit help.
+        let dir = std::env::temp_dir().join("cargo-lbin-test-man");
+        let _ = fs::remove_dir_all(&dir);
+        cmd_man(&dir).unwrap();
+        let top = fs::read_to_string(dir.join("cargo-lbin.1")).unwrap();
+        assert!(
+            top.contains("\n.TH CARGO-LBIN 1"),
+            "a titled roff page: {top:.80}"
+        );
+        for sub in ["install", "verify", "clean", "migrate", "man"] {
+            let page = dir.join(format!("cargo-lbin-{sub}.1"));
+            let text = fs::read_to_string(&page)
+                .unwrap_or_else(|e| panic!("{} missing: {e}", page.display()));
+            assert!(
+                text.contains(&format!("\n.TH CARGO-LBIN-{} 1", sub.to_uppercase())),
+                "{} carries its own title",
+                page.display()
+            );
+            // The SYNOPSIS documents the command as typed (roff escapes
+            // the hyphen), not the bare subcommand name mangen would
+            // fall back to without bin_name.
+            assert!(
+                text.contains(&format!("cargo\\-lbin {sub}")),
+                "{}: the SYNOPSIS carries the real invocation",
+                page.display()
+            );
+            assert!(
+                text.contains("\\-\\-prefix") && text.contains("\\-\\-user"),
+                "{}: build() propagated the global flags onto the page",
+                page.display()
+            );
+        }
+        assert!(
+            !dir.join("cargo-lbin-help.1").exists(),
+            "the implicit help pseudo-command earns no page"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
