@@ -143,7 +143,7 @@ The `--locked` choice is stored per crate and reused on future updates.
 
 Installing an already managed crate is a full reinstall: it is rebuilt in a fresh staging directory and its managed binaries are replaced. Changing `--locked` on a reinstall therefore takes effect instead of being skipped as "already installed".
 
-Installing a crate that the other known prefix already manages — and this one does not — warns before the first build starts, so the batch can still be abandoned before any minutes are invested:
+Installing a crate that another known prefix already manages — and this one does not — warns before the first build starts, so the batch can still be abandoned before any minutes are invested:
 
 ```text
 warning: `ripgrep` is already managed under /usr/local @14.1.0
@@ -215,7 +215,7 @@ bat
 
 `latest` and `pre-release` describe published history. They may name a yanked release, which is shown explicitly as `[yanked]`. The pre-release line is shown only when that release is newer than the latest stable release.
 
-The `installed` verdict is a separate question. It uses the same non-yanked update rules as `checkupdate`, so `info` does not call something "up to date" when `checkupdate` would disagree. If a crate has no non-yanked releases left, that is reported explicitly. An installed crate also shows its manifest entry in full — `pinned`, `locked`, and the binaries it provides — so `info` is the complete single-crate view of what `list` shows in aggregate. If the other known prefix carries the crate too, `info` names it with its version (`also in:`), whether or not this prefix has a copy — the other manifest is read without any lock, like every cross-prefix annotation, so the answer never waits behind a foreign build.
+The `installed` verdict is a separate question. It uses the same non-yanked update rules as `checkupdate`, so `info` does not call something "up to date" when `checkupdate` would disagree. If a crate has no non-yanked releases left, that is reported explicitly. An installed crate also shows its manifest entry in full — `pinned`, `locked`, and the binaries it provides — so `info` is the complete single-crate view of what `list` shows in aggregate. If another known prefix carries the crate too, `info` names each copy with its version (`also in:`), whether or not this prefix has a copy — the foreign manifests are read without any lock, like every cross-prefix annotation, so the answer never waits behind a foreign build.
 
 `--versions` appends the full published version set to each crate's block, in descending SemVer order, with yanked releases marked:
 
