@@ -635,6 +635,9 @@ cargo lbin tui
 │ Installed  0.26.0                                         │
 │ Latest     0.26.1                                         │
 │ Binaries   bat                                            │
+│ Locked     no                                             │
+│ Pinned     no                                             │
+│ Also in    /home/user/.local @0.25.0                      │
 ├───────────────────────────────────────────────────────────┤
 │ ↑/↓ select · Tab filter · Enter/u update · U update all … │
 │ 3 packages · 1 updates · 1 pinned (1 behind) · checked 3h │
@@ -642,6 +645,10 @@ cargo lbin tui
 ```
 
 The TUI starts entirely from disk — the manifest and the last `checkupdate` report. It performs no refresh, network request, update or installation on startup.
+
+The Selected panel is the crate's full managed entry: installed version, `Latest` from the last check, every binary, and `Locked`/`Pinned` answered explicitly — in a details panel a missing line would read as "unknown", not as "no". Each copy under another known prefix appears as its own `Also in` line with its version — with a custom current prefix there can legally be two. Deliberately absent: lease and staging state (build plumbing, not crate state — `verify` and `clean` own it) and the full version history (`info --versions` is the archaeology; the panel's `Latest` is the decision surface).
+
+Installing a crate another prefix already manages emits the same warning the CLI prints (see [Install](#install)) — the decision comes from the same code on both surfaces, so they cannot disagree. The TUI shows it in the panel as soon as it arrives and keeps it available while the build continues (arrows scroll it, `Esc`/`Enter` dismisses it); `c` still cancels. It informs and never blocks — and nothing waits on the display, so a build fast enough to finish in one breath may go straight to its final panel with the warning in it.
 
 | Key | Action |
 | --- | --- |
