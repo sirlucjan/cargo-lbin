@@ -143,6 +143,16 @@ The `--locked` choice is stored per crate and reused on future updates.
 
 Installing an already managed crate is a full reinstall: it is rebuilt in a fresh staging directory and its managed binaries are replaced. Changing `--locked` on a reinstall therefore takes effect instead of being skipped as "already installed".
 
+Installing a crate that the other known prefix already manages — and this one does not — warns before the first build starts, so the batch can still be abandoned before any minutes are invested:
+
+```text
+warning: `ripgrep` is already managed under /usr/local @14.1.0
+this will install another copy under /home/user/.local
+use `cargo lbin migrate ripgrep --prefix=/usr/local --to=/home/user/.local` if you intended to move it
+```
+
+It is a warning and never an error — double installation is legal, and `verify` reports the standing duplication afterwards. The migrate line is pasteable as printed — both paths are shell-quoted, so a space or a `$(...)` in a prefix stays a directory name rather than becoming a shell construct; a path with no honest shell spelling (non-UTF-8 or control characters) keeps the warning but drops the exact command, the same rule the `verify` reinstall hint follows. A reinstall of a crate both prefixes already carry does not warn: it creates no second copy. In the TUI the row's `[also in …]` annotation shows the state before the key is pressed, and the same warning still lands in the panel.
+
 Installing a binary name the prefix did not have before — every name on a first install, only the added ones when an update introduces a new binary — warns when a file of that name already exists on `PATH` outside the prefix, usually a distribution package:
 
 ```text

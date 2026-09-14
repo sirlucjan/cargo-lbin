@@ -1074,6 +1074,82 @@ fn place_and_commit(
     Ok(())
 }
 
+/// Pre-build warnings for an install batch about to create a second
+/// cross-prefix copy: one block per foreign managed copy of a
+/// requested crate that is absent from this prefix's manifest.
+/// Absent-here on purpose — the plan's word is "before creating the
+/// second copy": a reinstall of a crate both sides already carry
+/// creates nothing, and verify already names the standing duplication.
+/// A warning and never an error: double installation is legal, and
+/// migrate is named — as a genuinely pasteable command when both
+/// prefixes have an honest shell spelling, and not at all otherwise —
+/// for the person who meant to move, not copy. Emitted before the
+/// first build, so the whole batch can still be abandoned before any
+/// minutes are invested.
+fn duplicate_install_warnings<'a>(
+    prefix: &Path,
+    manifest: &Manifest,
+    names: impl Iterator<Item = &'a str>,
+) -> Vec<String> {
+    duplicate_install_warnings_from(&prefixes::also_installed(prefix), prefix, manifest, names)
+}
+
+/// The builder behind `duplicate_install_warnings`, over any
+/// cross-prefix map — split out so tests exercise the real message
+/// construction (prefixes' own tests already cover the map's loading).
+/// Lines, not blocks: the first carries the severity word, the
+/// continuations do not, and every line is sanitized — both prefixes
+/// are environment-borne, the 0.7.0 rule applies.
+fn duplicate_install_warnings_from<'a>(
+    also: &std::collections::BTreeMap<String, Vec<prefixes::AlsoIn>>,
+    prefix: &Path,
+    manifest: &Manifest,
+    names: impl Iterator<Item = &'a str>,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    for name in names {
+        if manifest.crates.contains_key(name) {
+            continue;
+        }
+        let Some(entries) = also.get(name) else {
+            continue;
+        };
+        for other in entries {
+            lines.push(text::sanitize(&format!(
+                "warning: `{name}` is already managed under {} @{}",
+                other.prefix.display(),
+                other.version
+            )));
+            lines.push(text::sanitize(&format!(
+                "this will install another copy under {}",
+                prefix.display()
+            )));
+            // The migrate line is printed only when it is genuinely
+            // pasteable: both paths shell-quoted, or — for a path with
+            // no honest spelling (non-UTF-8, control chars) — no exact
+            // command at all. The sanitize boundary protects the
+            // terminal, not the shell; a laundered path would be safe
+            // to paste and wrong to run, and quoting is what keeps
+            // `/tmp/$(touch owned)` a directory name instead of a
+            // command. Same rule as the verify reinstall hint.
+            if let (Some(source), Some(dest)) = (
+                pasteable_path_arg("--prefix", &other.prefix),
+                pasteable_path_arg("--to", prefix),
+            ) {
+                lines.push(text::sanitize(&format!(
+                    "use `cargo lbin migrate {name} {source} {dest}` \
+                     if you intended to move it"
+                )));
+            } else {
+                lines.push(text::sanitize(
+                    "use `cargo lbin migrate` if you intended to move it",
+                ));
+            }
+        }
+    }
+    lines
+}
+
 /// One warning per binary that a PATH entry outside the prefix already
 /// provides, naming file, owner (if the package manager says) and PATH
 /// order. Warning, not refusal (see `shadow`); only for names new to
@@ -1372,17 +1448,22 @@ fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
-/// The pasteable spelling of the audited prefix, or `None` when no
+/// The pasteable spelling of one path-valued flag, or `None` when no
 /// honest one exists: non-UTF-8 `display()` is lossy, and a control char
 /// would be laundered by the sanitize boundary into a command naming a
-/// different path — safe to paste, wrong to run. `--prefix=<quoted>`
-/// so a dash-leading prefix cannot lex as an option.
-fn pasteable_prefix(prefix: &Path) -> Option<String> {
-    let s = prefix.to_str()?;
+/// different path — safe to paste, wrong to run. `<flag>=<quoted>`
+/// so a dash-leading path cannot lex as an option.
+fn pasteable_path_arg(flag: &str, path: &Path) -> Option<String> {
+    let s = path.to_str()?;
     if s.chars().any(char::is_control) {
         return None;
     }
-    Some(format!("--prefix={}", shell_quote(s)))
+    Some(format!("{flag}={}", shell_quote(s)))
+}
+
+/// [`pasteable_path_arg`] for the flag every hint so far has needed.
+fn pasteable_prefix(prefix: &Path) -> Option<String> {
+    pasteable_path_arg("--prefix", prefix)
 }
 
 /// The reinstall a disk finding may name — `None` when the prefix has
@@ -2166,6 +2247,18 @@ pub(crate) fn tui_install_one(
     if spec.version.is_none() {
         refuse_pinned(&manifest, std::slice::from_ref(&spec.name))?;
     }
+    let mut frontend = Frontend::Captured {
+        on_line,
+        before_placement,
+        control,
+        checkpoint: None,
+    };
+    // The row's [also in …] annotation already showed the state; the
+    // warning still lands in the panel, so the parity with the CLI is
+    // in the record, not only in the table.
+    for w in duplicate_install_warnings(prefix, &manifest, std::iter::once(spec.name.as_str())) {
+        frontend.warning(&w);
+    }
     install_and_commit(
         prefix,
         &cache,
@@ -2174,12 +2267,7 @@ pub(crate) fn tui_install_one(
         spec.version.as_ref(),
         locked,
         PinPolicy::Infer,
-        &mut Frontend::Captured {
-            on_line,
-            before_placement,
-            control,
-            checkpoint: None,
-        },
+        &mut frontend,
     )?;
     Ok(())
 }
@@ -2200,6 +2288,12 @@ fn cmd_install(prefix: &Path, crates: &[String], locked: bool) -> Result<()> {
         .map(|s| s.name.clone())
         .collect();
     refuse_pinned(&manifest, &unversioned)?;
+    let mut frontend = Frontend::Terminal;
+    // Before the first build: the person still holds the whole batch
+    // and has invested nothing.
+    for w in duplicate_install_warnings(prefix, &manifest, specs.iter().map(|s| s.name.as_str())) {
+        frontend.warning(&w);
+    }
     for spec in &specs {
         install_and_commit(
             prefix,
@@ -2209,7 +2303,7 @@ fn cmd_install(prefix: &Path, crates: &[String], locked: bool) -> Result<()> {
             spec.version.as_ref(),
             locked,
             PinPolicy::Infer,
-            &mut Frontend::Terminal,
+            &mut frontend,
         )?;
     }
     Ok(())
@@ -3727,6 +3821,100 @@ mod tests {
                 "    2.2.0 [yanked]",
             ],
             "{out}"
+        );
+    }
+
+    /// The duplicate-install warning fires exactly when this install
+    /// would create the second copy: the crate is absent here and
+    /// managed over there. Both prefixes are environment-borne, so the
+    /// lines are sanitized; the migrate hint is pasteable as printed.
+    #[test]
+    fn duplicate_install_warns_only_before_the_second_copy() {
+        use std::collections::BTreeMap;
+        let prefix = PathBuf::from("/home/u/.local");
+        let mut also: BTreeMap<String, Vec<prefixes::AlsoIn>> = BTreeMap::new();
+        also.insert(
+            "foo".to_owned(),
+            vec![prefixes::AlsoIn {
+                prefix: PathBuf::from("/usr/local"),
+                version: "1.2.3".to_owned(),
+            }],
+        );
+
+        // Absent here, managed there: the plan's three lines, verbatim
+        // in shape, with a genuinely pasteable migrate hint —
+        // flag=value form, like every other pasteable hint.
+        let empty = Manifest::default();
+        let lines = duplicate_install_warnings_from(&also, &prefix, &empty, std::iter::once("foo"));
+        assert_eq!(
+            lines,
+            [
+                "warning: `foo` is already managed under /usr/local @1.2.3",
+                "this will install another copy under /home/u/.local",
+                "use `cargo lbin migrate foo --prefix=/usr/local --to=/home/u/.local` \
+                 if you intended to move it",
+            ],
+            "{lines:?}"
+        );
+
+        // Pasteable means shell-safe, not merely terminal-safe: a space
+        // stays one argument, an apostrophe survives its own quoting,
+        // and $() stays a directory name instead of a command.
+        let spaced = PathBuf::from("/tmp/my lbin");
+        let lines = duplicate_install_warnings_from(&also, &spaced, &empty, std::iter::once("foo"));
+        assert!(
+            lines[2].contains("--to='/tmp/my lbin'"),
+            "a space is quoted into one argument: {lines:?}"
+        );
+        let hostile_shell = PathBuf::from("/tmp/$(touch owned)");
+        let lines =
+            duplicate_install_warnings_from(&also, &hostile_shell, &empty, std::iter::once("foo"));
+        assert!(
+            lines[2].contains("--to='/tmp/$(touch owned)'"),
+            "command substitution is neutralized by quoting: {lines:?}"
+        );
+        let quoted = PathBuf::from("/tmp/o'brien");
+        let lines = duplicate_install_warnings_from(&also, &quoted, &empty, std::iter::once("foo"));
+        assert!(
+            lines[2].contains(r"--to='/tmp/o'\''brien'"),
+            "an apostrophe survives its own quoting: {lines:?}"
+        );
+
+        // Already installed here too: nothing new is created, verify
+        // owns the standing duplication — no warning.
+        let local = manifest_with(&["foo"]);
+        assert!(
+            duplicate_install_warnings_from(&also, &prefix, &local, std::iter::once("foo"))
+                .is_empty(),
+            "a reinstall creates no second copy"
+        );
+
+        // No foreign copy: silence.
+        assert!(
+            duplicate_install_warnings_from(&also, &prefix, &empty, std::iter::once("bar"))
+                .is_empty()
+        );
+
+        // A control character has no honest shell spelling: the warning
+        // stands, the terminal stays protected (the 0.7.0 rule), but no
+        // exact command is printed — a sanitize-laundered path would be
+        // safe to paste and wrong to run. Same rule as the verify
+        // reinstall hint.
+        let mut hostile: BTreeMap<String, Vec<prefixes::AlsoIn>> = BTreeMap::new();
+        hostile.insert(
+            "foo".to_owned(),
+            vec![prefixes::AlsoIn {
+                prefix: PathBuf::from("/usr/\x1b[31mlocal"),
+                version: "1.2.3".to_owned(),
+            }],
+        );
+        let lines =
+            duplicate_install_warnings_from(&hostile, &prefix, &empty, std::iter::once("foo"));
+        assert_eq!(lines.len(), 3, "the warning itself stands: {lines:?}");
+        assert!(lines.iter().all(|l| !l.contains('\x1b')), "{lines:?}");
+        assert_eq!(
+            lines[2], "use `cargo lbin migrate` if you intended to move it",
+            "no honest spelling, no exact command: {lines:?}"
         );
     }
 
