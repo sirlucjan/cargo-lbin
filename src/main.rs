@@ -194,7 +194,7 @@ enum Cmd {
     /// whether they are installed under the prefix
     ///
     /// `--versions` appends the full published version set, in
-    /// descending `SemVer` order, with yanked releases marked — the
+    /// descending semver order, with yanked releases marked — the
     /// answer to "install foo@X, but which X exists?". It is still
     /// information about the crate, so it lives here and not in a
     /// command of its own.
@@ -2644,8 +2644,8 @@ fn check_versions<'a>(
     Ok(Some(checked))
 }
 
-/// The full published version set, in descending `SemVer` order, one
-/// release per line with `release_label`'s yanked mark. `SemVer` order,
+/// The full published version set, in descending semver order, one
+/// release per line with `release_label`'s yanked mark. Semver order,
 /// not reverse chronology, on purpose: the question the section
 /// answers — "install foo@X, but which X exists?" — lives on the
 /// version axis, so a 1.9.7 backported *after* 2.0.0 still sorts below
@@ -3846,7 +3846,7 @@ mod tests {
         assert!(out.contains("also in:"), "{out}");
     }
 
-    /// The history section: descending `SemVer` order — not reverse
+    /// The history section: descending semver order — not reverse
     /// chronology; the index's publication order is neither — with
     /// everything listed: yanked flagged, pre-releases included,
     /// because this is history, and eligibility is the `installed`
@@ -3858,7 +3858,7 @@ mod tests {
             yanked,
         };
         // Deliberately out of order and mixed: whatever order came in,
-        // descending `SemVer` comes out.
+        // descending semver comes out.
         let releases = [
             rel("2.2.0", true),
             rel("2.4.0", false),
