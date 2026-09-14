@@ -1,11 +1,11 @@
 %define _disable_source_fetch 0
 
 Name:           cargo-lbin
-Version:        0.10.1
+Version:        0.12.0
 Release:        1
 Summary:        Cargo-powered application manager for crates.io command-line binaries
 
-License:        MIT AND Apache-2.0
+License:        MIT OR Apache-2.0
 URL:            https://github.com/sirlucjan/cargo-lbin
 Source0:        %{URL}/archive/refs/tags/%{version}.tar.gz
 
