@@ -503,7 +503,7 @@ pub fn ensure_lock_file(policy: Policy, path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Best-effort SELinux relabel (Fedora; absent and harmless on Arch).
+/// Best-effort `SELinux` relabel (Fedora; absent and harmless on Arch).
 pub fn restorecon(policy: Policy, paths: &[&Path]) {
     let Some(program) = RESTORECON_CANDIDATES
         .iter()

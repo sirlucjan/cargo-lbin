@@ -330,19 +330,11 @@ fn draw_details(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(panel, area);
 }
 
-fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
-    use std::fmt::Write as _;
-    let [keys_area, status_area, line_area] = Layout::new(
-        Direction::Vertical,
-        [
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Length(1),
-        ],
-    )
-    .areas(area);
-
-    let keys = if app.confirm.is_some() {
+/// The footer's key bar: only the keys the current state actually
+/// answers — a bar promising doors the gate keeps locked would be
+/// instructions for nothing.
+fn key_bar(app: &App) -> &'static str {
+    if app.confirm.is_some() {
         " y confirm · any other key cancel"
     } else if app.input.is_some() {
         " Enter run · Esc cancel"
@@ -367,7 +359,22 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         " ↑/↓ select · Tab filter · Enter/u update · U update all · i install · x remove · \
          m migrate · M migrate all · B other prefix · p pin · D downgrade · v verify · r check · s search · ? help · q quit"
-    };
+    }
+}
+
+fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
+    use std::fmt::Write as _;
+    let [keys_area, status_area, line_area] = Layout::new(
+        Direction::Vertical,
+        [
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ],
+    )
+    .areas(area);
+
+    let keys = key_bar(app);
     frame.render_widget(
         Paragraph::new(Span::styled(keys, Style::default().fg(Color::DarkGray))),
         keys_area,

@@ -1328,7 +1328,7 @@ fn shell_quote(s: &str) -> String {
 }
 
 /// The pasteable spelling of the audited prefix, or `None` when no
-/// honest one exists: non-UTF-8 display() is lossy, and a control char
+/// honest one exists: non-UTF-8 `display()` is lossy, and a control char
 /// would be laundered by the sanitize boundary into a command naming a
 /// different path — safe to paste, wrong to run. `--prefix=<quoted>`
 /// so a dash-leading prefix cannot lex as an option.
@@ -1361,6 +1361,115 @@ fn reinstall_hint(prefix: &Path, name: &str, entry: &Entry) -> Option<String> {
     Some(hint)
 }
 
+/// One managed binary's disk verdict: the remedy text and the bare
+/// `hint` are built together (loadable manifest only — one breach
+/// anywhere bounces `install`, so no hint is offered over one), then
+/// the claim is checked by `symlink_metadata` — the honest primitive:
+/// a symlink must be its own finding, not followed into a wrong one.
+fn disk_finding(
+    prefix: &Path,
+    bin_dir: &Path,
+    loadable: bool,
+    name: &str,
+    entry: &Entry,
+    bin: &str,
+) -> Option<Finding> {
+    use std::os::unix::fs::PermissionsExt;
+    let hint = if loadable {
+        reinstall_hint(prefix, name, entry)
+    } else {
+        None
+    };
+    let remedy = if loadable {
+        match hint.clone() {
+            Some(hint) => format!(" — reinstall: {hint}"),
+            // Loadable manifest, unspellable prefix: the repair is still a
+            // reinstall, there is just no command worth pasting.
+            None => " — reinstall it (this prefix's name cannot be \
+                      spelled as a safe shell command, so none is \
+                      offered)"
+                .to_owned(),
+        }
+    } else {
+        " — reinstall once the manifest findings above are repaired".to_owned()
+    };
+    let path = bin_dir.join(bin);
+    match fs::symlink_metadata(&path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(Finding {
+            path: Some(path.clone()),
+            hint: hint.clone(),
+            ..Finding::for_bin(
+                "binary-missing",
+                name,
+                bin,
+                format!(
+                    "`{name}`: managed binary {} is missing{remedy}",
+                    path.display()
+                ),
+            )
+        }),
+        // EACCES, EIO, a symlink loop: "missing" would be a lie — the honest
+        // finding is that the claim could not be checked.
+        Err(e) => Some(Finding {
+            path: Some(path.clone()),
+            ..Finding::for_bin(
+                "binary-uninspectable",
+                name,
+                bin,
+                format!(
+                    "`{name}`: managed binary {} cannot be inspected: {e} — the \
+                     manifest's claim could not be checked",
+                    path.display()
+                ),
+            )
+        }),
+        Ok(md) if md.file_type().is_symlink() => Some(Finding {
+            path: Some(path.clone()),
+            hint: hint.clone(),
+            ..Finding::for_bin(
+                "binary-is-a-symlink",
+                name,
+                bin,
+                format!(
+                    "`{name}`: managed binary {} is a symlink, not the regular \
+                     file lbin placed — remove it, then{}",
+                    path.display(),
+                    remedy.trim_start_matches(" —")
+                ),
+            )
+        }),
+        Ok(md) if !md.is_file() => Some(Finding {
+            path: Some(path.clone()),
+            hint: hint.clone(),
+            ..Finding::for_bin(
+                "binary-not-a-regular-file",
+                name,
+                bin,
+                format!(
+                    "`{name}`: managed binary {} is not a regular file — remove \
+                     whatever took its place, then{}",
+                    path.display(),
+                    remedy.trim_start_matches(" —")
+                ),
+            )
+        }),
+        Ok(md) if md.permissions().mode() & 0o111 == 0 => Some(Finding {
+            path: Some(path.clone()),
+            hint: hint.clone(),
+            ..Finding::for_bin(
+                "binary-not-executable",
+                name,
+                bin,
+                format!(
+                    "`{name}`: managed binary {} is not executable{remedy}",
+                    path.display()
+                ),
+            )
+        }),
+        Ok(_) => None,
+    }
+}
+
 /// The hard invariants — `Manifest::validate`'s exact set, one finding
 /// per breach where validate first-bails, plus the disk checks. Kept
 /// in lockstep on purpose: a check the loader gains must appear here,
@@ -1384,7 +1493,6 @@ fn reinstall_hint(prefix: &Path, name: &str, entry: &Entry) -> Option<String> {
 /// stays structural — `pacman -Qk`, not `-Qkk`: no hashes, by the same
 /// decision that makes migrate rebuild rather than copy.
 fn verify_entries(prefix: &Path, manifest: &Manifest) -> (Vec<Finding>, Vec<String>) {
-    use std::os::unix::fs::PermissionsExt;
     let mut errors = Vec::new();
     let mut checkable: Vec<String> = Vec::new();
     let mut claims: BTreeMap<&String, Vec<&String>> = BTreeMap::new();
@@ -1480,98 +1588,8 @@ fn verify_entries(prefix: &Path, manifest: &Manifest) -> (Vec<Finding>, Vec<Stri
             if validate::validate_bin_name(bin).is_err() || !seen.insert(bin.as_str()) {
                 continue;
             }
-            let hint = if loadable {
-                reinstall_hint(prefix, name, entry)
-            } else {
-                None
-            };
-            let remedy = if !loadable {
-                " — reinstall once the manifest findings above are repaired".to_owned()
-            } else {
-                match hint.clone() {
-                    Some(hint) => format!(" — reinstall: {hint}"),
-                    // Loadable manifest, unspellable prefix: the repair is still a
-                    // reinstall, there is just no command worth pasting.
-                    None => " — reinstall it (this prefix's name cannot be \
-                              spelled as a safe shell command, so none is \
-                              offered)"
-                        .to_owned(),
-                }
-            };
-            let path = bin_dir.join(bin);
-            match fs::symlink_metadata(&path) {
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => errors.push(Finding {
-                    path: Some(path.clone()),
-                    hint: hint.clone(),
-                    ..Finding::for_bin(
-                        "binary-missing",
-                        name,
-                        bin,
-                        format!(
-                            "`{name}`: managed binary {} is missing{remedy}",
-                            path.display()
-                        ),
-                    )
-                }),
-                // EACCES, EIO, a symlink loop: "missing" would be a lie — the honest
-                // finding is that the claim could not be checked.
-                Err(e) => errors.push(Finding {
-                    path: Some(path.clone()),
-                    ..Finding::for_bin(
-                        "binary-uninspectable",
-                        name,
-                        bin,
-                        format!(
-                            "`{name}`: managed binary {} cannot be inspected: {e} — the \
-                             manifest's claim could not be checked",
-                            path.display()
-                        ),
-                    )
-                }),
-                Ok(md) if md.file_type().is_symlink() => errors.push(Finding {
-                    path: Some(path.clone()),
-                    hint: hint.clone(),
-                    ..Finding::for_bin(
-                        "binary-is-a-symlink",
-                        name,
-                        bin,
-                        format!(
-                            "`{name}`: managed binary {} is a symlink, not the regular \
-                             file lbin placed — remove it, then{}",
-                            path.display(),
-                            remedy.trim_start_matches(" —")
-                        ),
-                    )
-                }),
-                Ok(md) if !md.is_file() => errors.push(Finding {
-                    path: Some(path.clone()),
-                    hint: hint.clone(),
-                    ..Finding::for_bin(
-                        "binary-not-a-regular-file",
-                        name,
-                        bin,
-                        format!(
-                            "`{name}`: managed binary {} is not a regular file — remove \
-                             whatever took its place, then{}",
-                            path.display(),
-                            remedy.trim_start_matches(" —")
-                        ),
-                    )
-                }),
-                Ok(md) if md.permissions().mode() & 0o111 == 0 => errors.push(Finding {
-                    path: Some(path.clone()),
-                    hint: hint.clone(),
-                    ..Finding::for_bin(
-                        "binary-not-executable",
-                        name,
-                        bin,
-                        format!(
-                            "`{name}`: managed binary {} is not executable{remedy}",
-                            path.display()
-                        ),
-                    )
-                }),
-                Ok(_) => {}
+            if let Some(finding) = disk_finding(prefix, &bin_dir, loadable, name, entry, bin) {
+                errors.push(finding);
             }
         }
     }
@@ -1587,7 +1605,7 @@ fn verify_entries(prefix: &Path, manifest: &Manifest) -> (Vec<Finding>, Vec<Stri
 /// error *policy* is the caller's: read errors come back unflattened,
 /// verify silences them (read-only, a possibly-wrong warning is worse
 /// than none), clean propagates them (a mutating command must not
-/// report success over a cache it could not read). NotFound is an
+/// report success over a cache it could not read). `NotFound` is an
 /// empty cache for both.
 fn scan_stale_stages(cache: &Path) -> std::io::Result<Vec<PathBuf>> {
     let mut stale = Vec::new();
@@ -4728,13 +4746,13 @@ mod tests {
         // The full mirror, collected not first-bailed — and the safety gate:
         // the path-like name is neither stat'd (a planted file outside bin/
         // must yield no disk verdict) nor handed to the PATH scan.
+        use std::os::unix::fs::PermissionsExt;
         let root = std::env::temp_dir().join("cargo-lbin-test-verify-mirror");
         let _ = fs::remove_dir_all(&root);
         let prefix = root.join("prefix");
         fs::create_dir_all(prefix.join("bin")).unwrap();
         // The escape target: joined and stat'd, `../outside` would resolve
         // here and the finding would wrongly be about the disk.
-        use std::os::unix::fs::PermissionsExt;
         fs::write(prefix.join("outside"), "#!/bin/sh\ntrue\n").unwrap();
         fs::set_permissions(prefix.join("outside"), fs::Permissions::from_mode(0o755)).unwrap();
         // A sound binary, so the sound half of the entry verifies clean.
@@ -4951,7 +4969,7 @@ mod tests {
         let new_log = logs.join("build-new.log");
         fs::write(&old_log, "old").unwrap();
         fs::write(&new_log, "new").unwrap();
-        let ancient = std::time::SystemTime::now() - std::time::Duration::from_secs(90 * 86_400);
+        let ancient = std::time::SystemTime::now() - std::time::Duration::from_hours(90 * 24);
         fs::File::options()
             .write(true)
             .open(&old_log)
@@ -5026,7 +5044,7 @@ mod tests {
         let cache = root.join("cache");
 
         // No stage directory at all: silence, not an error.
-        assert!(scan_stale_stages(&cache).unwrap().is_empty());
+        assert_eq!(scan_stale_stages(&cache).unwrap(), Vec::<PathBuf>::new());
 
         // A live PID (ours), a PID /proc cannot know, and a name that is
         // not a PID at all.

@@ -211,7 +211,7 @@ fn drain_stderr(
 /// `build` for a screen-owning frontend: stderr piped and forwarded
 /// line by line; plain text enforced, not assumed (cargo's coloring
 /// off, every line sanitized — build scripts answer to neither cargo
-/// nor CARGO_TERM_COLOR). stdout discarded: `cargo install` speaks on
+/// nor `CARGO_TERM_COLOR`). stdout discarded: `cargo install` speaks on
 /// stderr, and a stray write must not corrupt the screen.
 ///
 /// On failure the full output goes to a log and the error carries the

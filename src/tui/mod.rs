@@ -354,6 +354,54 @@ impl App {
     fn request_oneshot_cancel(cancel: &CancelFlag) {
         cancel.store(true, std::sync::atomic::Ordering::Relaxed);
     }
+
+    /// The one meaning of c over a running job. Builds escalate through
+    /// `BuildControl`; one-shots set their flag and nothing more; with no
+    /// job, silence — nothing else could be meant.
+    fn cancel_pressed(&mut self) {
+        match &self.job {
+            Some(Job::Build { name, control, .. }) => {
+                let name = name.clone();
+                match control.request_cancel() {
+                    crate::CancelOutcome::Accepted => {
+                        self.arm_cancel_grace();
+                        self.info(&format!("cancelling {name}… (c again sends SIGKILL)"));
+                    }
+                    crate::CancelOutcome::Killed => {
+                        self.warn(&format!("SIGKILL sent to the {name} build"));
+                    }
+                    crate::CancelOutcome::AlreadyStopping => {
+                        self.info("the build is already stopping");
+                    }
+                    crate::CancelOutcome::TooLate => {
+                        self.info("placement already started; too late to cancel");
+                    }
+                }
+            }
+            // One-shots: a flag, not the build's machinery — no
+            // grace, no escalation, no "too late". The slot stays
+            // held until the worker returns: the check worker
+            // exits between index requests, search is bounded by
+            // the agent's timeouts, and verify may sit in the
+            // shared-lock wait — none of which this door
+            // interrupts; results arriving after the flag are
+            // discarded.
+            Some(Job::Check { cancel, .. }) => {
+                Self::request_oneshot_cancel(cancel);
+                self.info("cancelling the update check…");
+            }
+            Some(Job::Verify { cancel, .. }) => {
+                Self::request_oneshot_cancel(cancel);
+                self.info("verify: cancel requested — the result will be discarded");
+            }
+            Some(Job::Search { query, cancel, .. }) => {
+                let note = format!("search `{query}`: cancel requested…");
+                Self::request_oneshot_cancel(cancel);
+                self.info(&note);
+            }
+            None => {}
+        }
+    }
 }
 
 /// Background work in flight — at most one, so the busy label is
@@ -1750,11 +1798,7 @@ impl App {
             match key.code {
                 // B on purpose: the jump is how one *leaves* a broken prefix — a
                 // gate that lets you in but not out would be a trap.
-                KeyCode::Char('q')
-                | KeyCode::Char('v')
-                | KeyCode::Char('?')
-                | KeyCode::Char('B')
-                | KeyCode::Esc => {}
+                KeyCode::Char('q' | 'v' | '?' | 'B') | KeyCode::Esc => {}
                 // The cancel door the degraded verify opened: v works
                 // here on purpose, so c must reach its running job — the
                 // gate swallowing it would answer a cancel with repair
@@ -1801,50 +1845,7 @@ impl App {
             // Cancel and stay. Builds escalate: first press SIGTERMs the
             // group, a second SIGKILLs. One-shots set a flag and nothing
             // more. With no job, silence — nothing else could be meant.
-            KeyCode::Char('c') => {
-                match &self.job {
-                    Some(Job::Build { name, control, .. }) => {
-                        let name = name.clone();
-                        match control.request_cancel() {
-                            crate::CancelOutcome::Accepted => {
-                                self.arm_cancel_grace();
-                                self.info(&format!("cancelling {name}… (c again sends SIGKILL)"));
-                            }
-                            crate::CancelOutcome::Killed => {
-                                self.warn(&format!("SIGKILL sent to the {name} build"));
-                            }
-                            crate::CancelOutcome::AlreadyStopping => {
-                                self.info("the build is already stopping");
-                            }
-                            crate::CancelOutcome::TooLate => {
-                                self.info("placement already started; too late to cancel");
-                            }
-                        }
-                    }
-                    // One-shots: a flag, not the build's machinery — no
-                    // grace, no escalation, no "too late". The slot stays
-                    // held until the worker returns: the check worker
-                    // exits between index requests, search is bounded by
-                    // the agent's timeouts, and verify may sit in the
-                    // shared-lock wait — none of which this door
-                    // interrupts; results arriving after the flag are
-                    // discarded.
-                    Some(Job::Check { cancel, .. }) => {
-                        Self::request_oneshot_cancel(cancel);
-                        self.info("cancelling the update check…");
-                    }
-                    Some(Job::Verify { cancel, .. }) => {
-                        Self::request_oneshot_cancel(cancel);
-                        self.info("verify: cancel requested — the result will be discarded");
-                    }
-                    Some(Job::Search { query, cancel, .. }) => {
-                        let note = format!("search `{query}`: cancel requested…");
-                        Self::request_oneshot_cancel(cancel);
-                        self.info(&note);
-                    }
-                    None => {}
-                }
-            }
+            KeyCode::Char('c') => self.cancel_pressed(),
             KeyCode::Char('?') => self.show_help = true,
             KeyCode::Down | KeyCode::Char('j') => self.select_next(),
             KeyCode::Up | KeyCode::Char('k') => self.select_prev(),
@@ -2494,6 +2495,11 @@ impl App {
     /// Collects finished background work. A dropped sender means a worker
     /// panicked — ratatui's hook already restored the terminal, so the
     /// loop returns the error rather than scribble over the shell.
+    // One collector, every job kind in one match: the Build arm is long
+    // because a build speaks many message kinds, and splitting the match
+    // would scatter the single-flight story across helpers (the same
+    // trade the too_many_arguments allows make at the install sites).
+    #[allow(clippy::too_many_lines)]
     fn poll_job(&mut self) -> Result<()> {
         let Some(job) = self.job.take() else {
             return Ok(());
