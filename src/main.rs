@@ -1106,7 +1106,40 @@ fn duplicate_install_warnings_from<'a>(
     manifest: &Manifest,
     names: impl Iterator<Item = &'a str>,
 ) -> Vec<String> {
-    let mut lines = Vec::new();
+    duplicate_install_warning_lines(
+        &cross_prefix_duplicates_from(also, prefix, manifest, names),
+        prefix,
+    )
+}
+
+/// One foreign managed copy that an install batch is about to
+/// duplicate — the *decision* as facts, shared by every surface. The
+/// CLI renders these into warning lines; the TUI feeds the same lines
+/// into its panel today and may render the fields natively tomorrow —
+/// either way the answer to "will this install create a duplicate?"
+/// has exactly one author, and no surface parses a string built for
+/// another.
+struct CrossPrefixDuplicate {
+    name: String,
+    other_prefix: PathBuf,
+    other_version: String,
+    /// The pasteable migrate command, present only when both prefixes
+    /// have an honest shell spelling (see `pasteable_path_arg`); the
+    /// spelling question is decided here, with the facts, so no
+    /// renderer can disagree about it.
+    migrate_hint: Option<String>,
+}
+
+/// The decision behind `duplicate_install_warnings`, over any
+/// cross-prefix map: which requested crates, absent from this prefix's
+/// manifest, are managed elsewhere — one entry per foreign copy.
+fn cross_prefix_duplicates_from<'a>(
+    also: &std::collections::BTreeMap<String, Vec<prefixes::AlsoIn>>,
+    prefix: &Path,
+    manifest: &Manifest,
+    names: impl Iterator<Item = &'a str>,
+) -> Vec<CrossPrefixDuplicate> {
+    let mut duplicates = Vec::new();
     for name in names {
         if manifest.crates.contains_key(name) {
             continue;
@@ -1115,36 +1148,61 @@ fn duplicate_install_warnings_from<'a>(
             continue;
         };
         for other in entries {
-            lines.push(text::sanitize(&format!(
-                "warning: `{name}` is already managed under {} @{}",
-                other.prefix.display(),
-                other.version
-            )));
-            lines.push(text::sanitize(&format!(
-                "this will install another copy under {}",
-                prefix.display()
-            )));
-            // The migrate line is printed only when it is genuinely
-            // pasteable: both paths shell-quoted, or — for a path with
-            // no honest spelling (non-UTF-8, control chars) — no exact
-            // command at all. The sanitize boundary protects the
-            // terminal, not the shell; a laundered path would be safe
-            // to paste and wrong to run, and quoting is what keeps
-            // `/tmp/$(touch owned)` a directory name instead of a
-            // command. Same rule as the verify reinstall hint.
-            if let (Some(source), Some(dest)) = (
+            let migrate_hint = match (
                 pasteable_path_arg("--prefix", &other.prefix),
                 pasteable_path_arg("--to", prefix),
             ) {
+                (Some(source), Some(dest)) => {
+                    Some(format!("cargo lbin migrate {name} {source} {dest}"))
+                }
+                _ => None,
+            };
+            duplicates.push(CrossPrefixDuplicate {
+                name: name.to_owned(),
+                other_prefix: other.prefix.clone(),
+                other_version: other.version.clone(),
+                migrate_hint,
+            });
+        }
+    }
+    duplicates
+}
+
+/// The CLI's words over the shared facts: three lines per duplicate,
+/// every one sanitized for the terminal. The migrate line is printed
+/// exactly when the facts carry an honest command — the sanitize
+/// boundary protects the terminal, not the shell; a laundered path
+/// would be safe to paste and wrong to run, and quoting is what keeps
+/// `/tmp/$(touch owned)` a directory name instead of a command. With
+/// no honest spelling the mechanism is still named, worded so nobody
+/// mistakes it for a pasteable hint. Same rule as the verify reinstall
+/// hint.
+fn duplicate_install_warning_lines(
+    duplicates: &[CrossPrefixDuplicate],
+    prefix: &Path,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    for dup in duplicates {
+        lines.push(text::sanitize(&format!(
+            "warning: `{}` is already managed under {} @{}",
+            dup.name,
+            dup.other_prefix.display(),
+            dup.other_version
+        )));
+        lines.push(text::sanitize(&format!(
+            "this will install another copy under {}",
+            prefix.display()
+        )));
+        match &dup.migrate_hint {
+            Some(hint) => {
                 lines.push(text::sanitize(&format!(
-                    "use `cargo lbin migrate {name} {source} {dest}` \
-                     if you intended to move it"
+                    "use `{hint}` if you intended to move it"
                 )));
-            } else {
-                lines.push(text::sanitize(
-                    "use `cargo lbin migrate` if you intended to move it",
-                ));
             }
+            None => lines.push(text::sanitize(
+                "use `cargo lbin migrate` with explicit --prefix/--to \
+                 if you intended to move it",
+            )),
         }
     }
     lines
@@ -3913,8 +3971,11 @@ mod tests {
         assert_eq!(lines.len(), 3, "the warning itself stands: {lines:?}");
         assert!(lines.iter().all(|l| !l.contains('\x1b')), "{lines:?}");
         assert_eq!(
-            lines[2], "use `cargo lbin migrate` if you intended to move it",
-            "no honest spelling, no exact command: {lines:?}"
+            lines[2],
+            "use `cargo lbin migrate` with explicit --prefix/--to \
+             if you intended to move it",
+            "no honest spelling: the mechanism is named, worded so nobody \
+             mistakes it for a pasteable hint: {lines:?}"
         );
     }
 
