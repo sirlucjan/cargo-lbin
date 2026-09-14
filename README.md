@@ -464,7 +464,7 @@ cargo lbin verify
 
 ```
 error: `foo`: managed binary /home/user/.local/bin/foo is missing — reinstall: cargo lbin install foo --prefix=/home/user/.local
-warning: 2 stage directories under /home/user/.cache/cargo-lbin/stage whose owning cargo-lbin process is gone — possible leftover build debris; inspect and remove when safe (a PID can be reused, and an orphaned build may still hold the directory)
+warning: 2 stage directories under /home/user/.cache/cargo-lbin/stage whose owning cargo-lbin process is gone — possible leftover build debris; inspect, then `cargo lbin clean --stages` when safe (a PID can be reused, and an orphaned build may still hold the directory)
 ```
 
 The manifest is the source of truth; every command relies on that,
@@ -655,6 +655,12 @@ seconds of the first cancel, SIGKILL follows automatically: a group
 member holding the build's output pipe can wedge the worker inside a
 read — a partial line with no newline is enough — so the interface does
 not depend on the worker to finish the job.
+
+The one-shot jobs (`r`, `v`, `s`) have their own, simpler door: `c`
+requests cancellation — the update check stops between index requests,
+a verify or search runs to completion and its result is discarded on
+arrival — and the same door works in the degraded state, where `v` is
+the natural first move.
 
 `m` migrates the selected crate to the other prefix of the known pair —
 `/usr/local` from `~/.local` or the reverse — after a confirmation that
