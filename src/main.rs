@@ -1616,12 +1616,19 @@ fn scan_stale_stages(cache: &Path) -> std::io::Result<Vec<PathBuf>> {
     };
     for entry in entries {
         let entry = entry?;
-        let alive = entry
-            .file_name()
-            .to_str()
-            .and_then(|s| s.parse::<u32>().ok())
-            .is_some_and(|pid| Path::new(&format!("/proc/{pid}")).exists());
-        if !alive {
+        let stale_entry = match entry.file_name().to_str().and_then(stage::parse_run_dir) {
+            // The heuristic, for the layout that has nothing better —
+            // with both of its known lies left standing.
+            Some(stage::StageRun::LegacyPid(pid)) => !Path::new(&format!("/proc/{pid}")).exists(),
+            // Never stale here: liveness for this layout is the lease,
+            // and until the probe exists the only safe answer is to
+            // spare the run. A wrong "stale" is a deletable lie; a
+            // wrong "leave it" costs disk until the next pass.
+            Some(stage::StageRun::LeasedRun { .. }) => false,
+            // Not a run at all: debris keeps its existing verdict.
+            None => true,
+        };
+        if stale_entry {
             stale.push(entry.path());
         }
     }
@@ -5051,12 +5058,17 @@ mod tests {
         // No stage directory at all: silence, not an error.
         assert_eq!(scan_stale_stages(&cache).unwrap(), Vec::<PathBuf>::new());
 
-        // A live PID (ours), a PID /proc cannot know, and a name that is
-        // not a PID at all.
+        // A live PID (ours), a PID /proc cannot know, a name that is
+        // not a PID at all — and a leased-layout run whose PID is just
+        // as dead, which is exactly why it must be spared: its liveness
+        // is the lease's to answer, not /proc's.
         let live = cache.join("stage").join(std::process::id().to_string());
         let dead = cache.join("stage").join(u32::MAX.to_string());
         let junk = cache.join("stage").join("not-a-pid");
-        for d in [&live, &dead, &junk] {
+        let leased = cache
+            .join("stage")
+            .join(format!("{}-0123456789abcdef", u32::MAX));
+        for d in [&live, &dead, &junk, &leased] {
             fs::create_dir_all(d).unwrap();
         }
         let stale = scan_stale_stages(&cache).unwrap();
@@ -5066,6 +5078,10 @@ mod tests {
         );
         assert!(stale.contains(&dead), "a dead PID's stage is debris");
         assert!(stale.contains(&junk), "a non-PID name is debris");
+        assert!(
+            !stale.contains(&leased),
+            "a leased-layout run is never the /proc heuristic's to condemn"
+        );
         let _ = fs::remove_dir_all(&root);
     }
 

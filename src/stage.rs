@@ -19,6 +19,103 @@ use std::process::Command;
 
 const CRATES_IO_SOURCE: &str = "registry+https://github.com/rust-lang/crates.io-index";
 
+/// A directory name in a stage namespace under the cache, as the
+/// scanners read it.
+///
+/// Two layouts coexist. `<pid>` is the pre-lease layout: the PID is
+/// the only identity there is, and liveness is the `/proc` heuristic —
+/// with both of its known lies (a reused PID resurrects a dead stage,
+/// an orphaned cargo outlives the PID that named it). `<pid>-<nonce>`
+/// is the lease-aware layout: the nonce makes the name unique across
+/// PID reuse, so the PID degrades to what it always should have been —
+/// a diagnostic — and ownership is whatever holds the run's `.lease`.
+///
+/// A name that parses as neither is not a run at all; the scanners
+/// keep their existing verdict on such debris.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StageRun {
+    /// `<pid>` — liveness by `/proc`, the heuristic this type exists
+    /// to retire.
+    LegacyPid(u32),
+    /// `<pid>-<nonce>` — ownership by lease; the PID is diagnostics
+    /// only and never consulted for liveness.
+    LeasedRun { pid: u32 },
+}
+
+/// Nonce width in hex digits: 8 random bytes, enough that a collision
+/// under one machine's stage namespaces is not a case worth code.
+const NONCE_HEX_LEN: usize = 16;
+
+/// Classify a stage-namespace entry name. Strict on purpose: a legacy
+/// name is
+/// ASCII digits and nothing else, a leased name is digits, one dash,
+/// and exactly [`NONCE_HEX_LEN`] lowercase hex digits — the alphabet
+/// [`new_run_dir_name`] writes. Anything looser would promote debris
+/// into a run and buy it protection it never earned.
+#[must_use]
+pub fn parse_run_dir(name: &str) -> Option<StageRun> {
+    fn pid(s: &str) -> Option<u32> {
+        if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        s.parse().ok()
+    }
+    if let Some(p) = pid(name) {
+        return Some(StageRun::LegacyPid(p));
+    }
+    let (p, nonce) = name.split_once('-')?;
+    let p = pid(p)?;
+    if nonce.len() == NONCE_HEX_LEN
+        && nonce
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        Some(StageRun::LeasedRun { pid: p })
+    } else {
+        None
+    }
+}
+
+/// A fresh `<pid>-<nonce>` name for this run. The nonce comes from
+/// `getrandom(2)`: no seed to manage, no clock to collide on, and no
+/// file descriptor to leak — two runs in the same nanosecond are a
+/// scheduler fact, two equal nonces are not.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the producer path adopts run names in the next commit"
+    )
+)]
+pub fn new_run_dir_name() -> std::io::Result<String> {
+    use std::fmt::Write as _;
+    let mut nonce = [0u8; NONCE_HEX_LEN / 2];
+    let mut filled = 0usize;
+    while filled < nonce.len() {
+        // SAFETY: getrandom(2) writes at most `len` bytes into the
+        // buffer starting at `buf`; the range passed lives on this
+        // stack frame for the whole call.
+        let n = unsafe {
+            libc::getrandom(nonce[filled..].as_mut_ptr().cast(), nonce.len() - filled, 0)
+        };
+        if n < 0 {
+            let e = std::io::Error::last_os_error();
+            // EINTR: nothing written, nothing lost; simply try again.
+            if e.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(e);
+        }
+        filled += usize::try_from(n).unwrap_or(0);
+    }
+    let mut name = format!("{}-", std::process::id());
+    for b in nonce {
+        // Infallible on String; the expect documents that, not a risk.
+        write!(name, "{b:02x}").expect("writing to a String cannot fail");
+    }
+    Ok(name)
+}
+
 #[derive(Debug)]
 pub struct Built {
     pub version: Version,
@@ -671,5 +768,52 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The parser is the classification boundary: everything it
+    /// accepts earns a liveness protocol, everything it rejects is
+    /// debris. Both sides of that line are pinned here.
+    #[test]
+    fn run_dir_parsing_is_strict_on_both_layouts() {
+        assert_eq!(parse_run_dir("1234"), Some(StageRun::LegacyPid(1234)));
+        assert_eq!(
+            parse_run_dir("1234-0123456789abcdef"),
+            Some(StageRun::LeasedRun { pid: 1234 })
+        );
+        for junk in [
+            "",
+            "-",
+            "12x",
+            "+7", // u32::parse would take it; the scanner must not
+            " 7",
+            "1234-",
+            "-0123456789abcdef",
+            "1234-0123456789abcde",   // one hex digit short
+            "1234-0123456789abcdef0", // one hex digit long
+            "1234-0123456789ABCDEF",  // not the alphabet we write
+            "1234-0123456789abcdeg",
+            "12x4-0123456789abcdef",
+            "1234-0123456789abcdef-0", // trailing garbage
+        ] {
+            assert_eq!(parse_run_dir(junk), None, "accepted junk: {junk:?}");
+        }
+    }
+
+    /// The generator and the parser agree on one alphabet, and two
+    /// calls never agree on one name — the whole point of the nonce.
+    #[test]
+    fn run_dir_names_round_trip_and_differ() {
+        let a = new_run_dir_name().unwrap();
+        let b = new_run_dir_name().unwrap();
+        assert_ne!(a, b, "two runs, one name: the nonce failed its job");
+        for name in [&a, &b] {
+            assert_eq!(
+                parse_run_dir(name),
+                Some(StageRun::LeasedRun {
+                    pid: std::process::id()
+                }),
+                "the generator wrote a name the parser rejects: {name}"
+            );
+        }
     }
 }
