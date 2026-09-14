@@ -2522,6 +2522,8 @@ fn cmd_man(dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Print a static completion script from the same clap definitions
+/// `--help` and `man` render — the third surface that cannot drift.
 fn cmd_completions(shell: clap_complete::Shell) {
     use clap::CommandFactory;
     let mut cmd = Cli::command();
