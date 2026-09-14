@@ -2523,16 +2523,24 @@ fn describe_info(name: &str, releases: &[index::Release], installed: Option<&Ent
         .collect();
     if live.is_empty() {
         out.push_str(" (no non-yanked releases)\n");
-        return out;
-    }
-    let newer = Version::parse(&entry.version).ok().and_then(|current| {
-        index::latest_relevant(&live, &current).filter(|latest| *latest > current)
-    });
-    if let Some(latest) = newer {
-        let _ = writeln!(out, " (update available: {latest})");
     } else {
-        out.push_str(" (up to date)\n");
+        let newer = Version::parse(&entry.version).ok().and_then(|current| {
+            index::latest_relevant(&live, &current).filter(|latest| *latest > current)
+        });
+        if let Some(latest) = newer {
+            let _ = writeln!(out, " (update available: {latest})");
+        } else {
+            out.push_str(" (up to date)\n");
+        }
     }
+    // The entry's own facts, exactly as the manifest holds them — the
+    // full single-crate view `list` gives in aggregate. yes/no over
+    // bare flags: the label is the question, the value must read as
+    // its answer.
+    let flag = |b: bool| if b { "yes" } else { "no" };
+    let _ = writeln!(out, "  pinned:      {}", flag(entry.pinned));
+    let _ = writeln!(out, "  locked:      {}", flag(entry.locked));
+    let _ = writeln!(out, "  binaries:    {}", entry.bins.join(", "));
     out
 }
 
@@ -3657,9 +3665,30 @@ mod tests {
             out.contains("installed:   1.0.0 (update available: 1.2.0)"),
             "{out}"
         );
+        // The entry block: the manifest's own facts, in full.
+        assert!(out.contains("pinned:      no"), "{out}");
+        assert!(out.contains("locked:      no"), "{out}");
+        assert!(out.contains("binaries:    foo"), "{out}");
 
         let out = describe_info("foo", &releases, None);
         assert!(out.contains("installed:   no"), "{out}");
+        assert!(
+            !out.contains("pinned:") && !out.contains("binaries:"),
+            "no entry, no entry block: {out}"
+        );
+
+        // Pinned, locked, several binaries: every field speaks.
+        let mut m = manifest_with(&["foo"]);
+        {
+            let e = m.crates.get_mut("foo").unwrap();
+            e.pinned = true;
+            e.locked = true;
+            e.bins = vec!["foo".into(), "fooctl".into()];
+        }
+        let out = describe_info("foo", &releases, m.crates.get("foo"));
+        assert!(out.contains("pinned:      yes"), "{out}");
+        assert!(out.contains("locked:      yes"), "{out}");
+        assert!(out.contains("binaries:    foo, fooctl"), "{out}");
 
         // Installed at the newest stable: up to date, rc still not offered.
         let mut m = manifest_with(&["foo"]);
@@ -3682,6 +3711,13 @@ mod tests {
         assert!(
             out.contains("installed:   1.0.0 (no non-yanked releases)"),
             "{out}"
+        );
+        // The regression that justified removing the early return: a
+        // publication history with nothing live is not a reason to
+        // withhold the local entry.
+        assert!(
+            out.contains("pinned:") && out.contains("locked:") && out.contains("binaries:    foo"),
+            "an all-yanked history still shows the entry block: {out}"
         );
     }
 

@@ -191,6 +191,9 @@ ripgrep
   latest:      14.1.1
   releases:    42 (2 yanked)
   installed:   14.1.0 (update available: 14.1.1)
+  pinned:      no
+  locked:      yes
+  binaries:    rg
 
 bat
   latest:      0.26.0
@@ -201,7 +204,7 @@ bat
 
 `latest` and `pre-release` describe published history. They may name a yanked release, which is shown explicitly as `[yanked]`. The pre-release line is shown only when that release is newer than the latest stable release.
 
-The `installed` verdict is a separate question. It uses the same non-yanked update rules as `checkupdate`, so `info` does not call something "up to date" when `checkupdate` would disagree. If a crate has no non-yanked releases left, that is reported explicitly.
+The `installed` verdict is a separate question. It uses the same non-yanked update rules as `checkupdate`, so `info` does not call something "up to date" when `checkupdate` would disagree. If a crate has no non-yanked releases left, that is reported explicitly. An installed crate also shows its manifest entry in full — `pinned`, `locked`, and the binaries it provides — so `info` is the complete single-crate view of what `list` shows in aggregate.
 
 Unknown names do not stop the rest of a batch. They are reported after the successful results, with a hint to use `search`; the command exits non-zero if any exact lookup failed.
 
