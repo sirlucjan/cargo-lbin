@@ -270,6 +270,20 @@ enum BuildKind {
     Migrate(Box<MigrateTarget>),
 }
 
+impl BuildKind {
+    /// The word the UI speaks for this job — one definition, so a live
+    /// panel and the finished report cannot name the same build
+    /// differently.
+    fn verb(&self) -> &'static str {
+        match self {
+            BuildKind::Install => "install",
+            // Tuple variant, tuple pattern: a pattern should not lie
+            // about the shape.
+            BuildKind::Migrate(_) => "migrate",
+        }
+    }
+}
+
 /// A confirmed migration on its way to `start_migrate`; the
 /// destination preflight may need the terminal.
 struct PendingMigrate {
@@ -1563,6 +1577,32 @@ impl App {
         lines
     }
 
+    /// Warnings as they arrive, not as a post-mortem. The worker emits
+    /// them before the work they describe — a cross-prefix duplicate is
+    /// announced before the build starts — and holding them until
+    /// `Done` would turn a heads-up into "by the way, you just created
+    /// a second copy". This surfaces each one on receipt and keeps it
+    /// readable while the build continues; it promises no more than
+    /// that, because nothing here delays the worker: a fast enough
+    /// build can deliver `Warning` and `Done` into the same poll, and
+    /// buying a guaranteed frame would mean letting a warning shape
+    /// execution — the opposite of informing without gating. The panel
+    /// is updated in place rather than re-pinned, so a growing list
+    /// does not yank a reader's scroll back to the top; a build start
+    /// already cleared any older report, so anything pinned here is
+    /// this build's own.
+    fn show_live_warnings(&mut self, name: &str, kind: &BuildKind, warnings: &[String]) {
+        let report = BuildReport {
+            title: format!("{} {name}: warnings", kind.verb()),
+            lines: warnings.to_vec(),
+            failed: false,
+        };
+        match &mut self.build_report {
+            Some(existing) => *existing = report,
+            None => self.pin_report(report),
+        }
+    }
+
     /// A finished captured install: reload, then speak in the pipeline's
     /// own words when it left any.
     fn finish_build(
@@ -1573,12 +1613,12 @@ impl App {
         tail: &VecDeque<String>,
         warnings: Vec<String>,
     ) {
-        let verb = match kind {
-            BuildKind::Install => "install",
-            // Tuple variant, tuple pattern: a pattern should not lie about the
-            // shape.
-            BuildKind::Migrate(_) => "migrate",
-        };
+        let verb = kind.verb();
+        // The live warning panel was this build's running record; every
+        // branch below pins whatever the finished build deserves, and a
+        // cancel deserves none. Clearing here keeps a stale live panel
+        // from outliving the job it belonged to.
+        self.build_report = None;
         // A batch owns its members' presentation: tallies, one summary.
         if self.migrate_batch.is_some()
             && let BuildKind::Migrate(target) = kind
@@ -2611,8 +2651,16 @@ impl App {
                             }
                         }
                         // Warnings live in `warnings` alone; a copy in the tail would print
-                        // twice under a one-line placement error.
-                        Ok(BuildMsg::Warning(line)) => warnings.push(line),
+                        // twice under a one-line placement error. They also reach the
+                        // panel on receipt: the worker emits them before the work they
+                        // describe, and a warning held until Done is a post-mortem. On
+                        // receipt, not before the build — this loop drains what has
+                        // arrived, and a cached build can put Warning and Done in the
+                        // same drain.
+                        Ok(BuildMsg::Warning(line)) => {
+                            warnings.push(line);
+                            self.show_live_warnings(&name, &kind, &warnings);
+                        }
                         Ok(BuildMsg::NeedAuth(target)) => needs_auth = Some(target),
                         Ok(BuildMsg::Done(outcome)) => {
                             done = Some(outcome);
@@ -3836,6 +3884,116 @@ mod tests {
         let report = app.build_report.as_ref().expect("findings pin a panel");
         assert!(report.failed, "an invariant violation is a failed panel");
         assert_eq!(app.report_scroll, 0, "a fresh report starts at the top");
+        let _ = std::fs::remove_dir_all(&prefix);
+    }
+
+    /// A warning is shown on receipt, not banked until `Done`: with the
+    /// build still running, the panel already carries it. That is the
+    /// surfacing contract in full — the UI never delays the worker, so
+    /// a build fast enough to finish within one poll is a race the
+    /// warning loses without being wrong, and this test pins the
+    /// behaviour where the mechanism actually answers: a warning
+    /// received while the job is alive is readable at once.
+    #[test]
+    fn a_warning_reaches_the_panel_while_the_build_still_runs() {
+        let prefix = std::env::temp_dir().join("cargo-lbin-test-tui-live-warning");
+        let _ = std::fs::remove_dir_all(&prefix);
+        std::fs::create_dir_all(&prefix).unwrap();
+        let mut app = App::new(&prefix).unwrap();
+
+        let (tx, rx) = mpsc::channel();
+        let (auth_tx, _auth_rx) = mpsc::channel();
+        app.job = Some(Job::Build {
+            name: "foo".into(),
+            rx,
+            auth_tx,
+            units_started: 0,
+            current: None,
+            tail: VecDeque::new(),
+            status_note: None,
+            warnings: Vec::new(),
+            started: std::time::Instant::now(),
+            needs_auth: None,
+            control: std::sync::Arc::new(crate::BuildControl::new()),
+            kind: BuildKind::Install,
+            cancel_deadline: None,
+        });
+
+        tx.send(BuildMsg::Warning(
+            "warning: `foo` is already managed under /usr/local @1.2.3".into(),
+        ))
+        .unwrap();
+        app.poll_job().unwrap();
+        assert!(app.build_running(), "the warning does not end the build");
+        let report = app
+            .build_report
+            .as_ref()
+            .expect("a warning is readable while the build runs");
+        assert!(report.lines.iter().any(|l| l.contains("already managed")));
+        assert!(!report.failed, "a warning is not a failure");
+
+        // A second warning grows the same panel; the scroll is not
+        // yanked back to the top under a reader.
+        app.report_scroll = 1;
+        tx.send(BuildMsg::Warning("warning: `foo` is shadowed".into()))
+            .unwrap();
+        app.poll_job().unwrap();
+        let report = app.build_report.as_ref().expect("still readable");
+        assert_eq!(report.lines.len(), 2, "both warnings, in order");
+        assert_eq!(
+            app.report_scroll, 1,
+            "a growing panel keeps the reader's place"
+        );
+
+        // And it is a warning, not a gate: the build finishes on its own
+        // and the final panel is the same record.
+        tx.send(BuildMsg::Done(BuildOutcome::Success)).unwrap();
+        app.poll_job().unwrap();
+        assert!(app.job.is_none(), "the build ran to completion, ungated");
+        let report = app.build_report.as_ref().expect("the record survives");
+        assert_eq!(report.lines.len(), 2, "{report:?}", report = report.lines);
+        let _ = std::fs::remove_dir_all(&prefix);
+    }
+
+    /// A cancelled build's live warning panel does not outlive the job
+    /// it belonged to: the cancel gets its message, and nothing stale
+    /// stays pinned over the list.
+    #[test]
+    fn a_cancelled_build_leaves_no_stale_warning_panel() {
+        let prefix = std::env::temp_dir().join("cargo-lbin-test-tui-live-warning-cancel");
+        let _ = std::fs::remove_dir_all(&prefix);
+        std::fs::create_dir_all(&prefix).unwrap();
+        let mut app = App::new(&prefix).unwrap();
+
+        let (tx, rx) = mpsc::channel();
+        let (auth_tx, _auth_rx) = mpsc::channel();
+        app.job = Some(Job::Build {
+            name: "foo".into(),
+            rx,
+            auth_tx,
+            units_started: 0,
+            current: None,
+            tail: VecDeque::new(),
+            status_note: None,
+            warnings: Vec::new(),
+            started: std::time::Instant::now(),
+            needs_auth: None,
+            control: std::sync::Arc::new(crate::BuildControl::new()),
+            kind: BuildKind::Install,
+            cancel_deadline: None,
+        });
+        tx.send(BuildMsg::Warning(
+            "warning: `foo` is already managed".into(),
+        ))
+        .unwrap();
+        app.poll_job().unwrap();
+        assert!(app.build_report.is_some());
+        tx.send(BuildMsg::Done(BuildOutcome::Cancelled)).unwrap();
+        app.poll_job().unwrap();
+        assert!(
+            app.build_report.is_none(),
+            "a cancelled build pins no panel, live or final"
+        );
         let _ = std::fs::remove_dir_all(&prefix);
     }
 

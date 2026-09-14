@@ -394,8 +394,15 @@ fn key_bar(app: &App) -> &'static str {
         }
     } else if app.build_running() {
         // Deliberately uncategorical: the hint describes the controls; the
-        // truthful per-press outcome is the runtime message's job.
-        " ↑/↓ select · c cancel/escalate · Ctrl-C cancel/quit"
+        // truthful per-press outcome is the runtime message's job. With a
+        // warning panel up, the arrows are the panel's — the same gate
+        // every pinned report keeps — so the bar says what they do
+        // rather than promising a selection that will not move.
+        if app.build_report.is_some() {
+            " ↑/↓ scroll warnings · Esc/Enter dismiss · c cancel/escalate · Ctrl-C cancel/quit"
+        } else {
+            " ↑/↓ select · c cancel/escalate · Ctrl-C cancel/quit"
+        }
     } else if app.oneshot_running() {
         " ↑/↓ select · c cancel · ? help · q quit"
     } else {
