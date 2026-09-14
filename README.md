@@ -467,7 +467,7 @@ cargo lbin verify
 
 ```
 error: `foo`: managed binary /home/user/.local/bin/foo is missing — reinstall: cargo lbin install foo --prefix=/home/user/.local
-warning: 2 stage directories under /home/user/.cache/cargo-lbin/stage whose owning cargo-lbin process is gone — possible leftover build debris; inspect, then `cargo lbin clean --stages` when safe (a PID can be reused, and an orphaned build may still hold the directory)
+warning: 2 stage directories under /home/user/.cache/cargo-lbin with no live owner — possible leftover build debris; inspect, then `cargo lbin clean --stages` when safe (for pre-lease stages the owner test is a PID heuristic: a PID can be reused, and an orphaned build may still hold the directory)
 ```
 
 The manifest is the source of truth; every command relies on that,
@@ -525,10 +525,13 @@ itself is healthy: the crate also installed under the other known
 prefix (legal by construction — `verify` does not know the history and
 does not guess it), another executable with a managed binary's name on
 `PATH` — whichever side resolves first, that is the one check that
-notices drift *between* operations — and stage directories whose owning
-process is gone (kept deliberately as crash forensics; listed here
-because nothing else ever lists them, and worded as a possibility:
-PIDs can be reused, so inspect before removing). Warnings alone exit
+notices drift *between* operations — and stage directories with no
+live owner (kept deliberately as crash forensics; listed here because
+nothing else ever lists them). For leased stages the owner is a kernel
+lock — `verify` briefly takes and immediately releases a *shared*
+lease, solely to determine liveness, and only a released lease is
+named — while pre-lease stages keep the PID heuristic and its caution:
+PIDs can be reused, so inspect before removing. Warnings alone exit
 zero, so a deliberate `PATH` or cache debris cannot turn a healthy
 prefix red in a script.
 
@@ -557,7 +560,7 @@ read-only-ness belongs to `cargo lbin verify`, the command.
 
 ## Clean
 
-The mutating half of the pair `verify` opens: `verify` names cache debris read-only, `clean` removes it — through the very same liveness test, so the two can never disagree about what debris is. Every removal is opt-in — a mutating command does nothing it was not explicitly asked to do, and bare `clean` is an error. `--stages` removes the stage directories `verify` reports as ownerless, through the very same liveness test, so the two can never disagree about what ownerless means. Ownerless is a heuristic, not proof: the owning cargo-lbin process is gone (a dead PID, or a name that is not a PID at all), but a build it spawned may survive it and still hold the directory — which is why stage removal is explicit and never a default. `--logs-older-than DAYS` removes failure logs past that age; the person names the retention, lbin does not invent one. Unlike `verify` (read-only, silent over an unreadable cache), `clean` refuses to report success over a cache it could not read: a missing directory is an empty one, any other read error is an error. `--dry-run` lists what would go and removes nothing. The cache is the user's own: no lock is taken, no sudo is ever used, and a stage owned by a live cargo-lbin run — on any prefix — is spared by the liveness test itself. Failed removals are reported and the command exits non-zero; `nothing to clean` exits zero.
+The mutating half of the pair `verify` opens: `verify` names cache debris read-only, `clean` removes it — through the very same liveness test, so the two can never disagree about what debris is. Every removal is opt-in — a mutating command does nothing it was not explicitly asked to do, and bare `clean` is an error. `--stages` removes the stage directories `verify` reports as having no live owner. For leased stages (the 0.13 layout) that scan is only candidate selection: the removal license is taking the stage's own lease exclusively, held through the whole delete, so a build still writing — even one orphaned by its cargo-lbin — vetoes the removal with its inherited lock, and a lease held at removal time defers that stage to a later pass (reported as deferred, not removed and not failed). For pre-lease stages ownership is still a heuristic, not proof: the owning cargo-lbin process is gone (a dead PID, or a name that is not a PID at all), but a build it spawned may survive it and still hold the directory — which is why stage removal is explicit and never a default. `--logs-older-than DAYS` removes failure logs past that age; the person names the retention, lbin does not invent one. Unlike `verify` (read-only, silent over an unreadable cache), `clean` refuses to report success over a cache it could not read: a missing directory is an empty one, any other read error is an error. `--dry-run` lists what would go and removes nothing. The cache is the user's own: the prefix state lock is not taken, no sudo is ever used, and a stage owned by a live run — on any prefix — is spared by the liveness test itself. Failed removals are reported and the command exits non-zero; `nothing to clean` exits zero.
 
 ## Remove
 
@@ -803,7 +806,7 @@ or, when `XDG_CACHE_HOME` is unset:
 ~/.cache/cargo-lbin/
 ```
 
-Builds use per-process staging directories, so independent operations against different prefixes cannot wipe each other's stages.
+Builds use per-run staging directories under `stage-v2/`, named `<pid>-<nonce>` and owned through a `.lease` file the creating process locks (`flock(2)`) and every spawned child inherits — so independent operations cannot wipe each other's stages, ownership survives PID reuse, and a build orphaned by its cargo-lbin keeps its stage visibly owned until it exits. Pre-0.13 stages under `stage/` are still recognized by their PID-heuristic rules; the two layouts do not share a directory, so a concurrently installed 0.12 binary cannot sweep live leased runs.
 
 The last `checkupdate` snapshot is stored under `checkupdate/`, one file per normalized prefix. Relative prefixes are anchored to the current working directory before that cache key is derived, so `--prefix local` in two different directories refers to two different prefix states. The snapshot is presentation-only state: it has no expiry, only `checkupdate` refreshes it, and it can be deleted at any time.
 

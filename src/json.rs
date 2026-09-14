@@ -347,13 +347,13 @@ mod tests {
             }],
             warnings: vec![crate::Finding {
                 kind: "stale-stages",
-                message: "1 stage directory under /home/u/.cache/cargo-lbin/stage whose owning \
-                          cargo-lbin process is gone — possible leftover build debris; \
-                          inspect, then `cargo lbin clean --stages` when safe"
+                message: "1 stage directory under /home/u/.cache/cargo-lbin with no live \
+                          owner — possible leftover build debris; inspect, then \
+                          `cargo lbin clean --stages` when safe"
                     .into(),
                 krate: None,
                 bin: None,
-                path: Some(PathBuf::from("/home/u/.cache/cargo-lbin/stage")),
+                path: Some(PathBuf::from("/home/u/.cache/cargo-lbin")),
                 hint: None,
             }],
         };
@@ -376,10 +376,10 @@ mod tests {
   "warnings": [
     {
       "kind": "stale-stages",
-      "message": "1 stage directory under /home/u/.cache/cargo-lbin/stage whose owning cargo-lbin process is gone — possible leftover build debris; inspect, then `cargo lbin clean --stages` when safe",
+      "message": "1 stage directory under /home/u/.cache/cargo-lbin with no live owner — possible leftover build debris; inspect, then `cargo lbin clean --stages` when safe",
       "crate": null,
       "bin": null,
-      "path": "/home/u/.cache/cargo-lbin/stage",
+      "path": "/home/u/.cache/cargo-lbin",
       "hint": null
     }
   ]

@@ -126,20 +126,23 @@ enum Cmd {
     /// Remove build debris from the cache; every removal is opt-in
     ///
     /// `--stages` removes the stage directories `verify` reports as
-    /// ownerless — the set is `verify`'s own, so the two cannot drift.
-    /// Ownerless is a liveness heuristic, not proof: the owning
-    /// cargo-lbin is gone, but a build it spawned may survive it and
-    /// still hold the directory, which is why removal is explicit and
-    /// never a default. `--logs-older-than DAYS` removes failure logs
-    /// past that age — the person names the retention, lbin does not
-    /// invent one. The cache is the user's own; no lock is taken and
-    /// sudo is never used. `--dry-run` lists what would go and removes
-    /// nothing.
+    /// having no live owner — the set is `verify`'s own, so the two
+    /// cannot drift. For leased stages (0.13's layout) the owner is a
+    /// kernel lock: removal takes the stage's lease exclusively and
+    /// holds it through the delete, and a lease held right now defers
+    /// that stage to a later pass. For pre-lease stages ownership is
+    /// still a PID heuristic — the owning cargo-lbin is gone, but a
+    /// build it spawned may survive it — which is why removal is
+    /// explicit and never a default. `--logs-older-than DAYS` removes
+    /// failure logs past that age — the person names the retention,
+    /// lbin does not invent one. The cache is the user's own; the
+    /// prefix state lock is not taken and sudo is never used.
+    /// `--dry-run` lists what would go and removes nothing.
     Clean {
         /// List what would be removed without removing anything
         #[arg(long)]
         dry_run: bool,
-        /// Remove stage directories whose owning cargo-lbin is gone
+        /// Remove stage directories with no live owner
         #[arg(long)]
         stages: bool,
         /// Remove build logs older than this many days
@@ -1626,12 +1629,20 @@ fn verify_entries(prefix: &Path, manifest: &Manifest) -> (Vec<Finding>, Vec<Stri
     (errors, checkable)
 }
 
-/// Stage directories not owned by a live PID — dead-PID and non-PID
-/// names alike; stages are named by the owning cargo-lbin's PID and
-/// kept on failure. Owner liveness is what the scan measures, and only
-/// that: a heuristic, not proof a build is dead — an orphaned cargo may
-/// outlive the cargo-lbin that spawned it and still hold the directory.
-/// The one definition of ownerless, shared by `verify` and `clean`;
+/// Stage directories with no live owner, and the namespace is part of
+/// the format: a name is a run only where its format lives — bare
+/// `<pid>` in `stage/`, `<pid>-<nonce>` in `stage-v2/`; cross-namespace
+/// names and non-parsing names are debris. Leased runs (kept on
+/// failure) answer through their lease, and only a released lease
+/// convicts — held is a live writer; a missing or unreadable lease,
+/// or a run path that is not a real directory (a symlink is probed as
+/// unknown, never followed), is spared. Legacy stages keep the /proc
+/// heuristic with both of its known lies: a reused PID resurrects a
+/// dead stage, and an orphaned cargo may outlive the cargo-lbin that
+/// spawned it and still hold the directory. The one definition of
+/// ownerless, shared by `verify` and `clean` (for whom this is
+/// candidate selection — its removal license is the exclusive lease
+/// take);
 /// error *policy* is the caller's: read errors come back unflattened,
 /// verify silences them (read-only, a possibly-wrong warning is worse
 /// than none), clean propagates them (a mutating command must not
@@ -1807,14 +1818,16 @@ fn clean_cache(
         bail!("nothing requested: name --stages and/or --logs-older-than DAYS");
     }
     // The removal set for stages is scan_stale_stages' answer — verify's
-    // function, so diagnosis and cleanup cannot drift. But that answer
-    // is a liveness heuristic over the *owning* cargo-lbin, not proof
-    // of a dead build: an orphaned cargo may survive its parent and
-    // still hold the directory — which is why --stages is opt-in and
-    // this loop stays behind it. Unlike verify (read-only, silence over
-    // a possibly-wrong warning), a mutating command must not report
-    // success over a cache it could not read: NotFound is an empty
-    // cache, every other read error is an error.
+    // function, so diagnosis and cleanup cannot drift. For leased runs
+    // that answer is candidate selection and the exclusive lease take
+    // is the removal license; for legacy stages it is still only a
+    // liveness heuristic over the owning cargo-lbin — an orphaned cargo
+    // may survive its parent and still hold the directory — which is
+    // why --stages is opt-in and this loop stays behind it. Unlike
+    // verify (read-only, silence over a possibly-wrong warning), a
+    // mutating command must not report success over a cache it could
+    // not read: NotFound is an empty cache, every other read error is
+    // an error.
     let stale = if stages {
         scan_stale_stages(cache)
             .with_context(|| format!("reading the stage namespaces under {}", cache.display()))?
