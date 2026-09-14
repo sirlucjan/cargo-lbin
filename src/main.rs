@@ -823,10 +823,10 @@ impl Frontend<'_> {
 /// crate, so a mid-batch failure never leaves installed files
 /// unrecorded. Returns the version the manifest committed — for a
 /// `None` request, whatever cargo's resolution picked, which no caller
-/// could know beforehand. A fresh per-crate stage, wiped before and
-/// removed only after the commit: a shared stage let stale binaries
-/// fail builds and let a different `--locked` be skipped as "already
-/// installed".
+/// could know beforehand. A fresh leased run per crate, removed only
+/// after the commit: a shared stage let stale binaries fail builds and
+/// let a different `--locked` be skipped as "already installed", and
+/// the nonce-fresh name means there is never anything to wipe first.
 // Eight arguments like `place_and_commit`, same reason: one install's
 // parameters; a struct would be built only to be destructured here.
 #[allow(clippy::too_many_arguments)]
@@ -863,18 +863,40 @@ fn install_and_commit(
     if frontend.wants_preauthorize() {
         privileged::preauthorize(prefix, initial_escalate)?;
     }
-    // Per-PID stage: the state lock serializes per *prefix*, so two runs
+    // Per-run stage: the state lock serializes per *prefix*, so two runs
     // on different prefixes may build the same crate — one wiping the
-    // other's stage must be structurally impossible.
-    let stage_dir = cache
-        .join("stage")
-        .join(std::process::id().to_string())
-        .join(name);
-    if stage_dir.exists() {
-        fs::remove_dir_all(&stage_dir)
-            .with_context(|| format!("clearing stale stage {}", stage_dir.display()))?;
-    }
-    let built = frontend.build(name, version, locked, &stage_dir, cache)?;
+    // other's stage must be structurally impossible. The nonce makes it
+    // so even across PID reuse, which also retires the pre-wipe: a
+    // fresh name has nothing to clear. The namespace is stage-v2 — see
+    // RUN_NAMESPACE for why the formats do not share a directory.
+    let run_dir = cache
+        .join(stage::RUN_NAMESPACE)
+        .join(stage::new_run_dir_name().context("naming the build stage")?);
+    // Held across the whole install and inherited by every child
+    // spawned from here on — cargo, rustc, build scripts — so the
+    // lease's lifetime is exactly "someone may still write to this
+    // stage", not this process's.
+    let lease = stage::Lease::acquire(&run_dir)?;
+    let stage_dir = run_dir.join(name);
+    let built = frontend.build(name, version, locked, &stage_dir, cache);
+    // A cancel's stage is evidence of nothing — and neither is its
+    // run, so the creator's cleanup runs, veto included: an inheritor
+    // still writing keeps the run alive. Every other build failure
+    // keeps its run (and lease file) as forensics; the lease itself is
+    // released when the last holder exits, and verify/clean take it
+    // from there.
+    #[cfg(feature = "tui")]
+    let built = match built {
+        Err(e) => {
+            if e.downcast_ref::<BuildCancelled>().is_some() {
+                stage::release_and_remove_run(lease, &run_dir);
+            }
+            return Err(e);
+        }
+        Ok(built) => built,
+    };
+    #[cfg(not(feature = "tui"))]
+    let built = built?;
     check_collisions(manifest, name, &built.bins, &prefix.join("bin"))?;
     // Only names this crate did not provide before: carried-over names
     // were reported when they were new.
@@ -920,11 +942,13 @@ fn install_and_commit(
         frontend.placement_begins()
     })();
     #[cfg(feature = "tui")]
-    if let Err(e) = &checkpoints
-        && e.downcast_ref::<BuildCancelled>().is_some()
-    {
-        let _ = fs::remove_dir_all(&stage_dir);
+    if let Err(e) = checkpoints {
+        if e.downcast_ref::<BuildCancelled>().is_some() {
+            stage::release_and_remove_run(lease, &run_dir);
+        }
+        return Err(e);
     }
+    #[cfg(not(feature = "tui"))]
     checkpoints?;
     // The version about to become the manifest's truth, held before
     // `place_and_commit` consumes `built`: the stage's verified
@@ -945,14 +969,15 @@ fn install_and_commit(
         rollback_new_bins(policy, &rollback.placed);
         return Err(err);
     }
-    // Stage removal is deliberately last: a stage surviving a failure is
-    // forensic evidence of exactly the build that caused it.
-    let _ = fs::remove_dir_all(&stage_dir);
-    if let Some(pid_dir) = stage_dir.parent() {
-        // Best effort, non-recursive: succeeds only once our PID directory
-        // is empty, i.e. after the last crate of this run.
-        let _ = fs::remove_dir(pid_dir);
-    }
+    // Run removal is deliberately last: a stage surviving a failure is
+    // forensic evidence of exactly the build that caused it — and it
+    // keeps its `.lease`, so once this process (and every inheritor)
+    // exits, the run is released and becomes exactly what verify and
+    // clean are for. A success removes the run through the creator's
+    // cleanup, veto included: "until the last process that may still
+    // write to the stage exits" binds cargo-lbin's own hand too, not
+    // just a later clean's.
+    stage::release_and_remove_run(lease, &run_dir);
     Ok(installed)
 }
 
@@ -3973,13 +3998,12 @@ mod tests {
             );
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
+        let leftovers: Vec<PathBuf> = fs::read_dir(cache.join(crate::stage::RUN_NAMESPACE))
+            .map(|entries| entries.map(|e| e.unwrap().path()).collect())
+            .unwrap_or_default();
         assert!(
-            !cache
-                .join("stage")
-                .join(std::process::id().to_string())
-                .join("straycrate")
-                .exists(),
-            "the stage is gone, and nothing is left alive to touch it"
+            leftovers.is_empty(),
+            "the run is gone, and nothing is left alive to touch it: {leftovers:?}"
         );
         let _ = fs::remove_dir_all(&root);
     }
@@ -4138,14 +4162,13 @@ mod tests {
             !logs.exists() || fs::read_dir(&logs).unwrap().next().is_none(),
             "a cancelled build writes no failure log"
         );
-        // …and the stage is removed rather than kept as evidence.
+        // …and the whole run is removed rather than kept as evidence.
+        let leftovers: Vec<PathBuf> = fs::read_dir(cache.join(crate::stage::RUN_NAMESPACE))
+            .map(|entries| entries.map(|e| e.unwrap().path()).collect())
+            .unwrap_or_default();
         assert!(
-            !cache
-                .join("stage")
-                .join(std::process::id().to_string())
-                .join("slowcrate")
-                .exists(),
-            "a cancelled build leaves no stage behind"
+            leftovers.is_empty(),
+            "a cancelled build leaves no run behind: {leftovers:?}"
         );
         let _ = fs::remove_dir_all(&root);
     }

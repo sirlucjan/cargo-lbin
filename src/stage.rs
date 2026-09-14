@@ -85,17 +85,252 @@ pub fn parse_run_dir(name: &str) -> Option<StageRun> {
     }
 }
 
+/// Name of the lease file inside a leased run directory.
+const LEASE_FILE: &str = ".lease";
+
+/// The lease's name while it is being prepared: created, locked and
+/// stripped of close-on-exec under this name, renamed to [`LEASE_FILE`]
+/// only then. The probe does not know this name, so an in-preparation
+/// lease reads as absent — unknown, spared — never as released.
+const LEASE_PENDING: &str = ".lease.pending";
+
+/// Best-effort demolition of a run this process created but never
+/// published. Armed right after `create_dir` succeeds, disarmed only
+/// once the lease is renamed into place: any handled error on the way
+/// removes the half-made run, because a run without a published lease
+/// is Unknown to every scanner — spared forever — and a *handled*
+/// error is not the crash the conservative skip was priced for. No
+/// child exists yet at any point this can fire, so the removal cannot
+/// take a stage from under anyone.
+struct UnpublishedRun<'a> {
+    run_dir: &'a Path,
+    armed: bool,
+}
+
+impl Drop for UnpublishedRun<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = fs::remove_dir_all(self.run_dir);
+        }
+    }
+}
+
+/// Ownership of one leased run, held as `flock(2) LOCK_EX` on the
+/// run's `.lease` for as long as anything may still write to the
+/// stage.
+///
+/// The lock belongs to the open file *description*, not to this
+/// process: the descriptor is stripped of `FD_CLOEXEC` on acquisition,
+/// so every child spawned while the lease is held — cargo, rustc,
+/// build scripts — inherits it, and the lease stands until the last
+/// inheritor exits. That is the whole design: a cargo orphaned by its
+/// cargo-lbin keeps the stage visibly owned, where the PID heuristic
+/// would have called it debris. The cost is a descriptor leaked into
+/// short-lived helpers too (sudo among them); the error is on the
+/// conservative side — a stage can only look alive longer, never
+/// deletable sooner.
+pub struct Lease {
+    // Held for the descriptor it keeps open; its Drop is the release.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "the field's work is keeping the descriptor open")
+    )]
+    file: fs::File,
+}
+
+impl Lease {
+    /// Create `run_dir` and take its lease.
+    ///
+    /// `LOCK_NB` even though contention is impossible by construction —
+    /// the nonce made the directory ours alone — because *if* the lock
+    /// is somehow held, blocking on it would hide a bug behind a hang,
+    /// and this error names it instead.
+    pub fn acquire(run_dir: &Path) -> Result<Self> {
+        use std::os::fd::AsRawFd;
+        if let Some(parent) = run_dir.parent() {
+            fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+        }
+        // create_dir, not create_dir_all, and create_new below: the
+        // nonce promised a fresh name, and the filesystem is where
+        // that promise is enforced — an EEXIST here is a bug named,
+        // not a state tolerated.
+        fs::create_dir(run_dir).with_context(|| format!("creating {}", run_dir.display()))?;
+        // From here to the rename, every error path demolishes the
+        // half-made run: handled failure cleans up after itself, only
+        // a crash leaves the conservative-Unknown residue behind.
+        let mut guard = UnpublishedRun {
+            run_dir,
+            armed: true,
+        };
+        // Locked before visible. Publishing `.lease` first would open
+        // a window — created but not yet locked — where a probe reads
+        // "released" off a lease nobody owns, and a clean could take
+        // it and remove the run under its creator's feet, stranding
+        // the creator's eventual lock on an unlinked inode. So the
+        // lease is prepared under a name the probe does not know and
+        // renamed into place only once it is already locked: from the
+        // first instant `.lease` exists, it is held.
+        let pending = run_dir.join(LEASE_PENDING);
+        let file = fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&pending)
+            .with_context(|| format!("creating {}", pending.display()))?;
+        let fd = file.as_raw_fd();
+        // SAFETY: flock(2) on an owned, open descriptor; no memory is
+        // passed.
+        if unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } < 0 {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("locking {}", pending.display()));
+        }
+        // Rust opens everything O_CLOEXEC; without undoing that here
+        // the lease would die with this process and the mechanism
+        // would degrade to the PID heuristic, only costlier. Read the
+        // flags and clear exactly the one bit — F_SETFD with a bare 0
+        // would erase flags this code never claimed to own.
+        // SAFETY: fcntl(2) F_GETFD/F_SETFD on an owned, open
+        // descriptor; no memory is passed.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        if flags < 0 {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("reading descriptor flags of {}", pending.display()));
+        }
+        // SAFETY: as above.
+        if unsafe { libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) } < 0 {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("clearing close-on-exec on {}", pending.display()));
+        }
+        let published = run_dir.join(LEASE_FILE);
+        fs::rename(&pending, &published)
+            .with_context(|| format!("publishing {}", published.display()))?;
+        guard.armed = false;
+        Ok(Self { file })
+    }
+}
+
+/// The run path itself must be a real directory — the same rule the
+/// payload walk already enforces one level down, applied at the top:
+/// a symlink planted under the namespace with a valid run name must
+/// not let a probe read someone else's lease as this run's, the taker
+/// lock it, or the remover walk (and delete) whatever the link points
+/// at.
+fn require_real_run_dir(run_dir: &Path) -> std::io::Result<()> {
+    let meta = fs::symlink_metadata(run_dir)?;
+    if meta.file_type().is_dir() {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::NotADirectory,
+            "run path is not a real directory",
+        ))
+    }
+}
+
+/// Take an existing run's lease exclusively, for removal.
+///
+/// The opposite discipline from [`Lease::acquire`]: nothing is
+/// created — a missing `.lease` here is a run someone else already
+/// removed or never finished publishing, and manufacturing a lease to
+/// then "own" it would convert absence of evidence into a removal
+/// license. No `FD_CLOEXEC` clearing either: this lease is held across
+/// a removal, not an exec, and it must die with its holder.
+///
+/// `Ok(Some)` — the caller owns the run until the returned lease
+/// drops, so hold it through the whole removal: that ordering is what
+/// closes the check-then-delete race. `Ok(None)` — held this instant;
+/// the caller leaves the run alone and a later pass answers. `Err` —
+/// the lease exists but would not open or lock; the caller decides
+/// what its own contract owes for that.
+pub fn take_lease_for_removal(run_dir: &Path) -> std::io::Result<Option<Lease>> {
+    use std::os::fd::AsRawFd;
+    require_real_run_dir(run_dir)?;
+    // Read-write, not read-only: on filesystems that emulate flock via
+    // fcntl (NFS among them) an exclusive lock wants a writable
+    // descriptor. The creator's own lease is writable already; the
+    // taker should not be the one descriptor in the design that only
+    // works where flock is native.
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(run_dir.join(LEASE_FILE))?;
+    // SAFETY: flock(2) on an owned, open descriptor; no memory is
+    // passed.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        return Ok(Some(Lease { file }));
+    }
+    let e = std::io::Error::last_os_error();
+    if e.kind() == std::io::ErrorKind::WouldBlock {
+        Ok(None)
+    } else {
+        Err(e)
+    }
+}
+
+/// Remove a leased run whose lease the caller holds — payload first,
+/// the lease last.
+///
+/// `remove_dir_all` makes no ordering promise, so it can unlink
+/// `.lease` first and then fail on the payload — leaving a lease-less
+/// new-format run, which every scanner reads as unknown and spares
+/// forever: a handled cleanup error manufacturing permanently
+/// invisible debris. So the proof of ownership goes last. Any failure
+/// in the payload walk leaves `.lease` in place; the caller's lock
+/// eventually drops, the next probe reads released, and the next pass
+/// may try again. What remains is the microscopic window between the
+/// lease's unlink and the final `remove_dir` — and a run caught there
+/// is already empty. Symlinked entries are unlinked, never followed:
+/// a payload symlink must not turn cleanup into a walk of someone
+/// else's tree.
+pub fn remove_leased_run(run_dir: &Path) -> std::io::Result<()> {
+    require_real_run_dir(run_dir)?;
+    for entry in fs::read_dir(run_dir)? {
+        let entry = entry?;
+        if entry.file_name() == LEASE_FILE {
+            continue;
+        }
+        // DirEntry::file_type does not follow symlinks, so a link to a
+        // directory takes the remove_file branch — unlinked, not
+        // traversed.
+        if entry.file_type()?.is_dir() {
+            fs::remove_dir_all(entry.path())?;
+        } else {
+            fs::remove_file(entry.path())?;
+        }
+    }
+    fs::remove_file(run_dir.join(LEASE_FILE))?;
+    fs::remove_dir(run_dir)
+}
+
+/// The creator's own cleanup, with the veto the lease's doc promised:
+/// relinquish `lease`, then remove the run only if no inheritor
+/// survives.
+///
+/// Dropping the creator's descriptor does not release the lock while
+/// any child still holds the inherited one — flock lives on the open
+/// file description — so a fresh-descriptor exclusive take is the
+/// question "did anything survive me?", asked of the kernel itself.
+/// Refused: an inheritor is alive, the run stays, and the inheritor's
+/// eventual exit makes it verify's finding and clean's candidate — the
+/// ordinary ownerless path. Granted: nothing can write to the stage
+/// anymore, and the removal happens holding the lock, the same
+/// discipline clean uses — payload first, the lease last, so even a
+/// failed removal leaves the run visible. Best-effort throughout:
+/// cleanup failure is not operation failure, and a run left behind is
+/// exactly what verify exists to name — which the lease-last order is
+/// what keeps true.
+pub fn release_and_remove_run(lease: Lease, run_dir: &Path) {
+    drop(lease);
+    if let Ok(Some(_held)) = take_lease_for_removal(run_dir) {
+        let _ = remove_leased_run(run_dir);
+    }
+    // Ok(None) — an inheritor survives; Err — nothing left to judge
+    // with. Either way the run stays, and stays somebody's finding.
+}
+
 /// A fresh `<pid>-<nonce>` name for this run. The nonce comes from
 /// `getrandom(2)`: no seed to manage, no clock to collide on, and no
 /// file descriptor to leak — two runs in the same nanosecond are a
 /// scheduler fact, two equal nonces are not.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the producer path adopts run names in the next commit"
-    )
-)]
 pub fn new_run_dir_name() -> std::io::Result<String> {
     use std::fmt::Write as _;
     let mut nonce = [0u8; NONCE_HEX_LEN / 2];
@@ -415,13 +650,16 @@ pub fn build_captured(
     }
     if !status.success() {
         // Ended by the cancel, not by cargo: no failure log (the person's own
-        // decision is not a diagnosis), stage removed. Both conditions on
-        // purpose: phase alone loses the race where cargo dies just before a
-        // late cancel; signal alone would misfile an external OOM kill as a
-        // cancellation.
+        // decision is not a diagnosis). Both conditions on purpose: phase
+        // alone loses the race where cargo dies just before a late cancel;
+        // signal alone would misfile an external OOM kill as a cancellation.
+        // No cleanup here, deliberately: this function knows the stage, not
+        // the run or its lease, and a group escapee may still hold the
+        // inherited lease and be writing — removal is the lease holder's
+        // call, made by the caller's handoff, never a classification's
+        // side effect.
         use std::os::unix::process::ExitStatusExt;
         if control.cancelled() && status.signal().is_some() {
-            let _ = fs::remove_dir_all(stage);
             return Err(anyhow::Error::new(crate::BuildCancelled));
         }
         // Tail from the first compiler error when there is one — the
@@ -806,6 +1044,215 @@ mod tests {
         ] {
             assert_eq!(parse_run_dir(junk), None, "accepted junk: {junk:?}");
         }
+    }
+
+    /// A handled acquire error demolishes the half-made run instead of
+    /// leaving a forever-Unknown directory no scanner may touch. The
+    /// forced failure: a run path short enough for `create_dir` but
+    /// whose `.lease.pending` sibling exceeds `PATH_MAX`, so the very
+    /// next step fails after the guard is armed. Only a crash — not a
+    /// handled error — is allowed to leave conservative-Unknown
+    /// residue.
+    #[test]
+    fn a_handled_acquire_error_leaves_no_unknown_run_behind() {
+        let root = std::env::temp_dir().join("cargo-lbin-test-lease-guard");
+        let _ = fs::remove_dir_all(&root);
+        // Build a path a few bytes under PATH_MAX (4096 on Linux):
+        // components of 200 'x's keep every name under NAME_MAX.
+        let mut run = root.clone();
+        while run.as_os_str().len() + 201 < 4090 {
+            run = run.join("x".repeat(200));
+        }
+        let pad = 4090_usize.saturating_sub(run.as_os_str().len() + 1);
+        run = run.join("x".repeat(pad.clamp(1, 200)));
+
+        let Err(err) = Lease::acquire(&run) else {
+            panic!("a path past PATH_MAX must not acquire")
+        };
+        assert!(
+            format!("{err:#}").contains(".lease.pending"),
+            "the failure is the pending file's, past create_dir: {err:#}"
+        );
+        assert!(
+            !run.exists(),
+            "a handled error demolishes the half-made run"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The lease-last removal, exercised over a populated run: nested
+    /// payload, a plain file, and a symlink pointing outside — the
+    /// link must be unlinked, never followed, and its target left
+    /// untouched. The ordering itself (payload before `.lease`) is
+    /// enforced by construction in `remove_leased_run`; what is
+    /// observable is that the run and its lease are wholly gone and
+    /// the outside world is not.
+    #[test]
+    fn remove_leased_run_clears_payload_and_spares_symlink_targets() {
+        let root = std::env::temp_dir().join("cargo-lbin-test-lease-remove");
+        let _ = fs::remove_dir_all(&root);
+        let outside = root.join("outside");
+        fs::create_dir_all(outside.join("keep")).unwrap();
+        let run = root.join("42-00000000000000ff");
+        let lease = Lease::acquire(&run).unwrap();
+        fs::create_dir_all(run.join("somecrate").join("bin")).unwrap();
+        fs::write(run.join("somecrate").join("bin").join("tool"), b"x").unwrap();
+        fs::write(run.join("stray-file"), b"y").unwrap();
+        std::os::unix::fs::symlink(&outside, run.join("link-out")).unwrap();
+
+        drop(lease);
+        let held = take_lease_for_removal(&run).unwrap();
+        assert!(held.is_some(), "no writer left: the taker owns the run");
+        remove_leased_run(&run).unwrap();
+        assert!(!run.exists(), "the run is wholly gone, lease included");
+        assert!(
+            outside.join("keep").exists(),
+            "a payload symlink is unlinked, never followed"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The same rule one level up: a symlink planted AS the run path,
+    /// wearing a valid run name and pointing at a directory that even
+    /// contains an unlocked `.lease` — the strongest possible bait.
+    /// Neither the taker nor the remover may follow it; the target
+    /// stays untouched.
+    #[test]
+    fn a_symlinked_run_path_is_never_followed() {
+        let root = std::env::temp_dir().join("cargo-lbin-test-lease-toplink");
+        let _ = fs::remove_dir_all(&root);
+        let outside = root.join("outside");
+        fs::create_dir_all(outside.join("keep")).unwrap();
+        fs::write(outside.join(LEASE_FILE), b"").unwrap();
+        let link = root.join("55-00000000000000ab");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+
+        let take = take_lease_for_removal(&link);
+        assert!(
+            take.is_err(),
+            "a symlinked run path must refuse the taker outright"
+        );
+        let removal = remove_leased_run(&link);
+        assert!(
+            removal.is_err(),
+            "a symlinked run path must refuse the remover outright"
+        );
+        assert!(
+            outside.join("keep").exists() && outside.join(LEASE_FILE).exists(),
+            "zero traversal: the link's target is untouched"
+        );
+        assert!(
+            link.exists() || fs::symlink_metadata(&link).is_ok(),
+            "the link itself is left where it was found"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The creator's cleanup asks before it deletes. A child spawned
+    /// while the lease is held inherits the descriptor; the creator's
+    /// own `release_and_remove_run` must then be refused — the child's
+    /// inherited lock survives the creator's drop — and the run stays
+    /// until the child exits, at which point it is the ordinary
+    /// ownerless candidate any taker may claim.
+    #[test]
+    fn creator_cleanup_defers_to_a_surviving_inheritor() {
+        let root = std::env::temp_dir().join("cargo-lbin-test-lease-veto");
+        let _ = fs::remove_dir_all(&root);
+        let run = root.join("777-00000000000000dd");
+        let stop = root.join("stop");
+        let lease = Lease::acquire(&run).unwrap();
+        fs::create_dir_all(run.join("somecrate")).unwrap();
+
+        // The inheritor: descriptor inherited at spawn, held until the
+        // stop file appears — with a hard iteration cap so a panicking
+        // test cannot strand it on the runner.
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg(format!(
+                "n=0; while [ ! -e \"{stop}\" ] && [ \"$n\" -lt 400 ]; do n=$((n+1)); sleep 0.05; done",
+                stop = stop.display()
+            ))
+            .spawn()
+            .unwrap();
+
+        release_and_remove_run(lease, &run);
+        assert!(
+            run.exists(),
+            "a surviving inheritor vetoes the creator's own cleanup"
+        );
+        assert!(
+            take_lease_for_removal(&run).unwrap().is_none(),
+            "the veto is the inheritor's lock, nothing softer: a re-ask is refused too"
+        );
+
+        fs::write(&stop, b"").unwrap();
+        child.wait().unwrap();
+        let taken = take_lease_for_removal(&run).unwrap();
+        assert!(
+            taken.is_some(),
+            "the inheritor's exit is the release; the ordinary ownerless path takes over"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The lease's two kernel-side promises, asked of the kernel
+    /// directly: a second file description cannot take the lock while
+    /// the `Lease` lives, and can the moment it drops. The probe opens
+    /// the file anew on purpose — flock is per open file description,
+    /// and a re-used descriptor would test nothing.
+    #[test]
+    fn a_lease_is_held_exactly_as_long_as_its_holder_lives() {
+        use std::os::fd::AsRawFd;
+        let root = std::env::temp_dir().join("cargo-lbin-test-lease-lifetime");
+        let _ = fs::remove_dir_all(&root);
+        let run = root.join("12345-0123456789abcdef");
+        let lease = Lease::acquire(&run).unwrap();
+        assert!(
+            !run.join(LEASE_PENDING).exists(),
+            "acquire publishes by rename: the pending name must not outlive it"
+        );
+        assert!(
+            run.join(LEASE_FILE).exists(),
+            "from the first instant .lease exists, it is held"
+        );
+
+        let probe = fs::File::open(run.join(LEASE_FILE)).unwrap();
+        // SAFETY: flock(2) on an owned, open descriptor.
+        let contended = unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        assert_eq!(contended, -1, "a held lease must refuse a second owner");
+        assert_eq!(
+            std::io::Error::last_os_error().kind(),
+            std::io::ErrorKind::WouldBlock,
+            "the refusal is contention, not some other failure"
+        );
+
+        drop(lease);
+        // SAFETY: as above.
+        let taken = unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        assert_eq!(taken, 0, "a dropped lease must be takeable at once");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The descriptor must survive exec, or the design collapses to
+    /// the PID heuristic with extra steps: `FD_CLOEXEC` is asserted
+    /// clear on the held lease itself.
+    #[test]
+    fn a_lease_descriptor_is_inheritable_across_exec() {
+        use std::os::fd::AsRawFd;
+        let root = std::env::temp_dir().join("cargo-lbin-test-lease-cloexec");
+        let _ = fs::remove_dir_all(&root);
+        let run = root.join("12345-fedcba9876543210");
+        let lease = Lease::acquire(&run).unwrap();
+        // SAFETY: fcntl(2) F_GETFD on an owned, open descriptor.
+        let flags = unsafe { libc::fcntl(lease.file.as_raw_fd(), libc::F_GETFD) };
+        assert!(flags >= 0);
+        assert_eq!(
+            flags & libc::FD_CLOEXEC,
+            0,
+            "a close-on-exec lease dies with this process — the one lifetime it must outlive"
+        );
+        drop(lease);
+        let _ = fs::remove_dir_all(&root);
     }
 
     /// The generator and the parser agree on one alphabet, and two
