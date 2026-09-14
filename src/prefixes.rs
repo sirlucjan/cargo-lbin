@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 /// One foreign installation of a crate: where, and at what version —
 /// the version matters, because skew between prefixes is precisely what
 /// the person wants to notice.
+#[derive(Clone)]
 pub struct AlsoIn {
     pub prefix: PathBuf,
     pub version: String,

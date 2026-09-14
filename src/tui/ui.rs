@@ -21,7 +21,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
             [
                 Constraint::Length(3),
                 Constraint::Min(5),
-                Constraint::Length(8),
+                Constraint::Length(resting_details_height(app)),
                 Constraint::Length(3),
                 Constraint::Length(3),
             ],
@@ -41,9 +41,9 @@ pub fn draw(frame: &mut Frame, app: &App) {
     // are the thing being read. Bounded by the terminal, floored at the
     // resting height, still scrollable past either.
     let details_h = if app.build_report.is_some() {
-        frame.area().height.saturating_sub(11).clamp(8, 16)
+        frame.area().height.saturating_sub(11).clamp(9, 16)
     } else {
-        8
+        resting_details_height(app)
     };
     let [header, list, details, footer] = Layout::new(
         Direction::Vertical,
@@ -136,7 +136,9 @@ fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
                 name.push_str(" [pinned]");
             }
             if !row.also.is_empty() {
-                name.push_str(&row.also);
+                // The same formatter the CLI listing uses, applied to the
+                // row's facts at render time — no-drift by construction.
+                name.push_str(&crate::prefixes::describe(&row.also));
             }
             TableRow::new(vec![
                 Cell::from(name),
@@ -237,6 +239,19 @@ fn draw_report(
     frame.render_widget(paragraph.block(block).scroll((effective, 0)), area);
 }
 
+/// The panel's height for the entry it must show: six fixed lines
+/// (crate, installed, latest, binaries, locked, pinned) plus one per
+/// foreign copy, plus the borders. The cross-prefix set is closed —
+/// `/usr/local` and `~/.local`, minus the current prefix — so a custom
+/// current prefix can legally produce two `Also in` lines and a
+/// standard one at most a single line; the clamp says so rather than
+/// trusting the map. A fixed height would silently clip the second
+/// copy, which is exactly the state the panel exists to report.
+fn resting_details_height(app: &App) -> u16 {
+    let also = app.selected_row().map_or(0, |row| row.also.len());
+    8 + u16::try_from(also).unwrap_or(2).min(2)
+}
+
 fn draw_details(frame: &mut Frame, app: &App, area: Rect) {
     // A build's report owns the panel until dismissed: either kind must
     // survive longer than one keypress.
@@ -282,52 +297,79 @@ fn draw_details(frame: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
-    let mut lines: Vec<Line> = Vec::new();
-    if let Some(row) = app.selected_row() {
-        // Plain values inherit the terminal's foreground; only the three
-        // status states carry a color of their own, so the panel reads
-        // the same on light and dark schemes.
-        lines.push(kv("Crate", &row.name, Style::default()));
-        lines.push(kv("Installed", &row.version, Style::default()));
-        match &row.status {
-            RowStatus::UpToDate => {
-                lines.push(kv(
-                    "Latest",
-                    &row.version,
-                    Style::default().fg(Color::Green),
-                ));
-            }
-            RowStatus::Outdated(latest) => lines.push(kv(
-                "Latest",
-                &latest.to_string(),
-                Style::default().fg(Color::Yellow),
-            )),
-            RowStatus::Unknown => lines.push(kv(
-                "Latest",
-                "not checked (press r)",
-                Style::default().fg(Color::Gray),
-            )),
-        }
-        lines.push(kv("Binaries", &row.bins.join(", "), Style::default()));
-        if row.locked {
-            lines.push(kv("Build", "--locked (reused on update)", Style::default()));
-        }
-        if row.pinned {
-            lines.push(kv(
-                "Pinned",
-                "held at this version; p to unpin",
-                Style::default().fg(Color::Yellow),
-            ));
-        }
-    } else {
-        lines.push(Line::from(Span::styled(
+    let lines = match app.selected_row() {
+        Some(row) => detail_lines(row),
+        None => vec![Line::from(Span::styled(
             "nothing selected",
             Style::default().fg(Color::DarkGray),
-        )));
-    }
+        ))],
+    };
     let panel =
         Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" Selected "));
     frame.render_widget(panel, area);
+}
+
+/// The selected crate's full managed entry, as lines — split from
+/// `draw_details` so the fields are testable without a terminal. Every
+/// manifest fact speaks: Locked and Pinned say yes or no instead of
+/// speaking only when set, because in a details panel a missing line
+/// reads as "unknown", not as "no". Plain values inherit the terminal's
+/// foreground; only the three status states and the affirmative pin
+/// carry a color of their own, so the panel reads the same on light
+/// and dark schemes. The cross-prefix line is a fact off the row,
+/// rendered natively (and sanitized — the foreign prefix is
+/// environment-borne); it appears only when a foreign copy exists,
+/// since "not elsewhere" is the ordinary state, not information.
+fn detail_lines(row: &super::Row) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(kv("Crate", &row.name, Style::default()));
+    lines.push(kv("Installed", &row.version, Style::default()));
+    match &row.status {
+        RowStatus::UpToDate => {
+            lines.push(kv(
+                "Latest",
+                &row.version,
+                Style::default().fg(Color::Green),
+            ));
+        }
+        RowStatus::Outdated(latest) => lines.push(kv(
+            "Latest",
+            &latest.to_string(),
+            Style::default().fg(Color::Yellow),
+        )),
+        RowStatus::Unknown => lines.push(kv(
+            "Latest",
+            "not checked (press r)",
+            Style::default().fg(Color::Gray),
+        )),
+    }
+    lines.push(kv("Binaries", &row.bins.join(", "), Style::default()));
+    if row.locked {
+        lines.push(kv(
+            "Locked",
+            "yes (--locked, reused on update)",
+            Style::default(),
+        ));
+    } else {
+        lines.push(kv("Locked", "no", Style::default()));
+    }
+    if row.pinned {
+        lines.push(kv(
+            "Pinned",
+            "yes — held at this version; p to unpin",
+            Style::default().fg(Color::Yellow),
+        ));
+    } else {
+        lines.push(kv("Pinned", "no", Style::default()));
+    }
+    for other in &row.also {
+        lines.push(kv(
+            "Also in",
+            &crate::text::sanitize(&format!("{} @{}", other.prefix.display(), other.version)),
+            Style::default().fg(Color::Gray),
+        ));
+    }
+    lines
 }
 
 /// The footer's key bar: only the keys the current state actually
@@ -577,4 +619,164 @@ fn kv(key: &str, value: &str, value_style: Style) -> Line<'static> {
         ),
         Span::styled(value.to_owned(), value_style),
     ])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tui::{Row, RowStatus};
+
+    fn line_text(line: &Line) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    fn row(name: &str) -> Row {
+        Row {
+            name: name.to_owned(),
+            version: "1.2.3".to_owned(),
+            bins: vec![name.to_owned()],
+            locked: false,
+            pinned: false,
+            also: Vec::new(),
+            status: RowStatus::Unknown,
+        }
+    }
+
+    /// The panel is the full managed entry: every manifest fact speaks,
+    /// including the negative — in a details panel a missing line reads
+    /// as "unknown", not as "no". A foreign-only crate has no row to
+    /// select, so its coverage lives in the cross-prefix decision
+    /// matrix, not here.
+    #[test]
+    fn details_tell_the_whole_entry_including_the_negatives() {
+        let plain = detail_lines(&row("foo"));
+        let texts: Vec<String> = plain.iter().map(line_text).collect();
+        assert!(
+            texts
+                .iter()
+                .any(|l| l.contains("Locked") && l.contains("no")),
+            "{texts:?}"
+        );
+        assert!(
+            texts
+                .iter()
+                .any(|l| l.contains("Pinned") && l.contains("no")),
+            "{texts:?}"
+        );
+        assert!(
+            !texts.iter().any(|l| l.contains("Also in")),
+            "not elsewhere is the ordinary state, not information: {texts:?}"
+        );
+
+        let mut full = row("foo");
+        full.locked = true;
+        full.pinned = true;
+        full.bins = vec!["foo".to_owned(), "fooctl".to_owned()];
+        full.also = vec![crate::prefixes::AlsoIn {
+            prefix: std::path::PathBuf::from("/usr/local"),
+            version: "1.1.0".to_owned(),
+        }];
+        let texts: Vec<String> = detail_lines(&full).iter().map(line_text).collect();
+        assert!(
+            texts
+                .iter()
+                .any(|l| l.contains("Locked") && l.contains("yes")),
+            "{texts:?}"
+        );
+        assert!(
+            texts
+                .iter()
+                .any(|l| l.contains("Pinned") && l.contains("yes")),
+            "{texts:?}"
+        );
+        assert!(
+            texts.iter().any(|l| l.contains("foo, fooctl")),
+            "every binary, in one line: {texts:?}"
+        );
+        assert!(
+            texts
+                .iter()
+                .any(|l| l.contains("Also in") && l.contains("/usr/local @1.1.0")),
+            "the foreign copy is a native line with its version: {texts:?}"
+        );
+    }
+
+    /// Two foreign copies are legal when the current prefix is a custom
+    /// one (the closed set is /usr/local and ~/.local, neither of them
+    /// current), and the panel must show both — the case the
+    /// cross-prefix matrix pins on the decision side.
+    #[test]
+    fn details_show_every_foreign_copy() {
+        let mut r = row("foo");
+        r.also = vec![
+            crate::prefixes::AlsoIn {
+                prefix: std::path::PathBuf::from("/usr/local"),
+                version: "1.0.0".to_owned(),
+            },
+            crate::prefixes::AlsoIn {
+                prefix: std::path::PathBuf::from("/home/u/.local"),
+                version: "1.1.0".to_owned(),
+            },
+        ];
+        let texts: Vec<String> = detail_lines(&r).iter().map(line_text).collect();
+        assert_eq!(
+            texts.len(),
+            8,
+            "six fixed lines plus one per copy: {texts:?}"
+        );
+        assert!(texts[6].contains("/usr/local @1.0.0"), "{texts:?}");
+        assert!(texts[7].contains("/home/u/.local @1.1.0"), "{texts:?}");
+    }
+
+    /// The panel's height follows the entry: a fixed height would clip
+    /// the second foreign copy, which is exactly the state the panel
+    /// exists to report. Borders included — the lines must fit inside
+    /// them, not merely exist.
+    #[test]
+    fn resting_height_makes_room_for_every_line() {
+        let prefix = std::env::temp_dir().join("cargo-lbin-test-tui-details-height");
+        let _ = std::fs::remove_dir_all(&prefix);
+        std::fs::create_dir_all(&prefix).unwrap();
+        let mut app = crate::tui::App::new(&prefix).unwrap();
+        app.rows = vec![row("foo")];
+        assert_eq!(
+            resting_details_height(&app),
+            8,
+            "no foreign copy: six lines + borders"
+        );
+        let content = |app: &super::super::App| {
+            u16::try_from(detail_lines(app.selected_row().unwrap()).len()).unwrap()
+        };
+        assert_eq!(resting_details_height(&app), content(&app) + 2);
+
+        app.rows[0].also = vec![crate::prefixes::AlsoIn {
+            prefix: std::path::PathBuf::from("/usr/local"),
+            version: "1.0.0".to_owned(),
+        }];
+        assert_eq!(resting_details_height(&app), content(&app) + 2);
+
+        app.rows[0].also.push(crate::prefixes::AlsoIn {
+            prefix: std::path::PathBuf::from("/home/u/.local"),
+            version: "1.1.0".to_owned(),
+        });
+        assert_eq!(
+            resting_details_height(&app),
+            content(&app) + 2,
+            "two foreign copies still fit inside the borders"
+        );
+        let _ = std::fs::remove_dir_all(&prefix);
+    }
+
+    /// The foreign prefix is environment-borne: the native line is
+    /// sanitized like every other human-readable cross-prefix output.
+    #[test]
+    fn details_sanitize_the_foreign_prefix() {
+        let mut r = row("foo");
+        r.also = vec![crate::prefixes::AlsoIn {
+            prefix: std::path::PathBuf::from("/usr/\x1b[31mlocal"),
+            version: "1.1.0".to_owned(),
+        }];
+        let texts: Vec<String> = detail_lines(&r).iter().map(line_text).collect();
+        assert!(texts.iter().all(|l| !l.contains('\x1b')), "{texts:?}");
+    }
 }

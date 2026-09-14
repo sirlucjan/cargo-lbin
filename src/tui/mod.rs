@@ -60,9 +60,12 @@ pub struct Row {
     pub bins: Vec<String>,
     pub locked: bool,
     pub pinned: bool,
-    /// Pre-formatted ` [also in ...]` suffix, from the same formatter the
-    /// CLI uses so the two surfaces cannot drift; empty otherwise.
-    pub also: String,
+    /// The other prefixes carrying this crate, as facts rather than as
+    /// presentation: the list suffix renders them through the shared
+    /// `prefixes::describe` the CLI listing uses, the details panel
+    /// renders its own line under the same sanitize policy — and
+    /// neither surface parses a string built for the other.
+    pub also: Vec<crate::prefixes::AlsoIn>,
     pub status: RowStatus,
 }
 
@@ -2840,7 +2843,7 @@ fn rows_from(
                 bins: entry.bins.clone(),
                 locked: entry.locked,
                 pinned: entry.pinned,
-                also: crate::prefixes::describe_for(also, name),
+                also: also.get(name).cloned().unwrap_or_default(),
                 status,
             }
         })
@@ -3001,7 +3004,7 @@ mod tests {
             bins: vec!["x".into()],
             locked: false,
             pinned,
-            also: String::new(),
+            also: Vec::new(),
             status,
         };
         let newer = Version::new(2, 0, 0);
@@ -3942,9 +3945,18 @@ mod tests {
         let m = manifest(&[("one", "1.0.0"), ("two", "2.0.0")]);
         let rows = rows_from(&m, None, &also);
         let one = rows.iter().find(|r| r.name == "one").unwrap();
-        assert_eq!(one.also, " [also in /usr/local @0.9.0]");
+        // Facts on the row; the shared formatter is applied at render
+        // time, so the CLI listing and the list suffix still cannot
+        // drift.
+        assert_eq!(one.also.len(), 1);
+        assert_eq!(one.also[0].prefix, std::path::PathBuf::from("/usr/local"));
+        assert_eq!(one.also[0].version, "0.9.0");
+        assert_eq!(
+            crate::prefixes::describe(&one.also),
+            " [also in /usr/local @0.9.0]"
+        );
         let two = rows.iter().find(|r| r.name == "two").unwrap();
-        assert_eq!(two.also, "", "installed nowhere else, no suffix");
+        assert!(two.also.is_empty(), "installed nowhere else, no facts");
     }
 
     #[test]
