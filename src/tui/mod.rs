@@ -3754,12 +3754,23 @@ mod tests {
         // A user-writable prefix: the decision lands in place — no
         // terminal handoff is queued, the file and the row are gone,
         // and the interface says so itself.
-        app.remove_confirmed("foo".into());
+        // Retried, because "busy" is a legitimate answer and this binary
+        // can produce it against itself: the prefix lock this test takes
+        // while reloading is inheritable across a sibling test's
+        // fork-to-exec window, and the removal's exclusive attempt is
+        // non-blocking by design — it reports busy rather than waiting.
+        // Production says "try again" to a person; the test does.
+        assert!(
+            crate::stage::eventually(std::time::Duration::from_secs(10), || {
+                app.remove_confirmed("foo".into());
+                !prefix.join("bin/foo").exists()
+            }),
+            "the binary is gone"
+        );
         assert!(
             app.pending.is_none(),
             "no handoff for a passwordless prefix"
         );
-        assert!(!prefix.join("bin/foo").exists(), "the binary is gone");
         assert!(
             app.visible().iter().all(|row| row.name != "foo"),
             "the row is gone from the reloaded list"
@@ -3860,14 +3871,19 @@ mod tests {
 
         // In place: no handoff queued, the bit lands on disk, the row
         // and the message agree.
-        app.pin_selected();
+        // Retried for the same reason the removal is: the in-place flip
+        // takes the prefix lock without waiting, and this binary can
+        // hold that lock against itself for a fork-to-exec window.
+        assert!(
+            crate::stage::eventually(std::time::Duration::from_secs(10), || {
+                app.pin_selected();
+                Manifest::load(&prefix).unwrap().crates["foo"].pinned
+            }),
+            "the pin is committed"
+        );
         assert!(
             app.pending.is_none(),
             "no handoff for a passwordless prefix"
-        );
-        assert!(
-            Manifest::load(&prefix).unwrap().crates["foo"].pinned,
-            "the pin is committed"
         );
         assert!(
             app.selected_row().is_some_and(|row| row.pinned),
@@ -3880,9 +3896,14 @@ mod tests {
             said.text
         );
 
-        // And back: the same key is its own inverse.
-        app.pin_selected();
-        assert!(!Manifest::load(&prefix).unwrap().crates["foo"].pinned);
+        // And back: the same key is its own inverse (retried alike).
+        assert!(
+            crate::stage::eventually(std::time::Duration::from_secs(10), || {
+                app.pin_selected();
+                !Manifest::load(&prefix).unwrap().crates["foo"].pinned
+            }),
+            "the unpin is committed"
+        );
         let said = app.message.take().expect("the unpin reports itself");
         assert!(said.text.contains("unpinned foo"), "{}", said.text);
 
@@ -3891,17 +3912,24 @@ mod tests {
         let mut moved = Manifest::load(&prefix).unwrap();
         moved.crates.get_mut("foo").unwrap().pinned = true;
         moved.store(&prefix).unwrap();
-        app.pin_selected();
+        // Retried on the *message*, not on the disk: the expected
+        // outcome is a no-op, so "nothing changed" cannot tell success
+        // from a transient busy. The word the interface chose can.
+        assert!(
+            crate::stage::eventually(std::time::Duration::from_secs(10), || {
+                app.pin_selected();
+                app.message
+                    .as_ref()
+                    .is_some_and(|m| m.text.contains("already pinned"))
+            }),
+            "named as already: {:?}",
+            app.message.as_ref().map(|m| m.text.clone())
+        );
         assert!(
             Manifest::load(&prefix).unwrap().crates["foo"].pinned,
             "already answered: nothing flips"
         );
-        let said = app.message.take().expect("the no-op reports itself");
-        assert!(
-            said.text.contains("already pinned"),
-            "named as already: {}",
-            said.text
-        );
+        let _ = app.message.take();
         assert!(
             app.selected_row().is_some_and(|row| row.pinned),
             "the reloaded row shows the state that stands"
