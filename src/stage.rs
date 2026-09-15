@@ -558,6 +558,43 @@ fn command(name: &str, version: Option<&Version>, locked: bool, stage: &Path) ->
     cmd
 }
 
+/// In tests only: retry a spawn refused with `ETXTBSY`.
+///
+/// A test writes its fake cargo and then execs it. Close-on-exec keeps
+/// that write descriptor out of a child's hands after `exec`, but not
+/// between `fork` and `exec` — for those microseconds a *sibling*
+/// test's child holds a copy of it, the script counts as open for
+/// writing, and exec'ing it is refused. The hazard is the test
+/// harness's alone: nothing rewrites the real cargo while cargo-lbin
+/// runs, so the release path has nothing to retry and this costs it
+/// one branch that is compiled out.
+#[cfg(test)]
+fn retry_while_text_file_busy<T>(
+    mut attempt: impl FnMut() -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        match attempt() {
+            Err(e)
+                if e.raw_os_error() == Some(libc::ETXTBSY)
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            other => return other,
+        }
+    }
+}
+
+/// Start a prepared cargo command, waiting out the harness's own
+/// `ETXTBSY` window under test and spawning plainly otherwise.
+fn spawn_cargo(cmd: &mut Command) -> std::io::Result<std::process::Child> {
+    #[cfg(test)]
+    return retry_while_text_file_busy(|| cmd.spawn());
+    #[cfg(not(test))]
+    cmd.spawn()
+}
+
 /// Build `name` into the stage — exactly `version` when given,
 /// otherwise the newest version cargo picks. The exact form is spelled
 /// (`--version =1.2.3`): the intent belongs in the command line, not a
@@ -566,8 +603,8 @@ pub fn build(name: &str, version: Option<&Version>, locked: bool, stage: &Path) 
     fs::create_dir_all(stage).with_context(|| format!("creating {}", stage.display()))?;
     // Compiler output goes straight to the terminal; the user should see the
     // build exactly as cargo presents it.
-    let status = command(name, version, locked, stage)
-        .status()
+    let status = spawn_cargo(&mut command(name, version, locked, stage))
+        .and_then(|mut child| child.wait())
         .context("failed to spawn cargo")?;
     if !status.success() {
         bail!("cargo install {name} failed with {status}");
@@ -692,12 +729,10 @@ pub fn build_captured(
     // in the session's foreground group: there Ctrl-C is the terminal's
     // job.
     std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
-    let mut child = cmd
-        .stdin(std::process::Stdio::null())
+    cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .context("failed to spawn cargo")?;
+        .stderr(std::process::Stdio::piped());
+    let mut child = spawn_cargo(&mut cmd).context("failed to spawn cargo")?;
     // The leader's pid is the group id. Announced before the first read:
     // a cancel arriving mid-spawn must find something to signal, and
     // `spawned` also delivers one accepted earlier.
