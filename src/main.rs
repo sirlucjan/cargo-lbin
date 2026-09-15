@@ -891,7 +891,7 @@ fn install_and_commit(
     // privileged call site.
     let initial_escalate = install_needs_privilege(policy, prefix)?;
     if frontend.wants_preauthorize() {
-        privileged::preauthorize(prefix, initial_escalate)?;
+        privileged::preauthorize(prefix, initial_escalate, privileged::AuthPurpose::Placement)?;
     }
     // Per-run stage: the state lock serializes per *prefix*, so two runs
     // on different prefixes may build the same crate — one wiping the
@@ -2164,11 +2164,38 @@ fn state_needs_privilege(policy: privileged::Policy, prefix: &Path) -> Result<bo
             && StateLock::preparation_needs_privilege(prefix)))
 }
 
+/// Is the late escalation certain enough to announce?
+///
+/// Only when both probes answered and answered this exact way: the
+/// source escalates, the destination does not. An `Err` is not a
+/// quiet "no" — a destination whose privilege cannot be judged may
+/// refuse the migration outright a moment later, and a heads-up about
+/// a build that never starts is exactly the false promise the notice
+/// exists to avoid. Unknown announces nothing.
+fn late_escalation_certain(source: &Result<bool>, dest: &Result<bool>) -> bool {
+    matches!((source, dest), (Ok(true), Ok(false)))
+}
+
+/// The heads-up for a migration whose privileged half comes last.
+///
+/// It promises the escalation, not the prompt: retiring from a
+/// privileged prefix will need sudo, and whether sudo *asks* depends
+/// on a timestamp nobody can predict from here. Shared by both
+/// surfaces, like the requirement line it precedes.
+fn late_escalation_note(name: &str, source: &Path) -> String {
+    text::sanitize(&format!(
+        "retiring `{name}` from {} needs sudo after the build; \
+         a password may be requested then",
+        source.display()
+    ))
+}
+
 /// The escalation union for operations placing/removing under bin. The
-/// build preflight, in-place removal and captured retirement must
-/// never disagree about whether a prefix asks a password; private
-/// copies of this `||` would drift.
-#[cfg(feature = "tui")]
+/// build preflight, in-place removal and both retirements — the
+/// captured one and the CLI's — must never disagree about whether a
+/// prefix asks a password; private copies of this `||` would drift.
+/// No longer TUI-only for exactly that reason: the CLI's migration
+/// asks the same question before it announces the password it needs.
 fn placement_needs_privilege(policy: privileged::Policy, prefix: &Path) -> Result<bool> {
     // Composed from the canonical probes, not re-spelled: changes reach
     // the TUI preflight through this line.
@@ -3511,8 +3538,20 @@ fn cmd_migrate(prefix: &Path, to: &Path, crates: &[String], all: bool, yes: bool
     let mut moved = 0usize;
     let mut incomplete: Vec<&str> = Vec::new();
     let mut failed: Vec<&str> = Vec::new();
+    // The same heads-up the TUI gives, and for the same reason: where
+    // the destination needs no password the privileged half is the
+    // retirement, which happens after each build. Decided once for the
+    // batch; emitted before each build, because that is where the wait
+    // it warns about begins.
+    let late_escalation = late_escalation_certain(
+        &placement_needs_privilege(privileged::Policy::for_prefix(prefix), prefix),
+        &placement_needs_privilege(privileged::Policy::for_prefix(to), to),
+    );
     for (i, (name, snap)) in snapshots.iter().enumerate() {
         println!("[{}/{total}] {name}", i + 1);
+        if late_escalation {
+            eprintln!("warning: {}", late_escalation_note(name, prefix));
+        }
         match migrate_one(
             prefix,
             to,
@@ -3873,13 +3912,19 @@ fn retire_with_frontend(
     frontend: &mut MigrateFrontend<'_>,
 ) -> Result<Retirement> {
     match frontend {
-        MigrateFrontend::Terminal => retire_source(
-            source,
-            name,
-            snap,
-            privileged::Policy::for_prefix(source),
-            &mut |l| eprintln!("{l}"),
-        ),
+        MigrateFrontend::Terminal => {
+            let policy = privileged::Policy::for_prefix(source);
+            // Placement says what its password is for; so does this. The
+            // preauthorization is also where a refusal is a plain
+            // failure rather than a half-done retirement discovered
+            // three sudo calls later.
+            privileged::preauthorize(
+                source,
+                placement_needs_privilege(policy, source)?,
+                privileged::AuthPurpose::Retirement,
+            )?;
+            retire_source(source, name, snap, policy, &mut |l| eprintln!("{l}"))
+        }
         #[cfg(not(feature = "tui"))]
         MigrateFrontend::Never(_) => unreachable!(),
         #[cfg(feature = "tui")]
@@ -5333,6 +5378,51 @@ mod tests {
             "the binary is unreachable by name, and that is said plainly"
         );
         let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Unknown is not "no". A destination whose privilege cannot be
+    /// judged may refuse the migration before any build starts, so
+    /// promising a password after that build would be a promise about
+    /// work that never happens. Both probes must answer, and answer
+    /// this way.
+    #[test]
+    fn an_unjudgeable_prefix_announces_nothing() {
+        let err = || Err(anyhow::anyhow!("only /usr/local may escalate"));
+        assert!(
+            late_escalation_certain(&Ok(true), &Ok(false)),
+            "the case it is for"
+        );
+        assert!(
+            !late_escalation_certain(&Ok(true), &err()),
+            "a destination nobody can judge is not a destination that needs nothing"
+        );
+        assert!(
+            !late_escalation_certain(&err(), &Ok(false)),
+            "nor is the source"
+        );
+        assert!(!late_escalation_certain(&err(), &err()));
+        // And the ordinary negatives.
+        assert!(!late_escalation_certain(&Ok(false), &Ok(false)));
+        assert!(
+            !late_escalation_certain(&Ok(true), &Ok(true)),
+            "a destination that escalates has already asked"
+        );
+    }
+
+    /// The sentence promises a privileged operation, not a password
+    /// prompt: sudo may have a fresh timestamp, and predicting that
+    /// from here would be a promise the tool cannot keep.
+    #[test]
+    fn the_late_escalation_note_promises_privilege_not_a_prompt() {
+        let note = late_escalation_note("scx_truther", Path::new("/usr/local"));
+        assert_eq!(
+            note,
+            "retiring `scx_truther` from /usr/local needs sudo after the build; \
+             a password may be requested then"
+        );
+        assert!(!note.contains("will ask"), "{note}");
+        let hostile = PathBuf::from("/usr/\x1b[31mlocal");
+        assert!(!late_escalation_note("foo", &hostile).contains('\x1b'));
     }
 
     #[test]

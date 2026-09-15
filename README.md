@@ -60,6 +60,8 @@ rustup's environment is not its job.
 
 Do **not** run `cargo-lbin` itself with `sudo`. Build scripts and proc macros must run as your normal user; `cargo-lbin` requests `sudo` itself only when placement under the canonical `/usr/local` prefix requires it.
 
+Where `cargo-lbin` asks for those credentials itself — placement, and a migration's retirement of the source — it names the reason first, because `sudo` prompts for a user and never for a purpose: `administrative privileges are required to install under /usr/local`, or `… to retire the source installation from /usr/local`. One sentence for both surfaces: the CLI prints it, and the TUI prints it on the terminal it steps off before suspending. (Operations that escalate inside a single privileged call, such as a `remove` or a pin flip needing `sudo`, still meet `sudo`'s own prompt directly.)
+
 ## Quick start
 
 ```bash
@@ -687,7 +689,7 @@ whose count sits in the header at all times, and the footer says how many
 pinned crates are behind. The same split shapes the `r` result line:
 `checked: 1 update(s) available; 1 pinned held back`.
 
-A single-crate install builds in place, inside its own transient Build panel, with `sudo` credentials validated up front, and a removal or a pin flip runs in place too when it needs no password; batch installs, `update` and — when that operation needs `sudo` — `remove` and `pin`/`unpin` temporarily hand the real terminal back to the normal CLI, where Cargo diagnostics, the update confirmation and password prompts behave exactly as they do outside the TUI, and the interface returns afterwards.
+A single-crate install builds in place, inside its own transient Build panel, with `sudo` credentials validated up front, and a removal or a pin flip runs in place too when it needs no password; when credentials lapse during a long build the interface steps aside and asks again; a migration out of a privileged prefix into a writable one escalates only after the build — the privileged half is retiring the source — and says so before the build starts, so a prompt arriving then is expected rather than startling (whether `sudo` asks at all depends on its own timestamp, so the notice promises the escalation, not the prompt); the CLI says the same before each crate's build; batch installs, `update` and — when that operation needs `sudo` — `remove` and `pin`/`unpin` temporarily hand the real terminal back to the normal CLI, where Cargo diagnostics, the update confirmation and password prompts behave exactly as they do outside the TUI, and the interface returns afterwards.
 
 `D` offers the older versions in the panel: a cancellable lookup, then a numbered list — the same choice `cargo lbin downgrade` makes, so a browser of the whole history it is not — and a digit installs one. The list stops at nine because a digit names one entry; anything older is announced with a pointer to `install NAME@VERSION`. The build that follows is an ordinary in-panel install of an exact version: `c` cancels it, its warnings land in the panel, and the version is pinned for the same reason the command pins. The offer is computed against the version the row shows, so if the crate moves or disappears while the list is open, the digit starts nothing and says why.
 

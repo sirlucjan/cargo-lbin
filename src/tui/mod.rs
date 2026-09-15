@@ -244,7 +244,10 @@ enum BuildMsg {
     /// the named prefix: one worker can escalate for both prefixes of a
     /// migration, and the prompt must name the one asking. The worker
     /// blocks until the run loop answers.
-    NeedAuth(PathBuf),
+    NeedAuth {
+        target: PathBuf,
+        purpose: crate::privileged::AuthPurpose,
+    },
     /// Finished, classified by the worker where the error is at hand: the
     /// UI must not guess "cancelled" from a phase flag a late `c` can set
     /// after cargo died of its own causes.
@@ -490,7 +493,7 @@ enum Job {
         started: std::time::Instant,
         /// Set by `poll_job` on a revalidation request — carrying the prefix
         /// the escalation is for; answered by the run loop.
-        needs_auth: Option<PathBuf>,
+        needs_auth: Option<(PathBuf, crate::privileged::AuthPurpose)>,
         /// The cancel state machine shared with the worker.
         control: std::sync::Arc<crate::BuildControl>,
         /// What is being built toward.
@@ -545,6 +548,43 @@ impl Job {
 
 /// Hits the details panel shows; `api::search` guarantees no more.
 const SEARCH_HITS: usize = 6;
+
+/// The authorization door both workers hand to the pipeline —
+/// placement and retirement alike.
+///
+/// Three answers, and each is a policy: a cancelled build refuses
+/// rather than asking for a password it no longer needs; fresh
+/// credentials pass silently, which is the common case after the
+/// preflight; otherwise the interface is asked to collect them and the
+/// worker waits for its verdict. A denial that answers a cancel *is*
+/// the cancel — a refusal keeps its own name only when it is one.
+fn auth_gate(
+    control: &crate::BuildControl,
+    tx: &Sender<BuildMsg>,
+    auth_rx: &Receiver<bool>,
+    escalating: &Path,
+    purpose: crate::privileged::AuthPurpose,
+) -> Result<()> {
+    if control.cancelled() {
+        return Err(anyhow::Error::new(crate::BuildCancelled));
+    }
+    match crate::privileged::credentials_fresh() {
+        Ok(true) => Ok(()),
+        Ok(false) => {
+            let _ = tx.send(BuildMsg::NeedAuth {
+                target: escalating.to_path_buf(),
+                purpose,
+            });
+            match auth_rx.recv() {
+                Ok(true) => Ok(()),
+                Ok(false) if control.cancelled() => Err(anyhow::Error::new(crate::BuildCancelled)),
+                Ok(false) => anyhow::bail!("sudo authentication failed"),
+                Err(_) => anyhow::bail!("the interface went away mid-authorization"),
+            }
+        }
+        Err(e) => Err(e),
+    }
+}
 
 /// A build the run loop still has to start, because starting one needs
 /// the terminal: the escalation preflight may have to ask for a
@@ -1042,8 +1082,13 @@ impl App {
         };
         let prefix = prefix.to_path_buf();
         if !fresh
-            && let Err(e) =
-                Self::suspended(terminal, || crate::privileged::preauthorize(&prefix, true))?
+            && let Err(e) = Self::suspended(terminal, || {
+                crate::privileged::preauthorize(
+                    &prefix,
+                    true,
+                    crate::privileged::AuthPurpose::Placement,
+                )
+            })?
         {
             return Ok(Preflight::Reported(format!("{e:#}")));
         }
@@ -1130,32 +1175,13 @@ impl App {
                 let _ = line_tx.send(build_msg(k, l));
             };
             let mut before_placement = |escalating: &Path| {
-                // A cancelled build must not ask for a password: refuse instead of
-                // raising NeedAuth; the run loop guards the other side of the race.
-                if control.cancelled() {
-                    return Err(anyhow::Error::new(crate::BuildCancelled));
-                }
-                match crate::privileged::credentials_fresh() {
-                    // The common case: the up-front validation is still
-                    // fresh and placement proceeds without a word.
-                    Ok(true) => Ok(()),
-                    Ok(false) => {
-                        let _ = worker_tx.send(BuildMsg::NeedAuth(escalating.to_path_buf()));
-                        match auth_rx.recv() {
-                            Ok(true) => Ok(()),
-                            // A denial answering a cancel *is* the cancel; a real refusal keeps
-                            // its own name.
-                            Ok(false) if control.cancelled() => {
-                                Err(anyhow::Error::new(crate::BuildCancelled))
-                            }
-                            Ok(false) => anyhow::bail!("sudo authentication failed"),
-                            Err(_) => {
-                                anyhow::bail!("the interface went away mid-authorization")
-                            }
-                        }
-                    }
-                    Err(e) => Err(e),
-                }
+                auth_gate(
+                    &control,
+                    &worker_tx,
+                    &auth_rx,
+                    escalating,
+                    crate::privileged::AuthPurpose::Placement,
+                )
             };
             // One door per intent: an install places what was asked for,
             // a downgrade first makes the statement its name implies —
@@ -1213,6 +1239,27 @@ impl App {
         Ok(())
     }
 
+    /// Does this migration's *retirement* escalate where the
+    /// destination did not?
+    ///
+    /// Both halves matter. The source must need privilege — otherwise
+    /// nothing is escalated at all — and the destination must not,
+    /// because when it does the preflight has already authenticated and
+    /// anything later is sudo's timestamp lapsing. A probe that cannot
+    /// answer says no: a missing heads-up is a smaller wrong than a
+    /// false one.
+    fn migration_escalates_late(&self, dest: &Path) -> bool {
+        let needs = |p: &Path| {
+            crate::placement_needs_privilege(crate::privileged::Policy::for_prefix(p), p)
+        };
+        // The same rule the CLI uses, from the same function: a probe
+        // that failed is not a probe that said no. Here the destination
+        // preflight would already have refused such a migration, but
+        // the decision should not depend on another gate happening to
+        // run first.
+        crate::late_escalation_certain(&needs(&self.prefix), &needs(dest))
+    }
+
     /// Start an in-place migration: the same job, gauge, cancel door and
     /// sudo roundtrip as an install — a frontend to `migrate`, not a
     /// second migrate. Whether a worker started travels back with its
@@ -1253,6 +1300,15 @@ impl App {
             }
             Preflight::Reported(message) => return Ok(StartOutcome::Refused(message)),
         }
+        // Where the destination needed no password, the source still
+        // needs privilege: retiring it is a privileged operation, and it
+        // happens *after* the build. Saying so now turns a prompt
+        // arriving ten minutes later into something expected. Whether
+        // sudo actually asks depends on its timestamp, which is why the
+        // sentence promises the escalation and not the prompt.
+        if self.migration_escalates_late(&dest) {
+            self.info(&crate::late_escalation_note(&name, &self.prefix));
+        }
         let (tx, rx) = mpsc::channel();
         let (auth_tx, auth_rx) = mpsc::channel();
         let control = std::sync::Arc::new(crate::BuildControl::new());
@@ -1273,28 +1329,15 @@ impl App {
                     let _ = line_tx.send(build_msg(k, l));
                 },
                 &mut |escalating: &Path| {
-                    // Same auth roundtrip as an install; a denial answering a cancel is
-                    // the cancel.
-                    if control.cancelled() {
-                        return Err(anyhow::Error::new(crate::BuildCancelled));
-                    }
-                    match crate::privileged::credentials_fresh() {
-                        Ok(true) => Ok(()),
-                        Ok(false) => {
-                            let _ = worker_tx.send(BuildMsg::NeedAuth(escalating.to_path_buf()));
-                            match auth_rx.recv() {
-                                Ok(true) => Ok(()),
-                                Ok(false) if control.cancelled() => {
-                                    Err(anyhow::Error::new(crate::BuildCancelled))
-                                }
-                                Ok(false) => anyhow::bail!("sudo authentication failed"),
-                                Err(_) => {
-                                    anyhow::bail!("the interface went away mid-authorization")
-                                }
-                            }
-                        }
-                        Err(e) => Err(e),
-                    }
+                    // One door, two phases: the destination while placing,
+                    // the source while retiring — and the person is told
+                    // which, because sudo will not.
+                    let purpose = if escalating == source {
+                        crate::privileged::AuthPurpose::Retirement
+                    } else {
+                        crate::privileged::AuthPurpose::Placement
+                    };
+                    auth_gate(&control, &worker_tx, &auth_rx, escalating, purpose)
                 },
                 &control,
             );
@@ -1390,7 +1433,7 @@ impl App {
         }
         // The prefix comes from the request, never the app: a migration
         // escalates for its *destination* while `self.prefix` is the source.
-        let Some(target) = self.job.as_mut().and_then(|job| {
+        let Some((target, purpose)) = self.job.as_mut().and_then(|job| {
             let Job::Build { needs_auth, .. } = job else {
                 return None;
             };
@@ -1398,7 +1441,12 @@ impl App {
         }) else {
             return Ok(());
         };
-        let outcome = Self::suspended(terminal, || crate::privileged::preauthorize(&target, true))?;
+        // `preauthorize` prints what the password is for, on the bare
+        // terminal the interface has just stepped off — the same
+        // sentence the CLI prints, from the same place.
+        let outcome = Self::suspended(terminal, || {
+            crate::privileged::preauthorize(&target, true, purpose)
+        })?;
         let ok = match outcome {
             Ok(()) => match crate::privileged::credentials_fresh() {
                 Ok(true) => true,
@@ -2930,7 +2978,9 @@ impl App {
                             warnings.push(line);
                             self.show_live_warnings(&name, &kind, &warnings);
                         }
-                        Ok(BuildMsg::NeedAuth(target)) => needs_auth = Some(target),
+                        Ok(BuildMsg::NeedAuth { target, purpose }) => {
+                            needs_auth = Some((target, purpose));
+                        }
                         Ok(BuildMsg::Done(outcome)) => {
                             done = Some(outcome);
                             break;
@@ -3590,6 +3640,50 @@ mod tests {
         app.job = None;
         app.pick_downgrade(0);
         assert!(app.pending_build.is_some(), "the offer still answers later");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The heads-up is made only where it can be kept: the source needs
+    /// privilege and the destination did not. It promises the
+    /// escalation, never the prompt — whether sudo asks depends on its
+    /// timestamp, which nothing here can predict.
+    #[test]
+    fn a_late_escalation_is_announced_only_when_it_is_certain() {
+        let root = std::env::temp_dir().join("cargo-lbin-test-tui-migrate-heads-up");
+        let _ = std::fs::remove_dir_all(&root);
+        let writable = root.join("writable");
+        std::fs::create_dir_all(writable.join("bin")).unwrap();
+        std::fs::create_dir_all(writable.join("share/cargo-lbin")).unwrap();
+        let mut app = App::new(&writable).unwrap();
+
+        // Both prefixes writable: nothing will ask, so nothing is said.
+        let other = root.join("other");
+        std::fs::create_dir_all(other.join("bin")).unwrap();
+        assert!(
+            !app.migration_escalates_late(&other),
+            "a writable source retires without a password"
+        );
+
+        // A source that needs privilege and a destination that does not
+        // is exactly the case the person met: the prompt comes after the
+        // build, so it is announced before it.
+        app.prefix = PathBuf::from("/usr/local");
+        assert_eq!(
+            app.migration_escalates_late(&other),
+            crate::placement_needs_privilege(
+                crate::privileged::Policy::for_prefix(&app.prefix),
+                &app.prefix
+            )
+            .unwrap_or(false),
+            "announced exactly when the source escalates"
+        );
+
+        // Destination privileged too: the preflight asks up front, so
+        // the heads-up would be about a lapse nobody can predict.
+        assert!(
+            !app.migration_escalates_late(Path::new("/usr/local")),
+            "no promise about a timestamp that may or may not lapse"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -4542,7 +4636,7 @@ mod tests {
         ] {
             let line = match build_msg(kind, hostile) {
                 BuildMsg::Cargo(l) | BuildMsg::Notice(l) | BuildMsg::Warning(l) => l,
-                BuildMsg::NeedAuth(_) | BuildMsg::Done(_) => {
+                BuildMsg::NeedAuth { .. } | BuildMsg::Done(_) => {
                     panic!("a line kind maps to a line message")
                 }
             };

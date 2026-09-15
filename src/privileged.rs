@@ -187,20 +187,46 @@ pub fn credentials_fresh() -> Result<bool> {
         .success())
 }
 
-pub fn preauthorize(prefix: &Path, escalate: bool) -> Result<()> {
+/// Why cargo-lbin is about to ask for a password.
+///
+/// Sudo prompts for a user and never for a reason, and the prefix
+/// alone does not supply one: a migration escalates for its
+/// destination while placing and for its source while retiring. The
+/// retirement is the case that needs saying most — it arrives after
+/// the build, when nothing on screen looks like it is about
+/// privileges.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AuthPurpose {
+    Placement,
+    Retirement,
+}
+
+/// The sentence printed before sudo's own prompt, wherever the prompt
+/// happens — the CLI's terminal or the bare screen the TUI steps off.
+/// One source, so the two surfaces cannot word the same moment
+/// differently. Named by prefix, not bin: the writes may be binaries,
+/// state or the lock — "into .../bin" would state a false reason for
+/// the latter two.
+#[must_use]
+pub fn requirement_line(purpose: AuthPurpose, prefix: &Path) -> String {
+    let what = match purpose {
+        AuthPurpose::Placement => "install under",
+        AuthPurpose::Retirement => "retire the source installation from",
+    };
+    crate::text::sanitize(&format!(
+        "administrative privileges are required to {what} {}",
+        prefix.display()
+    ))
+}
+
+pub fn preauthorize(prefix: &Path, escalate: bool, purpose: AuthPurpose) -> Result<()> {
     if !escalate {
         return Ok(());
     }
     if credentials_fresh()? {
         return Ok(());
     }
-    // Named by prefix, not bin: the writes may be binaries, state or the
-    // lock — "into .../bin" would state a false reason for the latter
-    // two.
-    eprintln!(
-        "administrative privileges are required to install under {}",
-        prefix.display()
-    );
+    eprintln!("{}", requirement_line(purpose, prefix));
     let status = Command::new(SUDO)
         .arg("-v")
         .status()
@@ -526,6 +552,33 @@ pub fn restorecon(policy: Policy, paths: &[&Path]) {
 
 #[cfg(test)]
 mod tests {
+    /// The prompt names the phase asking for it. Sudo says who you are;
+    /// only cargo-lbin knows what it is about to do, and a migration
+    /// asks for two prefixes for two different reasons. One sentence,
+    /// used by the CLI and by the screen the TUI steps off, so the two
+    /// cannot word the same moment differently.
+    #[test]
+    fn the_password_requirement_says_what_it_is_for() {
+        let prefix = Path::new("/usr/local");
+        assert_eq!(
+            requirement_line(AuthPurpose::Placement, prefix),
+            "administrative privileges are required to install under /usr/local"
+        );
+        assert_eq!(
+            requirement_line(AuthPurpose::Retirement, prefix),
+            "administrative privileges are required to retire the source installation from \
+             /usr/local"
+        );
+        // A prefix can come from the environment: sanitized like every
+        // other external string that reaches a terminal.
+        let hostile = PathBuf::from("/usr/\x1b[31mlocal");
+        assert!(
+            !requirement_line(AuthPurpose::Placement, &hostile).contains('\x1b'),
+            "{}",
+            requirement_line(AuthPurpose::Placement, &hostile)
+        );
+    }
+
     use super::*;
 
     #[test]
