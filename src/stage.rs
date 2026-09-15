@@ -469,6 +469,40 @@ impl Drop for FakeCargo {
     }
 }
 
+/// A run directory whose `.lease` exists and is held by nobody — the
+/// state every scanner calls released.
+///
+/// Built with plain file operations on purpose: a lease created
+/// through [`Lease::acquire`] is inheritable by design, so any process
+/// another test spawns during the microseconds it is open keeps the
+/// lock alive past the drop. A fixture must not depend on that race;
+/// this file is opened close-on-exec like every other, so nothing can
+/// capture it.
+#[cfg(test)]
+pub(crate) fn released_run_fixture(run_dir: &Path) {
+    fs::create_dir_all(run_dir).unwrap();
+    fs::write(run_dir.join(LEASE_FILE), b"").unwrap();
+}
+
+/// The other half of [`FakeCargo`]'s bargain, for tests that hold a
+/// lease and assert it is released.
+///
+/// A lease descriptor is deliberately inheritable — that is the whole
+/// feature: a cargo orphaned by its cargo-lbin keeps owning its stage.
+/// In a parallel test binary the same property bites, because *any*
+/// process spawned while *any* lease is open inherits that lease too,
+/// and keeps the lock alive long past its owner's drop. So a test
+/// asserting a release must not overlap a test that spawns: both take
+/// this lock, `FakeCargo` on the spawning side and this on the lease
+/// side. Poison is tolerated — a panicking test elsewhere must not
+/// turn every lease test into a failure of its own.
+#[cfg(test)]
+pub(crate) fn no_spawned_children() -> std::sync::MutexGuard<'static, ()> {
+    FAKE_CARGO_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 fn cargo_program() -> std::ffi::OsString {
     #[cfg(test)]
     if let Some(p) = CARGO_PROGRAM.read().unwrap().clone() {
@@ -1142,18 +1176,18 @@ mod tests {
     /// the outside world is not.
     #[test]
     fn remove_leased_run_clears_payload_and_spares_symlink_targets() {
+        let _serial = no_spawned_children();
         let root = std::env::temp_dir().join("cargo-lbin-test-lease-remove");
         let _ = fs::remove_dir_all(&root);
         let outside = root.join("outside");
         fs::create_dir_all(outside.join("keep")).unwrap();
         let run = root.join("42-00000000000000ff");
-        let lease = Lease::acquire(&run).unwrap();
+        released_run_fixture(&run);
         fs::create_dir_all(run.join("somecrate").join("bin")).unwrap();
         fs::write(run.join("somecrate").join("bin").join("tool"), b"x").unwrap();
         fs::write(run.join("stray-file"), b"y").unwrap();
         std::os::unix::fs::symlink(&outside, run.join("link-out")).unwrap();
 
-        drop(lease);
         let held = take_lease_for_removal(&run).unwrap();
         assert!(held.is_some(), "no writer left: the taker owns the run");
         remove_leased_run(&run).unwrap();
@@ -1209,6 +1243,7 @@ mod tests {
     /// ownerless candidate any taker may claim.
     #[test]
     fn creator_cleanup_defers_to_a_surviving_inheritor() {
+        let _serial = no_spawned_children();
         let root = std::env::temp_dir().join("cargo-lbin-test-lease-veto");
         let _ = fs::remove_dir_all(&root);
         let run = root.join("777-00000000000000dd");
@@ -1240,7 +1275,17 @@ mod tests {
 
         fs::write(&stop, b"").unwrap();
         child.wait().unwrap();
-        let taken = take_lease_for_removal(&run).unwrap();
+        // Bounded, for the same reason as above: the gate keeps other
+        // tests' long-lived children out, a passing short-lived one is
+        // waited out rather than raced.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let taken = loop {
+            let taken = take_lease_for_removal(&run).unwrap();
+            if taken.is_some() || std::time::Instant::now() >= deadline {
+                break taken;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
         assert!(
             taken.is_some(),
             "the inheritor's exit is the release; the ordinary ownerless path takes over"
@@ -1256,6 +1301,7 @@ mod tests {
     #[test]
     fn a_lease_is_held_exactly_as_long_as_its_holder_lives() {
         use std::os::fd::AsRawFd;
+        let _serial = no_spawned_children();
         let root = std::env::temp_dir().join("cargo-lbin-test-lease-lifetime");
         let _ = fs::remove_dir_all(&root);
         let run = root.join("12345-0123456789abcdef");
@@ -1280,9 +1326,24 @@ mod tests {
         );
 
         drop(lease);
-        // SAFETY: as above.
-        let taken = unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-        assert_eq!(taken, 0, "a dropped lease must be takeable at once");
+        // Takeable once every holder is gone — and in this binary a
+        // sibling test's short-lived child (an owner lookup shelling
+        // out to the distro's package manager, say) may hold an
+        // inherited copy for a moment, because an inheritable
+        // descriptor is exactly the feature under test. The gate above
+        // keeps long-lived children out; this waits out the brief
+        // ones. Production never waits like this: it asks once and
+        // treats held as held.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let taken = loop {
+            // SAFETY: as above.
+            let r = unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            if r == 0 || std::time::Instant::now() >= deadline {
+                break r;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        assert_eq!(taken, 0, "a dropped lease must become takeable");
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -1315,6 +1376,7 @@ mod tests {
     #[test]
     fn probing_answers_unknown_held_released_and_readers_coexist() {
         use std::os::fd::AsRawFd;
+        let _serial = no_spawned_children();
         let root = std::env::temp_dir().join("cargo-lbin-test-lease-probe");
         let _ = fs::remove_dir_all(&root);
 
@@ -1328,10 +1390,14 @@ mod tests {
         let run = root.join("12345-00000000000000cc");
         let lease = Lease::acquire(&run).unwrap();
         assert_eq!(probe_lease(&run), LeaseState::Held);
+        drop(lease);
 
         // Two readers at once: probe A holds LOCK_SH while probe B
-        // runs; B must still see the writer, not the reader.
-        drop(lease);
+        // runs; B must still see the writer, not the reader. The
+        // reader's run is a fixture: what is under test here is how
+        // probes see each other, not how a drop releases.
+        let run = root.join("12345-00000000000000cd");
+        released_run_fixture(&run);
         let reader = fs::File::open(run.join(LEASE_FILE)).unwrap();
         // SAFETY: flock(2) on an owned, open descriptor.
         assert_eq!(

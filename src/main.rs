@@ -4645,13 +4645,30 @@ mod tests {
             );
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
+        // Either the stray died before the creator's cleanup asked, and
+        // the run went with the cancel — or it was still holding the
+        // inherited lease at that moment and vetoed the removal, which
+        // is the feature, not a leak: with the last inheritor now gone
+        // the run is exactly the ownerless debris verify names and
+        // clean removes.
         let leftovers: Vec<PathBuf> = fs::read_dir(cache.join(crate::stage::RUN_NAMESPACE))
             .map(|entries| entries.map(|e| e.unwrap().path()).collect())
             .unwrap_or_default();
-        assert!(
-            leftovers.is_empty(),
-            "the run is gone, and nothing is left alive to touch it: {leftovers:?}"
-        );
+        match leftovers.as_slice() {
+            [] => {}
+            [run] => {
+                assert_eq!(
+                    crate::stage::probe_lease(run),
+                    crate::stage::LeaseState::Released,
+                    "a vetoed run is released once its last inheritor exits"
+                );
+                assert!(
+                    scan_stale_stages(&cache).unwrap().contains(run),
+                    "and it is then ownerless debris, not an orphan nobody names"
+                );
+            }
+            other => panic!("one build leaves at most one run: {other:?}"),
+        }
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -4810,13 +4827,30 @@ mod tests {
             "a cancelled build writes no failure log"
         );
         // …and the whole run is removed rather than kept as evidence.
+        // Either the stray died before the creator's cleanup asked, and
+        // the run went with the cancel — or it was still holding the
+        // inherited lease at that moment and vetoed the removal, which
+        // is the feature, not a leak: with the last inheritor now gone
+        // the run is exactly the ownerless debris verify names and
+        // clean removes.
         let leftovers: Vec<PathBuf> = fs::read_dir(cache.join(crate::stage::RUN_NAMESPACE))
             .map(|entries| entries.map(|e| e.unwrap().path()).collect())
             .unwrap_or_default();
-        assert!(
-            leftovers.is_empty(),
-            "a cancelled build leaves no run behind: {leftovers:?}"
-        );
+        match leftovers.as_slice() {
+            [] => {}
+            [run] => {
+                assert_eq!(
+                    crate::stage::probe_lease(run),
+                    crate::stage::LeaseState::Released,
+                    "a vetoed run is released once its last inheritor exits"
+                );
+                assert!(
+                    scan_stale_stages(&cache).unwrap().contains(run),
+                    "and it is then ownerless debris, not an orphan nobody names"
+                );
+            }
+            other => panic!("one build leaves at most one run: {other:?}"),
+        }
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -5731,6 +5765,7 @@ mod tests {
     #[test]
     fn clean_takes_the_lease_and_defers_to_a_reader_inside() {
         use std::os::fd::AsRawFd;
+        let _serial = crate::stage::no_spawned_children();
         let root = std::env::temp_dir().join("cargo-lbin-test-clean-lease");
         let _ = fs::remove_dir_all(&root);
         let cache = root.join("cache");
@@ -5740,8 +5775,8 @@ mod tests {
         let probed = cache
             .join(crate::stage::RUN_NAMESPACE)
             .join("1-00000000000000bb");
-        drop(crate::stage::Lease::acquire(&released).unwrap());
-        drop(crate::stage::Lease::acquire(&probed).unwrap());
+        crate::stage::released_run_fixture(&released);
+        crate::stage::released_run_fixture(&probed);
 
         // The frozen verify probe: a shared lock held across clean.
         let reader = fs::File::open(probed.join(".lease")).unwrap();
@@ -5964,6 +5999,7 @@ mod tests {
 
     #[test]
     fn scan_stale_stages_reports_dead_pids_and_spares_the_living() {
+        let _serial = crate::stage::no_spawned_children();
         let root = std::env::temp_dir().join("cargo-lbin-test-verify-stages");
         let _ = fs::remove_dir_all(&root);
         let cache = root.join("cache");
@@ -6026,7 +6062,7 @@ mod tests {
             fs::create_dir_all(d).unwrap();
         }
         let _holder = crate::stage::Lease::acquire(&held).unwrap();
-        drop(crate::stage::Lease::acquire(&released).unwrap());
+        crate::stage::released_run_fixture(&released);
         let stale = scan_stale_stages(&cache).unwrap();
         assert!(
             !stale.contains(&live),
