@@ -5814,9 +5814,11 @@ mod tests {
         );
 
         drop(reader);
-        clean_cache(&cache, false, true, None).unwrap();
         assert!(
-            !probed.exists(),
+            crate::stage::eventually(std::time::Duration::from_secs(10), || {
+                clean_cache(&cache, false, true, None).unwrap();
+                !probed.exists()
+            }),
             "the pass after the reader leaves finishes the job"
         );
         let _ = fs::remove_dir_all(&root);
@@ -5973,8 +5975,13 @@ mod tests {
             stale.contains(&run),
             "with the last inheritor gone, released convicts"
         );
-        clean_cache(&cache, false, true, None).unwrap();
-        assert!(!run.exists(), "clean takes the lease and finishes the job");
+        assert!(
+            crate::stage::eventually(std::time::Duration::from_secs(10), || {
+                clean_cache(&cache, false, true, None).unwrap();
+                !run.exists()
+            }),
+            "clean takes the lease and finishes the job"
+        );
         let _ = fs::remove_dir_all(&root);
     }
 

@@ -484,6 +484,32 @@ pub(crate) fn released_run_fixture(run_dir: &Path) {
     fs::write(run_dir.join(LEASE_FILE), b"").unwrap();
 }
 
+/// Retry `attempt` until it reports success, or give up at `deadline`.
+///
+/// For assertions of the form "this lock is free now". Close-on-exec
+/// keeps a descriptor out of a child's hands after `exec`, but not
+/// between `fork` and `exec`: for those microseconds the child holds a
+/// copy of every open description in the process, this binary's leases
+/// included, and an exclusive take against one of them is refused. Any
+/// spawn anywhere in the test binary can do it — an owner lookup
+/// shelling out to the distro's package manager is enough — so a test
+/// waits the window out instead of racing it. Production never waits:
+/// it asks once and treats held as held, which is the conservative
+/// answer it wants.
+#[cfg(test)]
+pub(crate) fn eventually(deadline: std::time::Duration, mut attempt: impl FnMut() -> bool) -> bool {
+    let end = std::time::Instant::now() + deadline;
+    loop {
+        if attempt() {
+            return true;
+        }
+        if std::time::Instant::now() >= end {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
 /// The other half of [`FakeCargo`]'s bargain, for tests that hold a
 /// lease and assert it is released.
 ///
@@ -1188,8 +1214,14 @@ mod tests {
         fs::write(run.join("stray-file"), b"y").unwrap();
         std::os::unix::fs::symlink(&outside, run.join("link-out")).unwrap();
 
-        let held = take_lease_for_removal(&run).unwrap();
-        assert!(held.is_some(), "no writer left: the taker owns the run");
+        let mut held = None;
+        assert!(
+            eventually(std::time::Duration::from_secs(10), || {
+                held = take_lease_for_removal(&run).unwrap();
+                held.is_some()
+            }),
+            "no writer left: the taker owns the run"
+        );
         remove_leased_run(&run).unwrap();
         assert!(!run.exists(), "the run is wholly gone, lease included");
         assert!(
@@ -1278,16 +1310,10 @@ mod tests {
         // Bounded, for the same reason as above: the gate keeps other
         // tests' long-lived children out, a passing short-lived one is
         // waited out rather than raced.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        let taken = loop {
-            let taken = take_lease_for_removal(&run).unwrap();
-            if taken.is_some() || std::time::Instant::now() >= deadline {
-                break taken;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        };
         assert!(
-            taken.is_some(),
+            eventually(std::time::Duration::from_secs(10), || {
+                take_lease_for_removal(&run).unwrap().is_some()
+            }),
             "the inheritor's exit is the release; the ordinary ownerless path takes over"
         );
         let _ = fs::remove_dir_all(&root);
@@ -1334,16 +1360,13 @@ mod tests {
         // keeps long-lived children out; this waits out the brief
         // ones. Production never waits like this: it asks once and
         // treats held as held.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        let taken = loop {
-            // SAFETY: as above.
-            let r = unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-            if r == 0 || std::time::Instant::now() >= deadline {
-                break r;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        };
-        assert_eq!(taken, 0, "a dropped lease must become takeable");
+        assert!(
+            eventually(std::time::Duration::from_secs(10), || {
+                // SAFETY: as above.
+                unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0 }
+            }),
+            "a dropped lease must become takeable"
+        );
         let _ = fs::remove_dir_all(&root);
     }
 
