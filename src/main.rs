@@ -327,6 +327,17 @@ fn main() -> ExitCode {
         eprintln!("(set CARGO_LBIN_ALLOW_ROOT=1 only in environments where root is the only user)");
         return ExitCode::from(EXIT_ERROR);
     }
+    // Said once, before any command reads it — and for `--to` where that
+    // second prefix is parsed. A JSON consumer is unaffected: this goes
+    // to stderr, like every other advisory.
+    if let Some(note) = bin_dir_prefix_note(&cli.prefix) {
+        eprintln!("warning: {note}");
+    }
+    if let Cmd::Migrate { ref to, .. } = cli.cmd
+        && let Some(note) = bin_dir_prefix_note(to)
+    {
+        eprintln!("warning: {note}");
+    }
     let result = match cli.cmd {
         Cmd::Install { ref crates, locked } => cmd_install(&cli.prefix, crates, locked),
         Cmd::Remove { ref crates } => cmd_remove(&cli.prefix, crates),
@@ -2188,6 +2199,39 @@ fn late_escalation_note(name: &str, source: &Path) -> String {
          a password may be requested then",
         source.display()
     ))
+}
+
+/// A prefix whose last component is `bin` — almost certainly one
+/// directory too deep.
+///
+/// A prefix is the parent of `bin`, so `--prefix /usr/local/bin` puts
+/// binaries in `/usr/local/bin/bin` and state in
+/// `/usr/local/bin/share`: legal, occasionally even intended, and
+/// usually a slip that only shows up later as a PATH complaint about a
+/// directory nobody meant to create. So it is a warning and never a
+/// refusal — the tool says what it read and what that implies, and the
+/// person decides. `None` when there is nothing to say, so the caller
+/// prints only when there is.
+fn bin_dir_prefix_note(prefix: &Path) -> Option<String> {
+    if prefix.file_name()? != "bin" {
+        return None;
+    }
+    // A bare relative `bin` has an empty parent, and "did you mean ?"
+    // helps nobody: the directory it means is the current one, spelled
+    // the way a shell would take it back.
+    let parent = prefix.parent()?;
+    let parent = if parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        parent
+    };
+    Some(text::sanitize(&format!(
+        "prefix {} ends in `bin`, so binaries go to {} — a prefix is the parent of `bin`; \
+         did you mean {}?",
+        prefix.display(),
+        prefix.join("bin").display(),
+        parent.display()
+    )))
 }
 
 /// The escalation union for operations placing/removing under bin. The
@@ -5423,6 +5467,36 @@ mod tests {
         assert!(!note.contains("will ask"), "{note}");
         let hostile = PathBuf::from("/usr/\x1b[31mlocal");
         assert!(!late_escalation_note("foo", &hostile).contains('\x1b'));
+    }
+
+    /// A prefix is the parent of `bin`, so one ending in `bin` is
+    /// almost certainly a slip — legal, occasionally intended, and
+    /// worth saying once rather than letting it surface later as a PATH
+    /// complaint about `.../bin/bin`.
+    #[test]
+    fn a_prefix_ending_in_bin_is_named_as_probably_one_level_too_deep() {
+        let note = bin_dir_prefix_note(Path::new("/home/u/.local/bin"))
+            .expect("a bin-suffixed prefix is worth a word");
+        assert!(note.contains("/home/u/.local/bin/bin"), "{note}");
+        assert!(note.contains("did you mean /home/u/.local?"), "{note}");
+
+        // A bare relative `bin`: the parent is the current directory,
+        // and it is spelled so rather than left blank.
+        let relative = bin_dir_prefix_note(Path::new("bin")).expect("still worth a word");
+        assert!(relative.contains("binaries go to bin/bin"), "{relative}");
+        assert!(relative.contains("did you mean .?"), "{relative}");
+
+        // Ordinary prefixes say nothing, including ones that merely
+        // contain the word.
+        assert!(bin_dir_prefix_note(Path::new("/usr/local")).is_none());
+        assert!(bin_dir_prefix_note(Path::new("/opt/binutils")).is_none());
+        assert!(bin_dir_prefix_note(Path::new("/")).is_none());
+
+        // Environment-borne, so sanitized like every other external
+        // string that reaches a terminal.
+        let hostile = PathBuf::from("/usr/\x1b[31mlocal/bin");
+        let note = bin_dir_prefix_note(&hostile).unwrap();
+        assert!(!note.contains('\x1b'), "{note}");
     }
 
     #[test]

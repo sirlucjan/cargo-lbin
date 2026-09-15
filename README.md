@@ -830,6 +830,8 @@ information is the additive, optional `also_in` field, omitted when
 empty — schema 1 documents for a single-prefix system are byte-identical
 to pre-0.8 ones.
 
+A prefix is the *parent* of `bin`, so `--prefix /usr/local` places binaries in `/usr/local/bin`. Passing the `bin` directory itself — `--prefix ~/.local/bin`, or `migrate --to ~/.local/bin` — therefore installs into `~/.local/bin/bin`, which is legal and occasionally even intended; `cargo-lbin` says so once, names the directory the binaries would land in and the parent it suspects you meant, and proceeds. A warning, never a refusal.
+
 Custom prefixes must be writable by the invoking user. `cargo-lbin` only permits privilege escalation for the canonical `/usr/local` prefix; it will not use `sudo` to write into an arbitrary custom path.
 
 Build staging and the update-report cache live under:

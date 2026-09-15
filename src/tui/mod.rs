@@ -680,6 +680,17 @@ pub struct App {
 pub fn run(prefix: &Path) -> Result<()> {
     // Fail before raw mode as a plain error, not a garbled screen.
     let mut app = App::new(prefix)?;
+    // The CLI prints this to stderr, which the alternate screen would
+    // wipe before anyone read it; here it belongs in the interface's own
+    // message line. Never over an existing one, though: `App::new`
+    // reloads, and a broken manifest or an unreadable report has more
+    // to say about this session than a prefix the person spelled a
+    // moment ago — the degraded notice outranks this one.
+    if app.message.is_none()
+        && let Some(note) = crate::bin_dir_prefix_note(prefix)
+    {
+        app.warn(&note);
+    }
     // `try_init` over `init`: a refused terminal is a normal error, and
     // its staged failure restores whatever did succeed.
     let mut terminal = match ratatui::try_init() {
@@ -3640,6 +3651,53 @@ mod tests {
         app.job = None;
         app.pick_downgrade(0);
         assert!(app.pending_build.is_some(), "the offer still answers later");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A prefix spelled one level too deep is worth a word, but never
+    /// over a word that matters more: a manifest the loader refused is
+    /// what this session is actually about.
+    #[test]
+    fn the_prefix_note_never_overwrites_a_startup_message() {
+        let root = std::env::temp_dir().join("cargo-lbin-test-tui-prefix-note");
+        let _ = std::fs::remove_dir_all(&root);
+        let prefix = root.join("bin");
+        std::fs::create_dir_all(prefix.join("bin")).unwrap();
+        std::fs::create_dir_all(prefix.join("share/cargo-lbin")).unwrap();
+
+        // A clean start: the note lands, because nothing else claimed
+        // the line.
+        let mut app = App::new(&prefix).unwrap();
+        assert!(app.message.is_none(), "a clean reload says nothing");
+        if let Some(note) = crate::bin_dir_prefix_note(&prefix) {
+            app.warn(&note);
+        }
+        assert!(
+            app.message
+                .as_ref()
+                .is_some_and(|m| m.text.contains("ends in `bin`")),
+            "{:?}",
+            app.message.as_ref().map(|m| m.text.clone())
+        );
+
+        // A manifest the validated loader refuses: that message stays.
+        std::fs::write(prefix.join("share/cargo-lbin/manifest.json"), "{ not json").unwrap();
+        let mut app = App::new(&prefix).unwrap();
+        let degraded = app
+            .message
+            .as_ref()
+            .map(|m| m.text.clone())
+            .expect("a broken manifest reports itself");
+        if app.message.is_none()
+            && let Some(note) = crate::bin_dir_prefix_note(&prefix)
+        {
+            app.warn(&note);
+        }
+        assert_eq!(
+            app.message.as_ref().map(|m| m.text.clone()),
+            Some(degraded),
+            "the degraded notice outranks a spelling remark"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
