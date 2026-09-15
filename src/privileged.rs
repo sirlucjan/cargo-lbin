@@ -167,13 +167,17 @@ pub fn needs_privilege(dir: &Path) -> bool {
     !dir_writable(dir)
 }
 
-/// Validate sudo credentials *before* a long operation, so the prompt
-/// lands at a predictable moment; sudo may still re-ask later — its
-/// call, deliberately not worked around. `sudo -n -v` asks whether the
-/// timestamp is fresh (the question is the timestamp, not any
-/// command); only when sudo would prompt is the reason announced, and
-/// `sudo -v` then owns the prompt — cargo-lbin never reads, buffers or
-/// forwards the password, a design rule. Preauthorization is UX, not
+/// Is sudo's credential timestamp warm right now?
+///
+/// Asked where a password is about to be spent — the placement door —
+/// and not before a long build, so a build that fails costs no
+/// password and one that succeeds is not compiled under a warm
+/// timestamp this tool established. `sudo -n -v` asks about the
+/// timestamp itself, not any command; only when sudo would prompt is
+/// the reason announced, and `sudo -v` then owns the prompt —
+/// cargo-lbin never reads, buffers or forwards the password, a design
+/// rule. Sudo may still re-ask at the privileged calls themselves: its
+/// policy, deliberately not worked around. Preauthorization is UX, not
 /// proof: the later calls authorize on their own terms.
 pub fn credentials_fresh() -> Result<bool> {
     Ok(Command::new(SUDO)

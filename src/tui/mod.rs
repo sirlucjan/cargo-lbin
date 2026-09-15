@@ -554,9 +554,10 @@ const SEARCH_HITS: usize = 6;
 ///
 /// Three answers, and each is a policy: a cancelled build refuses
 /// rather than asking for a password it no longer needs; fresh
-/// credentials pass silently, which is the common case after the
-/// preflight; otherwise the interface is asked to collect them and the
-/// worker waits for its verdict. A denial that answers a cancel *is*
+/// credentials pass silently, which is the common case when sudo's
+/// timestamp is still warm from earlier work; otherwise the interface
+/// is asked to collect them — this is where a placement's password is
+/// normally collected — and the worker waits for its verdict. A denial that answers a cancel *is*
 /// the cancel — a refusal keeps its own name only when it is one.
 fn auth_gate(
     control: &crate::BuildControl,
@@ -1072,10 +1073,11 @@ impl App {
     /// workflow maps the outcomes to what it can offer.
     fn preflight_escalation(terminal: &mut DefaultTerminal, prefix: &Path) -> Result<Preflight> {
         let policy = crate::privileged::Policy::for_prefix(prefix);
-        // The pipeline's union (bin + state) plus the lock file — the
-        // worker's first privileged touch: a migration into /usr/local may
-        // prepare the first lock ever there, ahead of any NeedAuth, and a
-        // cold sudo must be asked, not fail `sudo -n`.
+        // The pipeline's union (bin + state) plus the lock file. Only one
+        // of those genuinely cannot wait: preparing the first lock ever
+        // in this prefix is the worker's first privileged touch and
+        // happens ahead of any NeedAuth, so a cold sudo must be asked
+        // here rather than fail `sudo -n` with nobody to prompt.
         let escalate = match crate::placement_needs_privilege(policy, prefix) {
             Ok(escalate) => escalate,
             Err(e) => {
@@ -1083,6 +1085,17 @@ impl App {
             }
         };
         if !escalate {
+            return Ok(Preflight::Ready);
+        }
+        // Everything else waits for the placement door, where the
+        // credentials are actually spent: a build that fails should not
+        // have cost a password, and one that succeeds should not have
+        // held a warm timestamp for its whole length. The worker's
+        // `sudo -n` has a door of its own — NeedAuth suspends the screen
+        // and asks — so deferring costs nothing except on a sudo that
+        // refuses to cache at all, where the refusal now arrives after
+        // the build instead of before it.
+        if !StateLock::preparation_needs_privilege(prefix) {
             return Ok(Preflight::Ready);
         }
         let fresh = match crate::privileged::credentials_fresh() {
@@ -1149,8 +1162,8 @@ impl App {
     }
 
     /// A captured install. The run loop calls this because only it owns
-    /// the terminal: a stale credential prompt happens here, up front —
-    /// never inside the alternate screen.
+    /// the terminal: whatever the preflight still has to ask happens
+    /// here, on a suspended screen — never inside the alternate one.
     fn start_build(&mut self, terminal: &mut DefaultTerminal, req: &PendingBuild) -> Result<()> {
         let (raw_spec, locked) = (req.spec.as_str(), req.locked);
         let spec = match InstallSpec::parse_all(std::slice::from_ref(&raw_spec.to_owned())) {
@@ -1255,10 +1268,10 @@ impl App {
     ///
     /// Both halves matter. The source must need privilege — otherwise
     /// nothing is escalated at all — and the destination must not,
-    /// because when it does the preflight has already authenticated and
-    /// anything later is sudo's timestamp lapsing. A probe that cannot
-    /// answer says no: a missing heads-up is a smaller wrong than a
-    /// false one.
+    /// because a destination that escalates asks at its own placement
+    /// door, which comes first and leaves a warm timestamp behind. A
+    /// probe that cannot answer says no: a missing heads-up is a
+    /// smaller wrong than a false one.
     fn migration_escalates_late(&self, dest: &Path) -> bool {
         let needs = |p: &Path| {
             crate::placement_needs_privilege(crate::privileged::Policy::for_prefix(p), p)
@@ -3701,6 +3714,42 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// The preflight asks only for what cannot wait. Preparing this
+    /// prefix's first lock is the worker's first privileged touch and
+    /// happens before any `NeedAuth` exists, so it is asked up front;
+    /// everything else is collected at the placement door, after the
+    /// build.
+    #[test]
+    fn the_preflight_asks_only_where_the_placement_door_cannot() {
+        let root = std::env::temp_dir().join("cargo-lbin-test-tui-preflight-scope");
+        let _ = std::fs::remove_dir_all(&root);
+        let prefix = root.join("prefix");
+        std::fs::create_dir_all(prefix.join("bin")).unwrap();
+        std::fs::create_dir_all(prefix.join("share/cargo-lbin")).unwrap();
+
+        // A writable prefix escalates for nothing at all.
+        assert!(
+            !crate::placement_needs_privilege(
+                crate::privileged::Policy::for_prefix(&prefix),
+                &prefix
+            )
+            .unwrap(),
+            "a user-writable prefix needs no password anywhere"
+        );
+
+        // And its lock prepares without privilege — which is the
+        // question the preflight now asks before deciding to prompt.
+        assert!(
+            !StateLock::preparation_needs_privilege(&prefix),
+            "a lock this user can make is not a reason to ask up front"
+        );
+        // Made once, the file stays world-readable, so the answer holds
+        // for every later run in this prefix.
+        assert!(prefix.join("share/cargo-lbin/lock").exists());
+        assert!(!StateLock::preparation_needs_privilege(&prefix));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// The heads-up is made only where it can be kept: the source needs
     /// privilege and the destination did not. It promises the
     /// escalation, never the prompt — whether sudo asks depends on its
@@ -3736,7 +3785,7 @@ mod tests {
             "announced exactly when the source escalates"
         );
 
-        // Destination privileged too: the preflight asks up front, so
+        // Destination privileged too: it asks at its own door first, so
         // the heads-up would be about a lapse nobody can predict.
         assert!(
             !app.migration_escalates_late(Path::new("/usr/local")),

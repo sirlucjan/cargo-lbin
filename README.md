@@ -689,7 +689,7 @@ whose count sits in the header at all times, and the footer says how many
 pinned crates are behind. The same split shapes the `r` result line:
 `checked: 1 update(s) available; 1 pinned held back`.
 
-A single-crate install builds in place, inside its own transient Build panel, with `sudo` credentials validated up front, and a removal or a pin flip runs in place too when it needs no password; when credentials lapse during a long build the interface steps aside and asks again; a migration out of a privileged prefix into a writable one escalates only after the build — the privileged half is retiring the source — and says so before the build starts, so a prompt arriving then is expected rather than startling (whether `sudo` asks at all depends on its own timestamp, so the notice promises the escalation, not the prompt); the CLI says the same before each crate's build; batch installs, `update` and — when that operation needs `sudo` — `remove` and `pin`/`unpin` temporarily hand the real terminal back to the normal CLI, where Cargo diagnostics, the update confirmation and password prompts behave exactly as they do outside the TUI, and the interface returns afterwards.
+A single-crate install builds in place, inside its own transient Build panel, and a removal or a pin flip runs in place too when it needs no password; `sudo` is asked for at placement rather than before the build, and the interface steps aside for that prompt; a migration out of a privileged prefix into a writable one escalates only after the build — the privileged half is retiring the source — and says so before the build starts, so a prompt arriving then is expected rather than startling (whether `sudo` asks at all depends on its own timestamp, so the notice promises the escalation, not the prompt); the CLI says the same before each crate's build; batch installs, `update` and — when that operation needs `sudo` — `remove` and `pin`/`unpin` temporarily hand the real terminal back to the normal CLI, where Cargo diagnostics, the update confirmation and password prompts behave exactly as they do outside the TUI, and the interface returns afterwards.
 
 `D` offers the older versions in the panel: a cancellable lookup, then a numbered list — the same choice `cargo lbin downgrade` makes, so a browser of the whole history it is not — and a digit installs one. The list stops at nine because a digit names one entry; anything older is announced with a pointer to `install NAME@VERSION`. The build that follows is an ordinary in-panel install of an exact version: `c` cancels it, its warnings land in the panel, and the version is pinned for the same reason the command pins. The offer is computed against the version the row shows, so if the crate moves or disappears while the list is open, the digit starts nothing and says why.
 
@@ -875,13 +875,21 @@ It does **not** sandbox Cargo. Installing a crate means trusting code that Cargo
 
 Crates are built first, as the invoking user, in an isolated staging root. Only placement into a protected `/usr/local` destination may trigger `sudo`.
 
-When placement will need `sudo`, credentials are validated up front —
-`sudo -n -v` checks the credential timestamp silently, and only when sudo
-would prompt does `cargo-lbin` announce why and run `sudo -v` on the
-terminal — so the initial password prompt comes before a multi-minute
-build rather than ambushing an unattended terminal after it. sudo may
-still ask again if its credential timestamp expires in the meantime; that
-is sudo's policy to enforce, not `cargo-lbin`'s to work around.
+Credentials are collected where they are spent: at the placement door,
+after the build. A build is unprivileged work, so paying for it in
+advance would mean paying for builds that fail — and holding a warm
+credential for the whole length of every build that does not. `sudo -n
+-v` checks the timestamp silently there, and only when sudo would
+prompt does `cargo-lbin` announce why and run `sudo -v`. The TUI steps
+off its screen for that prompt; the CLI asks in place.
+
+One thing cannot wait: preparing a prefix's lock file the first time
+anything is installed there. That is the first privileged touch and it
+happens before the build, so a cold sudo is asked then — once per
+prefix, since the lock file is world-readable once made. On a sudo
+configured not to cache credentials at all, the refusal now arrives
+after the build instead of before it; that is the cost of not holding
+a password across work that does not need one.
 `cargo-lbin` never reads, buffers or forwards the password itself: the
 prompt, echo, retries, PAM and the credential cache are `sudo`'s business
 alone. This is a design rule, not an implementation detail — a password

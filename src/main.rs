@@ -789,13 +789,6 @@ impl Frontend<'_> {
         }
     }
 
-    /// Whether the pipeline's own preauthorize should run: a captured
-    /// frontend already validated and re-checks at the checkpoint, so a
-    /// prompt from inside would be exactly the hidden one to prevent.
-    fn wants_preauthorize(&self) -> bool {
-        matches!(self, Frontend::Terminal | Frontend::Checkpointed { .. })
-    }
-
     /// The cancel door, crossed unconditionally right before the first
     /// write needing rollback — distinct from `before_placement` (sudo
     /// only), so "too late" means the same at every prefix. Deliberately
@@ -825,15 +818,21 @@ impl Frontend<'_> {
         }
     }
 
-    /// The placement checkpoint: no-op on the terminal, the captured
-    /// frontend's sudo re-validation — a build can outlive the credential
-    /// timestamp. Called only when placement will escalate.
-    // `prefix` is consumed only by the tui arm; the parameter is the
-    // contract either way.
-    #[cfg_attr(not(feature = "tui"), allow(unused_variables))]
+    /// The placement checkpoint: make sure the credentials placement
+    /// needs exist *now*, whatever "now" costs to find out.
+    ///
+    /// This is where the password is collected, not before the build.
+    /// A terminal frontend prompts through `preauthorize`; a captured
+    /// one hands the request to the interface, which suspends the
+    /// screen and asks. Called only when placement will escalate, and
+    /// re-probed here rather than trusted from before the build — the
+    /// privileged sites re-check writability, and a build can outlive a
+    /// credential timestamp.
     fn before_placement(&mut self, prefix: &Path) -> Result<()> {
         match self {
-            Frontend::Terminal | Frontend::Checkpointed { .. } => Ok(()),
+            Frontend::Terminal | Frontend::Checkpointed { .. } => {
+                privileged::preauthorize(prefix, true, privileged::AuthPurpose::Placement)
+            }
             #[cfg(feature = "tui")]
             Frontend::Captured {
                 before_placement, ..
@@ -842,6 +841,21 @@ impl Frontend<'_> {
             Frontend::Never(_) => unreachable!(),
         }
     }
+}
+
+/// The placement door: collect the credentials placement will spend,
+/// then cross the cancel door — in that order, and only now.
+///
+/// This is the whole of "late authorization": the build is behind us,
+/// nothing privileged has happened yet, and the password (if one is
+/// wanted at all) is asked for here. A refusal returns before the
+/// first write, so the prefix and the manifest are untouched; the
+/// caller adds the words for that.
+fn authorize_placement(escalates: bool, prefix: &Path, frontend: &mut Frontend<'_>) -> Result<()> {
+    if escalates {
+        frontend.before_placement(prefix)?;
+    }
+    frontend.placement_begins()
 }
 
 /// When the shadow scan speaks for an install.
@@ -897,13 +911,12 @@ fn install_and_commit(
         #[cfg(not(feature = "tui"))]
         Frontend::Never(_) => unreachable!(),
     };
-    // UX-only early form of the policy check: fail (and prompt) before a
-    // multi-minute build, not after; enforcement proper lives at every
-    // privileged call site.
-    let initial_escalate = install_needs_privilege(policy, prefix)?;
-    if frontend.wants_preauthorize() {
-        privileged::preauthorize(prefix, initial_escalate, privileged::AuthPurpose::Placement)?;
-    }
+    // Read-only, and early on purpose: a prefix this policy may not
+    // write is named before minutes are spent building for it. No
+    // password is collected here — that happens at the placement door,
+    // after the build. Enforcement proper lives at every privileged
+    // call site.
+    install_needs_privilege(policy, prefix)?;
     // Per-run stage: the state lock serializes per *prefix*, so two runs
     // on different prefixes may build the same crate — one wiping the
     // other's stage must be structurally impossible. The nonce makes it
@@ -979,11 +992,16 @@ fn install_and_commit(
     // stage is evidence of nothing; every other refusal keeps its stage
     // like any pipeline failure.
     let checkpoints = (|| -> Result<()> {
-        if install_needs_privilege(policy, prefix)? {
-            frontend.before_placement(prefix)?;
-        }
-        frontend.placement_begins()
+        let escalates = install_needs_privilege(policy, prefix)?;
+        authorize_placement(escalates, prefix, frontend)
     })();
+    // A refusal here lands after cargo has said "Installed package" about
+    // the *stage*, so the answer says which of the two happened: the
+    // build did, the placement did not.
+    let checkpoints = checkpoints.context(
+        "the build finished, but placement did not begin: no files were placed and the \
+         manifest is unchanged",
+    );
     #[cfg(feature = "tui")]
     if let Err(e) = checkpoints {
         if e.downcast_ref::<BuildCancelled>().is_some() {
@@ -6641,6 +6659,151 @@ mod tests {
             outside.join("keep").exists() && outside.join(".lease").exists(),
             "zero traversal: the link's target is untouched by the scan"
         );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The door itself: with escalation needed, credentials are asked
+    /// for *before* the cancel door and before any write, and a refusal
+    /// stops there.
+    ///
+    /// Tested here rather than through `install_and_commit`, because
+    /// escalation cannot be provoked portably: these tests run as
+    /// whatever user CI provides, and a user who can write the prefix
+    /// never reaches the door at all. What the pipeline contributes is
+    /// the door's *position* — after the build, before the first write
+    /// — which is the call site's single line.
+    #[cfg(feature = "tui")]
+    #[test]
+    fn the_placement_door_asks_first_and_a_refusal_stops_there() {
+        let seen = std::cell::RefCell::new(Vec::new());
+        // One control per scenario: `placement_begins` is a one-way door
+        // and a second crossing is refused by design.
+        let control = BuildControl::new();
+        let prefix = Path::new("/usr/local");
+
+        // Escalation needed, credentials granted: the door is knocked
+        // on, and only then is the cancel door crossed.
+        let mut frontend = Frontend::Captured {
+            on_line: &mut |_, _| {},
+            before_placement: &mut |p: &Path| {
+                seen.borrow_mut().push(format!("auth:{}", p.display()));
+                Ok(())
+            },
+            control: &control,
+            checkpoint: Some(&mut || {
+                seen.borrow_mut().push("checkpoint".to_owned());
+                Ok(())
+            }),
+        };
+        authorize_placement(true, prefix, &mut frontend).unwrap();
+        assert_eq!(
+            seen.borrow().as_slice(),
+            ["auth:/usr/local".to_owned(), "checkpoint".to_owned()],
+            "the password comes first, the cancel door second"
+        );
+
+        // A prefix that escalates for nothing is never asked.
+        seen.borrow_mut().clear();
+        let fresh = BuildControl::new();
+        let mut frontend = Frontend::Captured {
+            on_line: &mut |_, _| {},
+            before_placement: &mut |p: &Path| {
+                seen.borrow_mut().push(format!("auth:{}", p.display()));
+                Ok(())
+            },
+            control: &fresh,
+            checkpoint: Some(&mut || {
+                seen.borrow_mut().push("checkpoint".to_owned());
+                Ok(())
+            }),
+        };
+        authorize_placement(false, prefix, &mut frontend).unwrap();
+        assert_eq!(
+            seen.borrow().as_slice(),
+            ["checkpoint".to_owned()],
+            "no escalation, no credentials"
+        );
+
+        // A denied password stops the operation at the door: the cancel
+        // door is never crossed, so nothing downstream can begin.
+        seen.borrow_mut().clear();
+        let third = BuildControl::new();
+        let mut refusing = Frontend::Captured {
+            on_line: &mut |_, _| {},
+            before_placement: &mut |_| bail!("sudo authentication failed"),
+            control: &third,
+            checkpoint: Some(&mut || {
+                seen.borrow_mut().push("checkpoint".to_owned());
+                Ok(())
+            }),
+        };
+        let err = authorize_placement(true, prefix, &mut refusing)
+            .expect_err("a denied password is a refusal");
+        assert!(
+            format!("{err:#}").contains("sudo authentication failed"),
+            "{err:#}"
+        );
+        assert!(
+            seen.borrow().is_empty(),
+            "a refusal at the door reaches nothing past it: {:?}",
+            seen.borrow()
+        );
+    }
+
+    /// A refusal after the build says which half happened. Cargo has
+    /// already announced an install — of the *stage* — so an error that
+    /// only said "sudo authentication failed" would leave the person
+    /// guessing whether files landed.
+    #[cfg(feature = "tui")]
+    #[test]
+    fn a_refusal_after_the_build_says_what_was_and_was_not_done() {
+        let root = std::env::temp_dir().join("cargo-lbin-test-late-auth-refused");
+        let _ = fs::remove_dir_all(&root);
+        let prefix = root.join("prefix");
+        fs::create_dir_all(prefix.join("bin")).unwrap();
+        fs::create_dir_all(prefix.join("share/cargo-lbin")).unwrap();
+        let _fake = crate::stage::FakeCargo::install(&staging_fake(&root, "okcrate"));
+
+        let control = BuildControl::new();
+        let mut manifest = Manifest::default();
+        let err = install_and_commit(
+            &prefix,
+            &root.join("cache"),
+            &mut manifest,
+            "okcrate",
+            None,
+            false,
+            PinPolicy::Infer,
+            ShadowReport::OnCommit,
+            &mut Frontend::Captured {
+                on_line: &mut |_, _| {},
+                before_placement: &mut |_| Ok(()),
+                control: &control,
+                // Stands in for the door refusing on a prefix this user
+                // can write: what matters here is the wording of a
+                // refusal that lands after a finished build.
+                checkpoint: Some(&mut || bail!("sudo authentication failed")),
+            },
+        )
+        .expect_err("a refusal is a refusal");
+        let text = format!("{err:#}");
+        assert!(text.contains("the build finished"), "{text}");
+        assert!(text.contains("placement did not begin"), "{text}");
+        assert!(text.contains("manifest is unchanged"), "{text}");
+        assert!(text.contains("sudo authentication failed"), "{text}");
+        assert!(
+            !manifest.crates.contains_key("okcrate")
+                && Manifest::load(&prefix).unwrap().crates.is_empty(),
+            "nothing is recorded that did not happen"
+        );
+        assert!(
+            !prefix.join("bin/okcrate").exists(),
+            "and nothing is placed"
+        );
+        let runs: Vec<PathBuf> = fs::read_dir(root.join("cache").join(crate::stage::RUN_NAMESPACE))
+            .map(|e| e.map(|e| e.unwrap().path()).collect())
+            .unwrap_or_default();
+        assert_eq!(runs.len(), 1, "the stage is kept as forensics: {runs:?}");
         let _ = fs::remove_dir_all(&root);
     }
 

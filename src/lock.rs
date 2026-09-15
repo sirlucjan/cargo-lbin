@@ -96,6 +96,15 @@ impl StateLock {
     /// captured frontend passes noninteractive, so sudo runs `-n`), and
     /// `notice` is where the human lines go — stderr, the frontend's
     /// stream, or nowhere for an advisory read.
+    ///
+    /// This is the one escalation that cannot wait for the placement
+    /// door, where every other password is collected: under a
+    /// privileged prefix the lock file must exist before the lock can
+    /// be taken, and the lock is taken before the build. It is a
+    /// once-per-prefix cost — [`Self::preparation_needs_privilege`]
+    /// answers false ever after, because the file is made
+    /// world-readable — and the captured frontend's preflight asks that
+    /// question before deciding to prompt at all.
     pub fn acquire_with(
         prefix: &Path,
         mode: &Mode,
