@@ -97,7 +97,7 @@ cargo lbin tui
 | `remove <crate>...` | Remove managed crates and their binaries |
 | `pin <crate>...` / `unpin <crate>...` | Pin crates to their installed version / release the pin |
 | `pinned [--check] [--json]` | List pinned crates and whether newer versions exist |
-| `downgrade <crate>` | Pick an older version from crates.io, install it and pin it |
+| `downgrade <crate>` | Pick an older version from crates.io, install it and pin it (in the TUI: `D`) |
 | `list [--json]` | List managed crates, using the last update report for annotations |
 | `checkupdate [--json]` | Query crates.io for updates and save a full local report |
 | `update <crate>... [--yes]` | Update explicitly selected managed crates; `--yes` skips confirmation |
@@ -662,13 +662,13 @@ Installing a crate another prefix already manages emits the same warning the CLI
 | `m` | Migrate the selected crate to the other prefix (asks first; known pair only) |
 | `M` | Migrate every crate to the other prefix (asks first; `c` cancels the batch) |
 | `B` | Jump to the other prefix of the known pair; the selection follows the crate |
-| `c` | Cancel the running operation: for a build, a second `c` sends SIGKILL; for `r`/`v`/`s`, a cancel request — the update check stops between requests, a verify/search result is discarded on arrival |
+| `c` | Cancel the running operation: for a build, a second `c` sends SIGKILL; for `r`/`v`/`s` and `D`'s version lookup, a cancel request — the update check stops between requests, a verify, search or lookup result is discarded on arrival |
 | `p` | Pin or unpin the selected crate; in place unless pinning needs `sudo` |
-| `D` | Downgrade the selected crate; the version prompt appears in the terminal |
+| `D` | Downgrade the selected crate: the panel offers the older versions, a digit installs one |
 | `v` | Verify the prefix; findings open in the report panel |
 | `r` | Run `checkupdate` and refresh the saved report |
 | `s` | Search crates.io by keyword |
-| `1`..`9` | With search results open, pick a visible hit into the install line |
+| `1`..`9` | With search results open, pick a visible hit into the install line; with a downgrade offer open, install that version |
 | `?` | Show help |
 | `q`, `Esc` | Quit from the package list; `Esc` also dismisses transient views/input |
 | `Ctrl-C` | Quit; with a build running, cancel it first and leave once it stops |
@@ -685,7 +685,9 @@ whose count sits in the header at all times, and the footer says how many
 pinned crates are behind. The same split shapes the `r` result line:
 `checked: 1 update(s) available; 1 pinned held back`.
 
-A single-crate install builds in place, inside its own transient Build panel, with `sudo` credentials validated up front, and a removal or a pin flip runs in place too when it needs no password; batch installs, `update`, `downgrade` and — when that operation needs `sudo` — `remove` and `pin`/`unpin` temporarily hand the real terminal back to the normal CLI, where Cargo diagnostics, the update confirmation and password prompts behave exactly as they do outside the TUI, and the interface returns afterwards.
+A single-crate install builds in place, inside its own transient Build panel, with `sudo` credentials validated up front, and a removal or a pin flip runs in place too when it needs no password; batch installs, `update` and — when that operation needs `sudo` — `remove` and `pin`/`unpin` temporarily hand the real terminal back to the normal CLI, where Cargo diagnostics, the update confirmation and password prompts behave exactly as they do outside the TUI, and the interface returns afterwards.
+
+`D` offers the older versions in the panel: a cancellable lookup, then a numbered list — the same choice `cargo lbin downgrade` makes, so a browser of the whole history it is not — and a digit installs one. The list stops at nine because a digit names one entry; anything older is announced with a pointer to `install NAME@VERSION`. The build that follows is an ordinary in-panel install of an exact version: `c` cancels it, its warnings land in the panel, and the version is pinned for the same reason the command pins. The offer is computed against the version the row shows, so if the crate moves or disappears while the list is open, the digit starts nothing and says why.
 
 An in-place build can be cancelled: `c` sends SIGTERM to cargo's whole
 process group — every rustc and build script included — and a second `c`
@@ -695,9 +697,9 @@ member holding the build's output pipe can wedge the worker inside a
 read — a partial line with no newline is enough — so the interface does
 not depend on the worker to finish the job.
 
-The one-shot jobs (`r`, `v`, `s`) have their own, simpler door: `c`
+The one-shot jobs (`r`, `v`, `s`, and `D`'s version lookup) have their own, simpler door: `c`
 requests cancellation — the update check stops between index requests,
-a verify or search runs to completion and its result is discarded on
+a verify, search or version lookup runs to completion and its result is discarded on
 arrival — and the same door works in the degraded state, where `v` is
 the natural first move.
 

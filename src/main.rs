@@ -2280,6 +2280,71 @@ pub(crate) fn tui_migrate_one(
     )
 }
 
+/// `downgrade` for the captured frontend: the authoritative check and
+/// the build, under one exclusive lock.
+///
+/// The version was chosen against what the interface displayed, and a
+/// list on screen is a snapshot — between the offer and the keypress
+/// another process can update the crate, remove it, or flip its
+/// `--locked`. Re-reading the rows would only refresh the same
+/// snapshot, so the statement that matters is made here, holding the
+/// lock the mutation itself holds: the manifest must still say
+/// `expected`, or nothing is built. Otherwise a command called
+/// downgrade could upgrade (current moved below the choice) or
+/// resurrect a crate somebody just removed — the two cases
+/// `cmd_downgrade` guards against for exactly this reason. `locked`
+/// comes from that same fresh read, never from the row.
+#[cfg(feature = "tui")]
+pub(crate) fn tui_downgrade_one(
+    prefix: &Path,
+    name: &str,
+    expected: &str,
+    version: &Version,
+    on_line: &mut dyn FnMut(LineKind, &str),
+    before_placement: &mut dyn FnMut(&Path) -> Result<()>,
+    control: &BuildControl,
+) -> Result<()> {
+    let cache = cache_dir()?;
+    let _lock = StateLock::acquire_with(
+        prefix,
+        &Mode::Exclusive,
+        privileged::Policy::for_prefix(prefix).screen_owned(),
+        &mut |s| on_line(LineKind::Notice, s),
+    )?;
+    let mut manifest = Manifest::load(prefix)?;
+    let fresh = manifest.crates.get(name).with_context(|| {
+        format!("`{name}` was removed while a version was being chosen; press D again")
+    })?;
+    if fresh.version != expected {
+        bail!(
+            "`{name}` changed from {expected} to {} while a version was being chosen; \
+             press D again",
+            fresh.version
+        );
+    }
+    let locked = fresh.locked;
+    let mut frontend = Frontend::Captured {
+        on_line,
+        before_placement,
+        control,
+        checkpoint: None,
+    };
+    // A pinned crate is downgraded like any other: the pin is a
+    // standing instruction, and an exact version is how it is restated
+    // — which is precisely what the keypress supplied.
+    install_and_commit(
+        prefix,
+        &cache,
+        &mut manifest,
+        name,
+        Some(version),
+        locked,
+        PinPolicy::Infer,
+        &mut frontend,
+    )?;
+    Ok(())
+}
+
 /// One crate for the TUI, end to end: same locking, pin refusal and
 /// pipeline as `cmd_install`; the exclusive lock spans build and
 /// placement — serialization per prefix is a documented invariant.
@@ -6106,6 +6171,96 @@ mod tests {
             outside.join("keep").exists() && outside.join(".lease").exists(),
             "zero traversal: the link's target is untouched by the scan"
         );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The statement `downgrade` makes is checked where it can be true:
+    /// under the same exclusive lock as the mutation. The rows the
+    /// person chose from are a snapshot, so a crate moved or removed in
+    /// between must stop the build — otherwise a command called
+    /// downgrade could upgrade, or resurrect what somebody just
+    /// removed.
+    #[cfg(feature = "tui")]
+    #[test]
+    fn a_tui_downgrade_refuses_a_premise_the_manifest_no_longer_holds() {
+        let root = std::env::temp_dir().join("cargo-lbin-test-tui-downgrade-premise");
+        let _ = fs::remove_dir_all(&root);
+        let prefix = seeded_prefix(&root, "prefix", "okcrate", false, false);
+        let _fake = crate::stage::FakeCargo::install(&versioned_fake(&root, "okcrate"));
+        let target = Version::parse("0.0.9").unwrap();
+        let control = BuildControl::new();
+
+        // The manifest says 0.1.0; a choice made against 0.3.0 is a
+        // choice about a world that is not there.
+        let err = tui_downgrade_one(
+            &prefix,
+            "okcrate",
+            "0.3.0",
+            &target,
+            &mut |_, _| {},
+            &mut |_| Ok(()),
+            &control,
+        )
+        .expect_err("a stale premise builds nothing");
+        assert!(format!("{err:#}").contains("changed from"), "{err:#}");
+        assert_eq!(
+            Manifest::load(&prefix).unwrap().crates["okcrate"].version,
+            "0.1.0",
+            "and the prefix is untouched"
+        );
+
+        // A crate removed while the list sat open is the same answer.
+        let gone = seeded_prefix(&root, "empty", "okcrate", false, false);
+        {
+            let mut m = Manifest::load(&gone).unwrap();
+            m.crates.remove("okcrate");
+            m.store(&gone).unwrap();
+        }
+        let err = tui_downgrade_one(
+            &gone,
+            "okcrate",
+            "0.1.0",
+            &target,
+            &mut |_, _| {},
+            &mut |_| Ok(()),
+            &control,
+        )
+        .expect_err("a removed crate is not resurrected");
+        assert!(format!("{err:#}").contains("was removed"), "{err:#}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A pinned crate downgrades and stays pinned: the pin is restated
+    /// at the chosen version, which is what `install NAME@VERSION` does
+    /// and why this path reuses it. `locked` comes from the fresh read,
+    /// not from the row the person was looking at.
+    #[cfg(feature = "tui")]
+    #[test]
+    fn a_tui_downgrade_repins_at_the_chosen_version() {
+        let root = std::env::temp_dir().join("cargo-lbin-test-tui-downgrade-pin");
+        let _ = fs::remove_dir_all(&root);
+        let prefix = seeded_prefix(&root, "prefix", "okcrate", true, true);
+        let _fake = crate::stage::FakeCargo::install(&versioned_fake(&root, "okcrate"));
+        let target = Version::parse("0.0.9").unwrap();
+        let control = BuildControl::new();
+
+        tui_downgrade_one(
+            &prefix,
+            "okcrate",
+            "0.1.0",
+            &target,
+            &mut |_, _| {},
+            &mut |_| Ok(()),
+            &control,
+        )
+        .unwrap();
+        let entry = Manifest::load(&prefix).unwrap().crates["okcrate"].clone();
+        assert_eq!(entry.version, "0.0.9", "the chosen version landed");
+        assert!(
+            entry.pinned,
+            "a pinned crate stays pinned, at the new version"
+        );
+        assert!(entry.locked, "and its --locked setting is carried over");
         let _ = fs::remove_dir_all(&root);
     }
 

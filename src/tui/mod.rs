@@ -6,15 +6,16 @@
 //! refresh or network access on start.
 //!
 //! Two ways of running a command. Some take over the real terminal
-//! (`u`/`U` updates, multi-crate installs, `downgrade`): the TUI steps
+//! (`u`/`U` updates, multi-crate installs, and a downgrade only where
+//! captured placement cannot run): the TUI steps
 //! aside, runs the command as the CLI would, waits for Enter, and comes
 //! back. Others run in place: a single-crate install or migrate builds
 //! behind the framed panel with its cancel door and sudo roundtrip, and
 //! a removal or pin flip that needs no escalation never leaves the
 //! screen. The `Terminal` is created once and kept across handoffs —
 //! `ratatui::try_init()` stacks a panic hook per call. `checkupdate`,
-//! `search` and `v` run on a one-shot thread while the list stays
-//! navigable.
+//! `search`, `v` and the version lookup behind `D` run on a one-shot
+//! thread while the list stays navigable.
 //!
 //! A manifest the validated loader refuses does not keep the TUI out:
 //! the session starts degraded — empty list, mutating actions refused,
@@ -197,6 +198,11 @@ enum OnConfirm {
 #[derive(Clone)]
 enum PendingAction {
     Update(String),
+    /// `downgrade`: only as the fallback when captured placement cannot
+    /// run (sudo caches nothing here). The command asks for a version
+    /// again, which is the price of the handover — and it keeps the
+    /// premise check the panel path makes under its own lock.
+    Downgrade(String),
     UpdateAll,
     Install {
         crates: Vec<String>,
@@ -208,8 +214,6 @@ enum PendingAction {
         name: String,
         pinned: bool,
     },
-    /// `downgrade`: the version prompt appears in the terminal.
-    Downgrade(String),
 }
 
 /// The render boundary in one function: every pipeline line becomes a
@@ -265,6 +269,12 @@ enum BuildOutcome {
 /// this — the worker reports outcomes, never prose.
 enum BuildKind {
     Install,
+    /// An install of an exact older version, started from the panel's
+    /// offer. It differs from `Install` only in what the record calls
+    /// it — the pipeline underneath is the same — but a record that
+    /// calls a downgrade an install describes an operation the person
+    /// did not perform.
+    Downgrade,
     /// Boxed: the variant is already the enum's largest, and the target
     /// rides in every build job.
     Migrate(Box<MigrateTarget>),
@@ -277,6 +287,7 @@ impl BuildKind {
     fn verb(&self) -> &'static str {
         match self {
             BuildKind::Install => "install",
+            BuildKind::Downgrade => "downgrade",
             // Tuple variant, tuple pattern: a pattern should not lie
             // about the shape.
             BuildKind::Migrate(_) => "migrate",
@@ -416,6 +427,11 @@ impl App {
                 Self::request_oneshot_cancel(cancel);
                 self.info(&note);
             }
+            Some(Job::Downgrade { name, cancel, .. }) => {
+                let note = format!("version lookup for `{name}`: cancel requested…");
+                Self::request_oneshot_cancel(cancel);
+                self.info(&note);
+            }
             None => {}
         }
     }
@@ -439,6 +455,15 @@ enum Job {
     Search {
         query: String,
         rx: Receiver<Result<Vec<api::Hit>>>,
+        cancel: CancelFlag,
+    },
+    /// The candidate lookup behind `D`: a read-only question to the
+    /// index, cancellable like every other one-shot. The choice it
+    /// feeds is a value for an action already chosen, not a browser.
+    Downgrade {
+        name: String,
+        current: String,
+        rx: Receiver<Result<Vec<Version>>>,
         cancel: CancelFlag,
     },
     /// A captured single-crate install streaming over `rx`.
@@ -506,6 +531,13 @@ impl Job {
                     format!("searching crates.io for `{query}`…")
                 }
             }
+            Job::Downgrade { name, cancel, .. } => {
+                if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                    format!("version lookup for `{name}`: cancel requested…")
+                } else {
+                    format!("asking crates.io which versions precede `{name}`…")
+                }
+            }
             Job::Build { name, .. } => format!("building {name}…"),
         }
     }
@@ -513,6 +545,37 @@ impl Job {
 
 /// Hits the details panel shows; `api::search` guarantees no more.
 const SEARCH_HITS: usize = 6;
+
+/// A build the run loop still has to start, because starting one needs
+/// the terminal: the escalation preflight may have to ask for a
+/// password. `expect` carries a downgrade's premise — the version the
+/// manifest must still hold — down to the worker, where it is checked
+/// under the build's own lock.
+struct PendingBuild {
+    spec: String,
+    locked: bool,
+    expect: Option<String>,
+}
+
+/// The versions `D` offers for the selected crate, and the version they
+/// are older than. The list is `index::downgrade_candidates`' own —
+/// strictly older, non-yanked, pre-releases only for a pre-release
+/// current — so the panel cannot become a browser of the whole
+/// history; it is the choice the command already makes, shown where
+/// the build will run.
+pub struct DowngradeChoice {
+    pub name: String,
+    pub current: String,
+    pub versions: Vec<Version>,
+    /// Older releases the list does not show, so the footer can say so
+    /// rather than pretending the offer is the whole history.
+    pub older: usize,
+}
+
+/// How many versions the panel offers: what a single digit can name.
+/// The CLI's prompt reads a line and can afford ten; a keypress is one
+/// character, and 1-9 is the idiom the search overlay already uses.
+const DOWNGRADE_CHOICES: usize = 9;
 
 /// A finished search, shown until dismissed; digits pick a hit.
 pub struct SearchResult {
@@ -544,6 +607,7 @@ pub struct App {
     /// A running `M` batch; `finish_build` feeds it, `c` ends it.
     migrate_batch: Option<MigrateBatch>,
     pub search_result: Option<SearchResult>,
+    pub downgrade_choice: Option<DowngradeChoice>,
     /// A build's sticky report pinned to the details panel until dismissed.
     pub build_report: Option<BuildReport>,
     /// The loader's refusal — the degraded state: list empty, mutating
@@ -563,7 +627,7 @@ pub struct App {
     pub show_help: bool,
     pending: Option<PendingAction>,
     /// A captured install waiting for the run loop (sudo preauth first).
-    pending_build: Option<(String, bool)>,
+    pending_build: Option<PendingBuild>,
     job: Option<Job>,
     /// Frame counter; drives the gauge spinner.
     ticks: usize,
@@ -622,6 +686,7 @@ impl App {
             pending_migrate: None,
             migrate_batch: None,
             search_result: None,
+            downgrade_choice: None,
             build_report: None,
             manifest_error: None,
             report_scroll: 0,
@@ -646,8 +711,11 @@ impl App {
     fn reload(&mut self) -> Result<ReloadOutcome> {
         // A search result marks hits installed — a fact about the prefix,
         // stale the moment anything re-reads it; `finish_search` reloads
-        // first and sets the new result after.
+        // first and sets the new result after. A downgrade offer goes for
+        // the same reason: it is "older than <this version>", and the
+        // reload may be what changed that version.
         self.search_result = None;
+        self.downgrade_choice = None;
         let report = match Report::load(&self.cache, &self.prefix) {
             Ok(report) => report,
             Err(e) => {
@@ -715,7 +783,9 @@ impl App {
     pub fn oneshot_running(&self) -> bool {
         matches!(
             self.job,
-            Some(Job::Check { .. } | Job::Verify { .. } | Job::Search { .. })
+            Some(
+                Job::Check { .. } | Job::Verify { .. } | Job::Search { .. } | Job::Downgrade { .. }
+            )
         )
     }
 
@@ -856,8 +926,8 @@ impl App {
                 self.run_in_terminal(terminal, &action)?;
                 continue;
             }
-            if let Some((spec, locked)) = self.pending_build.take() {
-                self.start_build(terminal, &spec, locked)?;
+            if let Some(req) = self.pending_build.take() {
+                self.start_build(terminal, &req)?;
                 continue;
             }
             if let Some(req) = self.pending_migrate.take() {
@@ -910,6 +980,7 @@ impl App {
         ratatui::try_restore().context("leaving the TUI")?;
         println!();
         let outcome = match action {
+            PendingAction::Downgrade(name) => crate::cmd_downgrade(&self.prefix, name),
             PendingAction::Update(name) => {
                 crate::cmd_update(&self.prefix, std::slice::from_ref(name), false, false)
             }
@@ -923,7 +994,6 @@ impl App {
             PendingAction::SetPinned { name, pinned } => {
                 crate::cmd_set_pinned(&self.prefix, std::slice::from_ref(name), *pinned)
             }
-            PendingAction::Downgrade(name) => crate::cmd_downgrade(&self.prefix, name),
         };
         if let Err(e) = &outcome {
             eprintln!("error: {e:#}");
@@ -986,15 +1056,47 @@ impl App {
         }
     }
 
+    /// Can captured placement run? `false` means the attempt is over:
+    /// either it was reported, or it left as a terminal handoff.
+    ///
+    /// Captured placement runs `sudo -n`; a non-caching sudo would be
+    /// asked a question it cannot voice, so the work falls back to the
+    /// terminal instead of a doomed build. A downgrade hands over *as a
+    /// downgrade*: `install NAME@VERSION` there would place the same
+    /// version without the premise check, and the command that owns
+    /// that check is the one to run — it asks for a version again,
+    /// which is the price of the handover.
+    fn escalation_ready(
+        &mut self,
+        terminal: &mut DefaultTerminal,
+        req: &PendingBuild,
+        name: &str,
+    ) -> Result<bool> {
+        match Self::preflight_escalation(terminal, &self.prefix.clone())? {
+            Preflight::Ready => Ok(true),
+            Preflight::NoCache => {
+                self.info("sudo does not cache credentials here; handing the terminal over");
+                self.pending = Some(match &req.expect {
+                    Some(_) => PendingAction::Downgrade(name.to_owned()),
+                    None => PendingAction::Install {
+                        crates: vec![req.spec.clone()],
+                        locked: req.locked,
+                    },
+                });
+                Ok(false)
+            }
+            Preflight::Reported(message) => {
+                self.error(&message);
+                Ok(false)
+            }
+        }
+    }
+
     /// A captured install. The run loop calls this because only it owns
     /// the terminal: a stale credential prompt happens here, up front —
     /// never inside the alternate screen.
-    fn start_build(
-        &mut self,
-        terminal: &mut DefaultTerminal,
-        raw_spec: &str,
-        locked: bool,
-    ) -> Result<()> {
+    fn start_build(&mut self, terminal: &mut DefaultTerminal, req: &PendingBuild) -> Result<()> {
+        let (raw_spec, locked) = (req.spec.as_str(), req.locked);
         let spec = match InstallSpec::parse_all(std::slice::from_ref(&raw_spec.to_owned())) {
             Ok(mut specs) => specs.remove(0),
             Err(e) => {
@@ -1008,23 +1110,8 @@ impl App {
         // A new attempt supersedes the previous report — a stale failure
         // over a fresh run would report on the wrong world.
         self.build_report = None;
-        match Self::preflight_escalation(terminal, &self.prefix.clone())? {
-            Preflight::Ready => {}
-            // Captured placement runs `sudo -n`; a non-caching sudo would be
-            // asked a question it cannot voice — install falls back to the
-            // terminal handoff instead of a doomed build.
-            Preflight::NoCache => {
-                self.info("sudo does not cache credentials here; handing the terminal over");
-                self.pending = Some(PendingAction::Install {
-                    crates: vec![raw_spec.to_owned()],
-                    locked,
-                });
-                return Ok(());
-            }
-            Preflight::Reported(message) => {
-                self.error(&message);
-                return Ok(());
-            }
+        if !self.escalation_ready(terminal, req, &spec.name)? {
+            return Ok(());
         }
         let (tx, rx) = mpsc::channel();
         let (auth_tx, auth_rx) = mpsc::channel();
@@ -1033,46 +1120,65 @@ impl App {
         let prefix = self.prefix.clone();
         let name = spec.name.clone();
         let worker_tx = tx.clone();
+        // A downgrade's premise travels into the worker, where the lock
+        // that decides it is held.
+        let expect = req.expect.clone();
         std::thread::spawn(move || {
             let line_tx = worker_tx.clone();
             let control = worker_control;
-            let result = crate::tui_install_one(
-                &prefix,
-                &spec,
-                locked,
-                &mut |k: crate::LineKind, l: &str| {
-                    let _ = line_tx.send(build_msg(k, l));
-                },
-                &mut |escalating: &Path| {
-                    // A cancelled build must not ask for a password: refuse instead of
-                    // raising NeedAuth; the run loop guards the other side of the race.
-                    if control.cancelled() {
-                        return Err(anyhow::Error::new(crate::BuildCancelled));
-                    }
-                    match crate::privileged::credentials_fresh() {
-                        // The common case: the up-front validation is still
-                        // fresh and placement proceeds without a word.
-                        Ok(true) => Ok(()),
-                        Ok(false) => {
-                            let _ = worker_tx.send(BuildMsg::NeedAuth(escalating.to_path_buf()));
-                            match auth_rx.recv() {
-                                Ok(true) => Ok(()),
-                                // A denial answering a cancel *is* the cancel; a real refusal keeps
-                                // its own name.
-                                Ok(false) if control.cancelled() => {
-                                    Err(anyhow::Error::new(crate::BuildCancelled))
-                                }
-                                Ok(false) => anyhow::bail!("sudo authentication failed"),
-                                Err(_) => {
-                                    anyhow::bail!("the interface went away mid-authorization")
-                                }
+            let mut on_line = |k: crate::LineKind, l: &str| {
+                let _ = line_tx.send(build_msg(k, l));
+            };
+            let mut before_placement = |escalating: &Path| {
+                // A cancelled build must not ask for a password: refuse instead of
+                // raising NeedAuth; the run loop guards the other side of the race.
+                if control.cancelled() {
+                    return Err(anyhow::Error::new(crate::BuildCancelled));
+                }
+                match crate::privileged::credentials_fresh() {
+                    // The common case: the up-front validation is still
+                    // fresh and placement proceeds without a word.
+                    Ok(true) => Ok(()),
+                    Ok(false) => {
+                        let _ = worker_tx.send(BuildMsg::NeedAuth(escalating.to_path_buf()));
+                        match auth_rx.recv() {
+                            Ok(true) => Ok(()),
+                            // A denial answering a cancel *is* the cancel; a real refusal keeps
+                            // its own name.
+                            Ok(false) if control.cancelled() => {
+                                Err(anyhow::Error::new(crate::BuildCancelled))
+                            }
+                            Ok(false) => anyhow::bail!("sudo authentication failed"),
+                            Err(_) => {
+                                anyhow::bail!("the interface went away mid-authorization")
                             }
                         }
-                        Err(e) => Err(e),
                     }
-                },
-                &control,
-            );
+                    Err(e) => Err(e),
+                }
+            };
+            // One door per intent: an install places what was asked for,
+            // a downgrade first makes the statement its name implies —
+            // under the lock, not against a snapshot.
+            let result = match (&expect, &spec.version) {
+                (Some(expected), Some(version)) => crate::tui_downgrade_one(
+                    &prefix,
+                    &spec.name,
+                    expected,
+                    version,
+                    &mut on_line,
+                    &mut before_placement,
+                    &control,
+                ),
+                _ => crate::tui_install_one(
+                    &prefix,
+                    &spec,
+                    locked,
+                    &mut on_line,
+                    &mut before_placement,
+                    &control,
+                ),
+            };
             // Classified here, once, by downcast — see `BuildOutcome`.
             let outcome = match result {
                 Ok(()) => BuildOutcome::Success,
@@ -1095,7 +1201,13 @@ impl App {
             started: std::time::Instant::now(),
             needs_auth: None,
             control,
-            kind: BuildKind::Install,
+            // The premise is what makes this a downgrade, so it is also
+            // what the record answers to.
+            kind: if req.expect.is_some() {
+                BuildKind::Downgrade
+            } else {
+                BuildKind::Install
+            },
             cancel_deadline: None,
         });
         Ok(())
@@ -1646,12 +1758,12 @@ impl App {
                 // destination committed (Migrated's payload), never the
                 // frozen plan's.
                 let note = match kind {
-                    BuildKind::Install => tail
+                    BuildKind::Install | BuildKind::Downgrade => tail
                         .iter()
                         .rev()
                         .find(|l| l.starts_with("installed "))
                         .cloned()
-                        .unwrap_or_else(|| format!("install {name} finished")),
+                        .unwrap_or_else(|| format!("{verb} {name} finished")),
                     BuildKind::Migrate(target) => match &outcome {
                         BuildOutcome::Migrated(installed) => {
                             format!("migrated {name} {installed} to {}", target.dest.display())
@@ -1731,14 +1843,16 @@ impl App {
                     )));
                 }
                 self.pin_report(BuildReport {
-                    // "install", not "build": the failure may be placement or the
-                    // manifest commit; the title must not narrow it.
-                    title: format!("install {name} failed"),
+                    // The operation's own word, not "build": the failure may be
+                    // placement or the manifest commit, so the title must not
+                    // narrow it — and not "install" either, which would rename
+                    // what the person asked for.
+                    title: format!("{verb} {name} failed"),
                     lines,
                     failed: true,
                 });
                 self.error(&format!(
-                    "install {name} failed — details in the panel; Esc/Enter dismisses"
+                    "{verb} {name} failed — details in the panel; Esc/Enter dismisses"
                 ));
             }
         }
@@ -1877,7 +1991,7 @@ impl App {
                 }
             }
             KeyCode::Esc => {
-                if self.search_result.take().is_some() {
+                if self.downgrade_choice.take().is_some() || self.search_result.take().is_some() {
                     // Dismissing a result is fine mid-build; only the exit is held back.
                 } else if matches!(self.job, Some(Job::Build { .. })) {
                     self.error("a build is running; c cancels it, Ctrl-C cancels and quits");
@@ -1909,6 +2023,18 @@ impl App {
             KeyCode::Char('s') => self.open_input(InputPurpose::Search),
             // With a search result up, a digit picks a hit and opens the install
             // line — editable, so `--locked` can still be added.
+            // With an offer up, a digit names the version — the same idiom
+            // the search overlay uses, and the reason the list stops at
+            // nine.
+            KeyCode::Char(c @ '1'..='9') if self.downgrade_choice.is_some() => {
+                let pick = c
+                    .to_digit(10)
+                    .and_then(|d| usize::try_from(d).ok())
+                    .and_then(|d| d.checked_sub(1));
+                if let Some(i) = pick {
+                    self.pick_downgrade(i);
+                }
+            }
             KeyCode::Char(c @ '1'..='9') if self.search_result.is_some() => {
                 let pick = c
                     .to_digit(10)
@@ -1936,12 +2062,11 @@ impl App {
             // Toggle from what the row shows; the command re-reads under the
             // lock, so a pin changed elsewhere is reported, not overwritten.
             KeyCode::Char('p') => self.pin_selected(),
-            // The version choice happens in the terminal, by the command itself.
-            KeyCode::Char('D') => {
-                if let Some(name) = self.selected_name() {
-                    self.queue(PendingAction::Downgrade(name));
-                }
-            }
+            // The version choice happens here: a known action wanting one
+            // value, which is what this interface is for. The build that
+            // follows runs in the panel, with `c` and the warning record
+            // the terminal handoff could not give it.
+            KeyCode::Char('D') => self.start_downgrade(),
             KeyCode::Char('x') => self.remove_selected(),
             KeyCode::Char('B') => self.jump_to_other_prefix(),
             // Migrate to the other prefix of the known pair — and only there: a
@@ -2346,7 +2471,11 @@ impl App {
                 Ok((crates, locked)) if crates.len() == 1 => {
                     let spec = crates.into_iter().next().expect("len checked");
                     self.info(&format!("building {spec}…"));
-                    self.pending_build = Some((spec, locked));
+                    self.pending_build = Some(PendingBuild {
+                        spec,
+                        locked,
+                        expect: None,
+                    });
                 }
                 Ok((crates, locked)) => self.queue(PendingAction::Install { crates, locked }),
                 Err(e) => self.error(&format!("{e:#}")),
@@ -2389,6 +2518,9 @@ impl App {
             return;
         }
         self.build_report = None;
+        // The panel shows one thing at a time, and a verify is about to
+        // want it.
+        self.downgrade_choice = None;
         let (tx, rx) = mpsc::channel();
         let prefix = self.prefix.clone();
         thread::spawn(move || {
@@ -2518,10 +2650,119 @@ impl App {
         self.message = None;
     }
 
+    /// `D`: ask the index which older versions exist for the selected
+    /// crate. Read-only and cancellable, like every other one-shot — the
+    /// mutation is the build that a chosen version starts, and nothing
+    /// is chosen yet.
+    fn start_downgrade(&mut self) {
+        if self.anything_running() {
+            self.error("busy; wait for the current job to finish");
+            return;
+        }
+        let Some(row) = self.selected_row() else {
+            return;
+        };
+        // A pinned crate is offered the list like any other: the pin is a
+        // standing instruction and an exact version is how it is
+        // restated, which is exactly what a digit supplies — the CLI
+        // command has always allowed this.
+        let (name, current) = (row.name.clone(), row.version.clone());
+        let Ok(parsed) = Version::parse(&current) else {
+            self.error(&format!(
+                "manifest holds unparsable version for `{name}`; verify says more"
+            ));
+            return;
+        };
+        self.search_result = None;
+        self.downgrade_choice = None;
+        let (tx, rx) = mpsc::channel();
+        let lookup = name.clone();
+        thread::spawn(move || {
+            let candidates = crate::index::releases(&lookup)
+                .and_then(|r| r.ok_or_else(|| crate::index::not_found(&lookup)))
+                .map(|releases| crate::index::downgrade_candidates(&releases, &parsed));
+            let _ = tx.send(candidates);
+        });
+        self.job = Some(Job::Downgrade {
+            name,
+            current,
+            rx,
+            cancel: cancel_flag(),
+        });
+        self.message = None;
+    }
+
+    /// The offer answered: install that exact version, in the panel.
+    ///
+    /// The version was chosen relative to the one the row showed, and
+    /// that premise travels with the request rather than being checked
+    /// here — the rows are a snapshot, so the statement is made where
+    /// it can be true: under the exclusive lock, in
+    /// `tui_downgrade_one`. Pinning is not decided here either:
+    /// `install NAME@VERSION` pins an exact version, and this is that
+    /// command with the version supplied by a keypress.
+    fn pick_downgrade(&mut self, index: usize) {
+        // An offer can outlive the lookup that produced it: nothing stops
+        // the person from pressing `v` while it sits there, and the run
+        // loop starts a queued build before it polls the running job. So
+        // the single-flight rule is checked here too, not only where the
+        // lookup began — a build written over a live `Job` would leave
+        // its worker sending into a receiver nobody holds.
+        if self.anything_running() {
+            self.error("busy; wait for the current job to finish");
+            return;
+        }
+        let Some(choice) = &self.downgrade_choice else {
+            return;
+        };
+        let Some(version) = choice.versions.get(index) else {
+            return;
+        };
+        let (name, current, version) = (
+            choice.name.clone(),
+            choice.current.clone(),
+            version.to_string(),
+        );
+        self.downgrade_choice = None;
+        self.info(&format!("downgrading {name} {current} -> {version}"));
+        // The run loop owns the terminal, and a build needs it for the
+        // escalation preflight: the same door the install line uses.
+        // `current` rides along as the premise — the worker re-checks it
+        // under the exclusive lock, because the rows are a snapshot and
+        // the manifest is the authority.
+        self.pending_build = Some(PendingBuild {
+            spec: format!("{name}@{version}"),
+            locked: false,
+            expect: Some(current),
+        });
+    }
+
+    /// The offer, or the reason there is none.
+    fn finish_downgrade(&mut self, name: String, current: String, candidates: Vec<Version>) {
+        if candidates.is_empty() {
+            self.info(&format!(
+                "{name} {current} is installed; no older version to go back to"
+            ));
+            return;
+        }
+        let older = candidates.len().saturating_sub(DOWNGRADE_CHOICES);
+        let versions: Vec<Version> = candidates.into_iter().take(DOWNGRADE_CHOICES).collect();
+        let n = versions.len();
+        self.downgrade_choice = Some(DowngradeChoice {
+            name,
+            current,
+            versions,
+            older,
+        });
+        self.info(&format!("1-{n} installs, Esc dismisses"));
+    }
+
     fn start_search(&mut self, query: String) {
         // A failed search must not leave the previous query's hits under a
-        // footer about a different one.
+        // footer about a different one, and the panel shows one thing at
+        // a time.
         self.search_result = None;
+        self.downgrade_choice = None;
         let (tx, rx) = mpsc::channel();
         let q = query.clone();
         thread::spawn(move || {
@@ -2590,6 +2831,34 @@ impl App {
                 }
                 Err(TryRecvError::Disconnected) => {
                     bail!("verify worker aborted; the terminal was reset by the panic")
+                }
+            },
+            Job::Downgrade {
+                name,
+                current,
+                rx,
+                cancel,
+            } => match rx.try_recv() {
+                Ok(result) => {
+                    if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                        self.info(&format!("version lookup for `{name}` cancelled"));
+                    } else {
+                        match result {
+                            Ok(candidates) => self.finish_downgrade(name, current, candidates),
+                            Err(e) => self.error(&format!("{e:#}")),
+                        }
+                    }
+                }
+                Err(TryRecvError::Empty) => {
+                    self.job = Some(Job::Downgrade {
+                        name,
+                        current,
+                        rx,
+                        cancel,
+                    });
+                }
+                Err(TryRecvError::Disconnected) => {
+                    bail!("version lookup worker aborted; the terminal was reset by the panic")
                 }
             },
             Job::Search { query, rx, cancel } => match rx.try_recv() {
@@ -2836,6 +3105,7 @@ impl App {
 fn action_label(action: &PendingAction) -> String {
     match action {
         PendingAction::Update(name) => format!("update {name}"),
+        PendingAction::Downgrade(name) => format!("downgrade {name}"),
         PendingAction::UpdateAll => "update --all".to_owned(),
         PendingAction::Install { crates, locked } => {
             let mut label = format!("install {}", crates.join(" "));
@@ -2850,7 +3120,6 @@ fn action_label(action: &PendingAction) -> String {
             name,
             pinned: false,
         } => format!("unpin {name}"),
-        PendingAction::Downgrade(name) => format!("downgrade {name}"),
     }
 }
 
@@ -3226,6 +3495,174 @@ mod tests {
             app.selected, 0,
             "foo exists there but is not visible under Pinned"
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The offer is a value for a chosen action: it lands, a digit
+    /// answers it, and what leaves the panel is a build — not a browser
+    /// with its own navigation.
+    #[test]
+    fn a_downgrade_offer_turns_one_keypress_into_a_pinned_build() {
+        let root = std::env::temp_dir().join("cargo-lbin-test-tui-downgrade-offer");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let mut app = App::new(&root).unwrap();
+        app.rows = rows_from(&manifest(&[("foo", "1.2.0")]), None, &BTreeMap::new());
+
+        app.finish_downgrade("foo".into(), "1.2.0".into(), vec![v("1.1.0"), v("1.0.0")]);
+        let choice = app.downgrade_choice.as_ref().expect("the offer is up");
+        assert_eq!(choice.versions, vec![v("1.1.0"), v("1.0.0")]);
+        assert_eq!(choice.older, 0, "nothing withheld, nothing to announce");
+
+        app.pick_downgrade(0);
+        let req = app.pending_build.as_ref().expect("a build was requested");
+        assert_eq!(req.spec, "foo@1.1.0", "that exact version, nothing else");
+        assert_eq!(
+            req.expect.as_deref(),
+            Some("1.2.0"),
+            "and the premise travels with it, to be checked under the lock"
+        );
+        assert!(
+            app.downgrade_choice.is_none(),
+            "an answered offer leaves the panel"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Nothing older is an answer, not an empty panel; and a long
+    /// history is capped at what a digit can name, with the remainder
+    /// announced rather than hidden.
+    #[test]
+    fn the_offer_is_capped_and_an_empty_one_is_a_message() {
+        let root = std::env::temp_dir().join("cargo-lbin-test-tui-downgrade-cap");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let mut app = App::new(&root).unwrap();
+        app.rows = rows_from(&manifest(&[("foo", "1.2.0")]), None, &BTreeMap::new());
+
+        app.finish_downgrade("foo".into(), "1.2.0".into(), Vec::new());
+        assert!(
+            app.downgrade_choice.is_none(),
+            "no candidates, no panel to dismiss"
+        );
+
+        let many: Vec<Version> = (0..12).map(|i| v(&format!("1.0.{i}"))).collect();
+        app.finish_downgrade("foo".into(), "1.2.0".into(), many);
+        let choice = app.downgrade_choice.as_ref().unwrap();
+        assert_eq!(choice.versions.len(), DOWNGRADE_CHOICES, "one digit each");
+        assert_eq!(choice.older, 3, "and the rest is said out loud");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Single flight, checked where the build is requested and not only
+    /// where the offer began. An offer outlives its lookup, the run loop
+    /// starts a queued build before polling the running job, and a
+    /// `Job` written over a live one would strand its worker sending
+    /// into a receiver nobody holds.
+    #[test]
+    fn an_offer_answered_during_another_job_starts_nothing() {
+        let root = std::env::temp_dir().join("cargo-lbin-test-tui-downgrade-busy");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let mut app = App::new(&root).unwrap();
+        app.rows = rows_from(&manifest(&[("foo", "1.2.0")]), None, &BTreeMap::new());
+        app.finish_downgrade("foo".into(), "1.2.0".into(), vec![v("1.1.0")]);
+
+        // `v` after the lookup finished: legal, and the offer is still up.
+        let (_tx, rx) = mpsc::channel();
+        app.job = Some(Job::Verify {
+            rx,
+            started: std::time::Instant::now(),
+            cancel: cancel_flag(),
+        });
+
+        app.pick_downgrade(0);
+        assert!(
+            app.pending_build.is_none(),
+            "no build is queued over a running job"
+        );
+        assert!(
+            matches!(app.job, Some(Job::Verify { .. })),
+            "and the running job is untouched"
+        );
+
+        // With the job done, the same keypress works.
+        app.job = None;
+        app.pick_downgrade(0);
+        assert!(app.pending_build.is_some(), "the offer still answers later");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The record says what the person did. A downgrade's panel, its
+    /// messages and its failure title all speak the operation's own
+    /// word — calling it an install would describe something nobody
+    /// asked for, and putting the whole build into the record was the
+    /// reason this moved into the panel at all.
+    #[test]
+    fn a_downgrade_is_recorded_as_a_downgrade() {
+        let root = std::env::temp_dir().join("cargo-lbin-test-tui-downgrade-record");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let mut app = App::new(&root).unwrap();
+        assert_eq!(BuildKind::Downgrade.verb(), "downgrade");
+
+        let (tx, rx) = mpsc::channel();
+        let (auth_tx, _auth_rx) = mpsc::channel();
+        app.job = Some(Job::Build {
+            name: "foo".into(),
+            rx,
+            auth_tx,
+            units_started: 0,
+            current: None,
+            tail: VecDeque::new(),
+            status_note: None,
+            warnings: Vec::new(),
+            started: std::time::Instant::now(),
+            needs_auth: None,
+            control: std::sync::Arc::new(crate::BuildControl::new()),
+            kind: BuildKind::Downgrade,
+            cancel_deadline: None,
+        });
+
+        tx.send(BuildMsg::Warning("warning: something".into()))
+            .unwrap();
+        app.poll_job().unwrap();
+        let live = app.build_report.as_ref().expect("warnings reach the panel");
+        assert!(live.title.starts_with("downgrade foo"), "{}", live.title);
+
+        tx.send(BuildMsg::Done(BuildOutcome::Failed(anyhow::anyhow!(
+            "boom"
+        ))))
+        .unwrap();
+        app.poll_job().unwrap();
+        let report = app.build_report.as_ref().expect("a failure is pinned");
+        assert_eq!(report.title, "downgrade foo failed", "{}", report.title);
+        assert!(report.failed);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A pinned crate is downgraded like any other — the CLI command
+    /// always allowed it, and the digit supplies exactly the "name a
+    /// version" the pin asks for. The pin itself is not touched here:
+    /// `install NAME@VERSION` re-pins, which is the door this takes.
+    #[test]
+    fn a_pinned_crate_is_offered_the_list_like_any_other() {
+        let root = std::env::temp_dir().join("cargo-lbin-test-tui-downgrade-pinned");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let mut app = App::new(&root).unwrap();
+        let mut m = manifest(&[("foo", "1.2.0")]);
+        m.crates.get_mut("foo").unwrap().pinned = true;
+        app.rows = rows_from(&m, None, &BTreeMap::new());
+
+        app.finish_downgrade("foo".into(), "1.2.0".into(), vec![v("1.1.0")]);
+        assert!(
+            app.downgrade_choice.is_some(),
+            "a pin is restated by naming a version, not a reason to refuse"
+        );
+        app.pick_downgrade(0);
+        let req = app.pending_build.as_ref().expect("the build is requested");
+        assert_eq!(req.spec, "foo@1.1.0");
         let _ = std::fs::remove_dir_all(&root);
     }
 

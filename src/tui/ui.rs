@@ -248,6 +248,15 @@ fn draw_report(
 /// trusting the map. A fixed height would silently clip the second
 /// copy, which is exactly the state the panel exists to report.
 fn resting_details_height(app: &App) -> u16 {
+    // An open offer owns the panel, and every version it lists has to
+    // fit inside the borders: keys that work on invisible lines are
+    // worse than no keys. The list is capped at nine, the overflow note
+    // is one more line.
+    if let Some(choice) = &app.downgrade_choice {
+        let lines =
+            u16::try_from(choice.versions.len()).unwrap_or(9).min(9) + u16::from(choice.older > 0);
+        return lines + 2;
+    }
     let also = app.selected_row().map_or(0, |row| row.also.len());
     8 + u16::try_from(also).unwrap_or(2).min(2)
 }
@@ -257,6 +266,43 @@ fn draw_details(frame: &mut Frame, app: &App, area: Rect) {
     // survive longer than one keypress.
     if let Some(report) = &app.build_report {
         draw_report(frame, app, report, app.report_scroll, area);
+        return;
+    }
+    // An open downgrade offer owns the panel: a list of versions with
+    // nothing to navigate — the digit is the whole interaction, as in
+    // the search overlay.
+    if let Some(choice) = &app.downgrade_choice {
+        let mut lines: Vec<Line> = choice
+            .versions
+            .iter()
+            .enumerate()
+            .map(|(i, v)| {
+                Line::from(vec![
+                    Span::styled(
+                        format!("[{}] ", i + 1),
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(v.to_string()),
+                ])
+            })
+            .collect();
+        if choice.older > 0 {
+            // The offer is capped, so it says so rather than reading as
+            // the whole history.
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "and {} older — install {}@VERSION for one of those",
+                    choice.older, choice.name
+                ),
+                Style::default().fg(Color::Gray),
+            )));
+        }
+        let panel =
+            Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(format!(
+                " Downgrade {} from {} (digit installs, Esc dismisses) ",
+                choice.name, choice.current
+            )));
+        frame.render_widget(panel, area);
         return;
     }
     // A finished search takes over the panel until dismissed; it is the
@@ -566,7 +612,7 @@ fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
         "p           pin / unpin selected crate; a pin declares the version:",
         "            update --all holds it back, m migrates exactly it",
         "            (in place unless pinning needs sudo)",
-        "D           downgrade: pick an older version in the terminal, pinned",
+        "D           downgrade: the panel offers older versions, a digit installs one",
         "v           verify: the manifest's claims checked against the disk,",
         "            read-only; violations and warnings land in a panel,",
         "            naming the repair where one is unambiguous",
@@ -579,7 +625,7 @@ fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
         "checked up front and prompts happen on the real terminal (again",
         "only if the timestamp expires); a failed build",
         "keeps its last lines and the log path in the details panel.",
-        "update, downgrade and batch installs hand the terminal to cargo",
+        "update and batch installs hand the terminal to cargo",
         "and sudo as before, and return when you press Enter.",
         "",
         "q / Esc     quit (from the list); during a build, Ctrl-C",
@@ -770,6 +816,47 @@ mod tests {
             resting_details_height(&app),
             content(&app) + 2,
             "two foreign copies still fit inside the borders"
+        );
+        let _ = std::fs::remove_dir_all(&prefix);
+    }
+
+    /// Every offered version has to fit inside the borders: a digit
+    /// that works on a line nobody can see is worse than no digit at
+    /// all. The Phase V height test's shape, for the panel's other
+    /// tenant.
+    #[test]
+    fn an_offer_gets_a_panel_tall_enough_for_every_version() {
+        let prefix = std::env::temp_dir().join("cargo-lbin-test-tui-offer-height");
+        let _ = std::fs::remove_dir_all(&prefix);
+        std::fs::create_dir_all(&prefix).unwrap();
+        let mut app = crate::tui::App::new(&prefix).unwrap();
+        app.rows = vec![row("foo")];
+
+        let offer = |versions: usize, older: usize| crate::tui::DowngradeChoice {
+            name: "foo".to_owned(),
+            current: "1.2.0".to_owned(),
+            versions: (0..versions)
+                .map(|i| semver::Version::parse(&format!("1.0.{i}")).unwrap())
+                .collect(),
+            older,
+        };
+
+        app.downgrade_choice = Some(offer(2, 0));
+        assert_eq!(resting_details_height(&app), 4, "two lines and the borders");
+        app.downgrade_choice = Some(offer(9, 0));
+        assert_eq!(resting_details_height(&app), 11, "nine still fit");
+        app.downgrade_choice = Some(offer(9, 3));
+        assert_eq!(
+            resting_details_height(&app),
+            12,
+            "the overflow note is a line of its own"
+        );
+
+        app.downgrade_choice = None;
+        assert_eq!(
+            resting_details_height(&app),
+            8,
+            "with no offer the entry's own height is back"
         );
         let _ = std::fs::remove_dir_all(&prefix);
     }
