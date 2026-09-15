@@ -3948,9 +3948,10 @@ mod tests {
         );
 
         // No foreign copy: silence.
-        assert!(
-            duplicate_install_warnings_from(&also, &prefix, &empty, std::iter::once("bar"))
-                .is_empty()
+        assert_eq!(
+            duplicate_install_warnings_from(&also, &prefix, &empty, std::iter::once("bar")),
+            Vec::<String>::new(),
+            "nothing managed elsewhere, nothing to warn about"
         );
 
         // A control character has no honest shell spelling: the warning
