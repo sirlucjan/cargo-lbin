@@ -161,6 +161,8 @@ warning: `rg` already exists as /usr/bin/rg (/usr/bin/rg is owned by ripgrep 14.
 
 The owner comes from `/usr/bin/pacman -Qo`, `/usr/bin/rpm -qf` or `/usr/bin/dpkg -S` — the first of these that runs and claims the file; by absolute path, never a `PATH` lookup, since the prefix itself is usually on `PATH` ahead of `/usr/bin`. Without a claim, the file is still reported. The warning reports which directory comes first in `PATH` — the prefix's `bin`, the existing file's directory, or that `<prefix>/bin` is not on `PATH` at all; it does not attempt to determine which file the current user can actually execute. Paths and package-manager output are external data and pass through the same control-character sanitizing as crates.io responses before reaching the terminal. It is a warning, not a refusal: installing a newer version than the distribution ships is a normal reason to use this tool, and the person installing decides.
 
+A `migrate` reports this after it finishes, not while it runs. The rebuild at the destination happens with the source installation still in place, and the retirement that follows may remove it — or, when it refuses or fails, deliberately leave it. So the scan runs once that phase has answered and describes what is actually there: the copy that now comes first on `PATH`, which may be a distribution package the source copy had been hiding; or the source itself, when it survived; or nothing, when nothing is left to shadow. `<destination>/bin is not on PATH` is asked separately, because it is a fact about the destination rather than about any shadowing file: a binary in a directory `PATH` does not list is unreachable by bare name whether or not something else carries that name.
+
 ## Search
 
 Find crates by keyword:

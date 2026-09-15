@@ -76,6 +76,18 @@ fn anchor(entry: PathBuf, cwd: &Path) -> PathBuf {
     out
 }
 
+/// Is `<prefix>/bin` a `PATH` entry at all?
+///
+/// The same anchoring [`find_shadows`] uses — a relative `PATH` entry
+/// and a relative prefix must be compared after both are resolved, or
+/// `./bin` and `$PWD/bin` read as different directories. A fact about
+/// the prefix alone: it holds whether or not anything shadows the
+/// binaries in it, which is why it is asked separately.
+pub fn prefix_on_path(path_var: &OsStr, prefix_bin: &Path, cwd: &Path) -> bool {
+    let prefix_bin = anchor(prefix_bin.to_path_buf(), cwd);
+    std::env::split_paths(path_var).any(|d| anchor(d, cwd) == prefix_bin)
+}
+
 /// Scan `PATH` for files named like `bins`, ignoring `prefix_bin`,
 /// first match per name in `PATH` order; `exists` injected so the scan
 /// is testable without a filesystem.

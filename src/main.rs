@@ -833,6 +833,20 @@ impl Frontend<'_> {
     }
 }
 
+/// When the shadow scan speaks for an install.
+///
+/// An ordinary install's result *is* the state the moment it commits,
+/// so it reports then. A migration has a second phase that changes
+/// what stands on `PATH` — it retires the source copy, or fails to and
+/// deliberately leaves it — and nothing before that phase knows which.
+/// So it defers: the caller scans the real state once the retirement
+/// has answered, and says what it finds instead of what it predicted.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ShadowReport {
+    OnCommit,
+    Deferred,
+}
+
 /// Build one crate, verify destination ownership, place, clean up
 /// obsolete binaries and commit the manifest — all before the next
 /// crate, so a mid-batch failure never leaves installed files
@@ -842,7 +856,7 @@ impl Frontend<'_> {
 /// after the commit: a shared stage let stale binaries fail builds and
 /// let a different `--locked` be skipped as "already installed", and
 /// the nonce-fresh name means there is never anything to wipe first.
-// Eight arguments like `place_and_commit`, same reason: one install's
+// Nine arguments like `place_and_commit`, same reason: one install's
 // parameters; a struct would be built only to be destructured here.
 #[allow(clippy::too_many_arguments)]
 fn install_and_commit(
@@ -853,6 +867,7 @@ fn install_and_commit(
     version: Option<&Version>,
     locked: bool,
     pin: PinPolicy,
+    shadow: ShadowReport,
     frontend: &mut Frontend<'_>,
 ) -> Result<Version> {
     // Revalidate even post-CLI-check: on updates `name` comes from the
@@ -926,8 +941,10 @@ fn install_and_commit(
         })
         .cloned()
         .collect();
-    for w in shadow_warnings(prefix, &new_bins) {
-        frontend.warning(&w);
+    if shadow == ShadowReport::OnCommit {
+        for w in shadow_warnings(prefix, &new_bins) {
+            frontend.warning(&w);
+        }
     }
 
     // Snapshot before `place_and_commit` inserts the new manifest entry;
@@ -2340,6 +2357,7 @@ pub(crate) fn tui_downgrade_one(
         Some(version),
         locked,
         PinPolicy::Infer,
+        ShadowReport::OnCommit,
         &mut frontend,
     )?;
     Ok(())
@@ -2390,6 +2408,7 @@ pub(crate) fn tui_install_one(
         spec.version.as_ref(),
         locked,
         PinPolicy::Infer,
+        ShadowReport::OnCommit,
         &mut frontend,
     )?;
     Ok(())
@@ -2426,6 +2445,7 @@ fn cmd_install(prefix: &Path, crates: &[String], locked: bool) -> Result<()> {
             spec.version.as_ref(),
             locked,
             PinPolicy::Infer,
+            ShadowReport::OnCommit,
             &mut frontend,
         )?;
     }
@@ -3098,6 +3118,7 @@ fn cmd_downgrade(prefix: &Path, name: &str) -> Result<()> {
         Some(version),
         locked,
         PinPolicy::Infer,
+        ShadowReport::OnCommit,
         &mut Frontend::Terminal,
     )?;
     Ok(())
@@ -3273,6 +3294,7 @@ fn apply_updates(prefix: &Path, cache: &Path, outdated: &[Checked]) -> Result<()
                     None,
                     locked,
                     PinPolicy::Infer,
+                    ShadowReport::OnCommit,
                     &mut Frontend::Terminal,
                 ) {
                     Ok(_) => updated += 1,
@@ -3583,7 +3605,10 @@ pub(crate) enum MigrateFrontend<'a> {
 /// flavor's policy and notice path), the no-force refusal, the frozen
 /// plan's checkpoint composed behind the placement door, and the
 /// rebuild itself. Everything in here may still fail as a plain error:
-/// nothing has committed until this returns.
+/// nothing has committed until this returns. Returns the version the
+/// destination committed and the binaries it committed with it — the
+/// latter is the destination's own fact, which the source snapshot
+/// cannot supply for an unpinned migration.
 fn rebuild_at_destination(
     source: &Path,
     dest: &Path,
@@ -3591,7 +3616,7 @@ fn rebuild_at_destination(
     name: &str,
     snap: &MigrationSnapshot,
     frontend: &mut MigrateFrontend<'_>,
-) -> Result<Version> {
+) -> Result<(Version, Vec<String>)> {
     let _dest_lock = match frontend {
         MigrateFrontend::Terminal => StateLock::acquire(dest, &Mode::Exclusive)?,
         #[cfg(not(feature = "tui"))]
@@ -3668,6 +3693,8 @@ fn rebuild_at_destination(
             version,
             snap.locked,
             PinPolicy::Exactly(snap.pinned),
+            // Phase B decides what stands on PATH; the report waits for it.
+            ShadowReport::Deferred,
             &mut Frontend::Checkpointed {
                 checkpoint: &mut checkpoint,
             },
@@ -3687,6 +3714,7 @@ fn rebuild_at_destination(
             version,
             snap.locked,
             PinPolicy::Exactly(snap.pinned),
+            ShadowReport::Deferred,
             &mut Frontend::Captured {
                 on_line: &mut **on_line,
                 before_placement: &mut **before_placement,
@@ -3695,7 +3723,17 @@ fn rebuild_at_destination(
             },
         )?,
     };
-    Ok(installed)
+    // What the destination actually has, not what the source had: an
+    // unpinned migration installs the latest version, and a version can
+    // add or drop binaries. The shadow report that follows Phase B asks
+    // about these names.
+    let bins = dest_manifest
+        .crates
+        .get(name)
+        .with_context(|| format!("`{name}` vanished from {} after its commit", dest.display()))?
+        .bins
+        .clone();
+    Ok((installed, bins))
 }
 
 /// One migration, sequential by design: destination first, source
@@ -3711,6 +3749,54 @@ fn rebuild_at_destination(
 /// the person without one complete installation (a crash
 /// mid-retirement can leave a partial source; `remove` is `rm -f` and
 /// cleans the remainder).
+/// What stands on `PATH` for a migrated crate, asked once the
+/// retirement has answered.
+///
+/// A plain scan of the real state, so every outcome tells the truth
+/// without predicting any of it: the source retired and a distro copy
+/// now first — that copy is named; the retirement refused or failed
+/// and the source still there — the source is named; nothing left to
+/// shadow — nothing is said.
+///
+/// `<dest>/bin is not on PATH` is asked separately because it is not a
+/// property of any shadowing file: a binary in a directory `PATH` does
+/// not list is unreachable by bare name whether or not something else
+/// carries the name. It is added only when no shadow note was
+/// produced, since a note already ends with that verdict when it
+/// applies.
+fn migration_shadow_notes(dest: &Path, bins: &[String]) -> Vec<String> {
+    let notes = shadow_notes(dest, bins);
+    if !notes.is_empty() || bins.is_empty() {
+        return notes;
+    }
+    let (Some(path_var), Ok(cwd)) = (std::env::var_os("PATH"), std::env::current_dir()) else {
+        return notes;
+    };
+    let dest_bin = dest.join("bin");
+    if shadow::prefix_on_path(&path_var, &dest_bin, &cwd) {
+        return notes;
+    }
+    vec![text::sanitize(&format!(
+        "{} is not on PATH",
+        dest_bin.display()
+    ))]
+}
+
+/// The deferred report, spoken through whichever channel the migration
+/// is using.
+fn report_migration_shadows(dest: &Path, bins: &[String], frontend: &mut MigrateFrontend<'_>) {
+    for note in migration_shadow_notes(dest, bins) {
+        let line = format!("warning: {note}");
+        match frontend {
+            MigrateFrontend::Terminal => eprintln!("{line}"),
+            #[cfg(not(feature = "tui"))]
+            MigrateFrontend::Never(_) => unreachable!(),
+            #[cfg(feature = "tui")]
+            MigrateFrontend::Captured { on_line, .. } => on_line(LineKind::Warning, &line),
+        }
+    }
+}
+
 fn migrate_one(
     source: &Path,
     dest: &Path,
@@ -3719,7 +3805,8 @@ fn migrate_one(
     snap: &MigrationSnapshot,
     frontend: &mut MigrateFrontend<'_>,
 ) -> Result<MigrateOutcome> {
-    let installed = rebuild_at_destination(source, dest, cache, name, snap, frontend)?;
+    let (installed, installed_bins) =
+        rebuild_at_destination(source, dest, cache, name, snap, frontend)?;
 
     // Phase B: the source, under its exclusive lock. From here nothing
     // may surface as a plain error — the destination has committed, and
@@ -3730,7 +3817,11 @@ fn migrate_one(
     // exception. The reason names the version the destination committed:
     // two installations stand, and "what is actually over there" is the
     // fact the person cleans up by.
-    match retire_with_frontend(source, name, snap, frontend) {
+    let retirement = retire_with_frontend(source, name, snap, frontend);
+    // Every branch below describes a finished migration, so the state
+    // is real now: whatever retirement did or refused to do is on disk.
+    report_migration_shadows(dest, &installed_bins, frontend);
+    match retirement {
         Ok(Retirement::Retired) => Ok(MigrateOutcome::Moved {
             already_retired: false,
             version: installed,
@@ -4602,6 +4693,7 @@ mod tests {
                 None,
                 false,
                 PinPolicy::Infer,
+                ShadowReport::OnCommit,
                 &mut Frontend::Captured {
                     on_line: &mut |_, _| {},
                     before_placement: &mut |_| Ok(()),
@@ -4682,6 +4774,7 @@ mod tests {
                 None,
                 false,
                 PinPolicy::Infer,
+                ShadowReport::OnCommit,
                 &mut Frontend::Captured {
                     on_line: &mut |_, _| {},
                     before_placement: &mut |_| Ok(()),
@@ -4784,6 +4877,7 @@ mod tests {
                 None,
                 false,
                 PinPolicy::Infer,
+                ShadowReport::OnCommit,
                 &mut Frontend::Captured {
                     on_line: &mut |_, _| {},
                     before_placement: &mut |_| Ok(()),
@@ -4859,6 +4953,7 @@ mod tests {
                 None,
                 false,
                 PinPolicy::Infer,
+                ShadowReport::OnCommit,
                 &mut Frontend::Captured {
                     on_line: &mut |_, _| {},
                     before_placement: &mut |_| Ok(()),
@@ -5028,6 +5123,216 @@ mod tests {
         .unwrap();
         fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
         script
+    }
+
+    /// A fake cargo whose build carries a second binary — the shape an
+    /// unpinned migration meets when the newer version ships more than
+    /// the source had.
+    #[cfg(feature = "tui")]
+    fn two_bin_fake(root: &Path, name: &str, extra: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let fake_bin = root.join("fakebin");
+        fs::create_dir_all(&fake_bin).unwrap();
+        let script = fake_bin.join("cargo");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\n\
+                 ver=0.2.0\n\
+                 for a in \"$@\"; do\n\
+                 case \"$a\" in =*) ver=${{a#=}};; esac\n\
+                 done\n\
+                 mkdir -p \"$4/bin\"\n\
+                 for b in {name} {extra}; do\n\
+                 printf '#!/bin/sh\\ntrue\\n' > \"$4/bin/$b\"\n\
+                 chmod 755 \"$4/bin/$b\"\n\
+                 done\n\
+                 printf '%s' \"{{\\\"installs\\\":{{\\\"{name} $ver (registry+https://github.com/rust-lang/crates.io-index)\\\":{{\\\"bins\\\":[\\\"{name}\\\",\\\"{extra}\\\"]}}}}}}\" > \"$4/.crates2.json\"\n\
+                 exit 0\n"
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        script
+    }
+
+    /// The report asks about the destination's binaries, which for an
+    /// unpinned migration are the *new* version's — a set the source
+    /// snapshot cannot describe. A binary the newer version adds must
+    /// be scanned, and one it drops must not be: the report covers what
+    /// was installed, not what used to be.
+    // The captured frontend is the TUI's; without it there is no such
+    // migration to report about.
+    #[cfg(feature = "tui")]
+    #[test]
+    fn a_migrations_report_scans_the_binaries_the_destination_committed() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join("cargo-lbin-test-migrate-report-bins");
+        let _ = fs::remove_dir_all(&root);
+        let source = seeded_prefix(&root, "source", "okcrate", false, false);
+        let dest = root.join("dest");
+        let distro_bin = root.join("distro/bin");
+        fs::create_dir_all(dest.join("bin")).unwrap();
+        fs::create_dir_all(dest.join("share/cargo-lbin")).unwrap();
+        fs::create_dir_all(&distro_bin).unwrap();
+        // The distro ships only the helper — the name the source
+        // version never had, and the one the new version adds.
+        let helper = distro_bin.join("okcrate-helper");
+        fs::write(&helper, "#!/bin/sh\n").unwrap();
+        fs::set_permissions(&helper, fs::Permissions::from_mode(0o755)).unwrap();
+        let _fake =
+            crate::stage::FakeCargo::install(&two_bin_fake(&root, "okcrate", "okcrate-helper"));
+
+        let snap = MigrationSnapshot::capture(
+            "okcrate",
+            &Manifest::load(&source).unwrap().crates["okcrate"],
+        )
+        .unwrap();
+        assert_eq!(snap.bins, vec!["okcrate".to_owned()], "the source's set");
+
+        let said = std::cell::RefCell::new(Vec::new());
+        let control = BuildControl::new();
+        let outcome = {
+            let mut on_line = |k: LineKind, l: &str| {
+                if matches!(k, LineKind::Warning) {
+                    said.borrow_mut().push(l.to_owned());
+                }
+            };
+            let mut before_placement = |_: &Path| Ok(());
+            // No extra gate here: `FakeCargo` already holds the one that
+            // serializes spawn- and PATH-sensitive tests, and taking it
+            // twice would deadlock. The system PATH stays on the end —
+            // the fake cargo shells out to mkdir and chmod.
+            let old_path = std::env::var_os("PATH");
+            let scan_path = format!(
+                "{}:{}:{}",
+                distro_bin.display(),
+                dest.join("bin").display(),
+                old_path
+                    .as_ref()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            );
+            // SAFETY: serialized by the FakeCargo lock this test holds.
+            unsafe { std::env::set_var("PATH", scan_path) };
+            let outcome = migrate_one(
+                &source,
+                &dest,
+                &root.join("cache"),
+                "okcrate",
+                &snap,
+                &mut MigrateFrontend::Captured {
+                    on_line: &mut on_line,
+                    before_placement: &mut before_placement,
+                    control: &control,
+                },
+            );
+            match old_path {
+                // SAFETY: as above.
+                Some(v) => unsafe { std::env::set_var("PATH", v) },
+                None => unsafe { std::env::remove_var("PATH") },
+            }
+            outcome
+        }
+        .unwrap();
+        assert!(
+            matches!(outcome, MigrateOutcome::Moved { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            Manifest::load(&dest).unwrap().crates["okcrate"].bins,
+            vec!["okcrate".to_owned(), "okcrate-helper".to_owned()],
+            "the destination committed both binaries"
+        );
+        let said = said.into_inner();
+        assert!(
+            said.iter()
+                .any(|l| l.contains("okcrate-helper") && l.contains(&helper.display().to_string())),
+            "a binary the new version added is scanned too: {said:?}"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The deferred report, in the four states Phase B can leave behind.
+    /// Each is the real filesystem and the real PATH at the moment the
+    /// migration finishes — nothing is predicted, so nothing can be
+    /// predicted wrongly.
+    #[test]
+    fn a_migrations_shadow_report_describes_the_state_phase_b_left() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join("cargo-lbin-test-shadow-after-retire");
+        let _ = fs::remove_dir_all(&root);
+        let source_bin = root.join("source/bin");
+        let distro_bin = root.join("distro/bin");
+        let dest = root.join("dest");
+        for d in [&source_bin, &distro_bin, &dest.join("bin")] {
+            fs::create_dir_all(d).unwrap();
+        }
+        let put = |dir: &Path| {
+            let f = dir.join("tool");
+            fs::write(&f, "#!/bin/sh\n").unwrap();
+            fs::set_permissions(&f, fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        let bins = vec!["tool".to_owned()];
+        let notes = |path: String| {
+            // PATH is process-wide: the same gate the spawn-sensitive
+            // tests use keeps this from racing them.
+            let _serial = crate::stage::no_spawned_children();
+            let old = std::env::var_os("PATH");
+            // SAFETY: serialized by the gate above.
+            unsafe { std::env::set_var("PATH", path) };
+            let notes = migration_shadow_notes(&dest, &bins);
+            match old {
+                // SAFETY: as above.
+                Some(v) => unsafe { std::env::set_var("PATH", v) },
+                None => unsafe { std::env::remove_var("PATH") },
+            }
+            notes
+        };
+        let with_dest = format!(
+            "{}:{}:{}",
+            source_bin.display(),
+            distro_bin.display(),
+            dest.join("bin").display()
+        );
+
+        // Retired, and a copy further down PATH takes over the name: the
+        // report names *that* copy, which the pre-retirement scan never
+        // even looked at.
+        put(&distro_bin);
+        let after = notes(with_dest.clone());
+        assert_eq!(after.len(), 1, "{after:?}");
+        assert!(
+            after[0].contains(&distro_bin.join("tool").display().to_string()),
+            "the copy that actually shadows now: {after:?}"
+        );
+
+        // Incomplete: retirement refused or failed, so the source stands
+        // — and is reported, because it is still there.
+        put(&source_bin);
+        let incomplete = notes(with_dest.clone());
+        assert_eq!(incomplete.len(), 1, "{incomplete:?}");
+        assert!(
+            incomplete[0].contains(&source_bin.join("tool").display().to_string()),
+            "a source that survived is news: {incomplete:?}"
+        );
+
+        // Retired, nothing replaces it, and the destination is on PATH:
+        // there is nothing true left to say.
+        fs::remove_file(source_bin.join("tool")).unwrap();
+        fs::remove_file(distro_bin.join("tool")).unwrap();
+        assert!(notes(with_dest).is_empty(), "silence is the honest answer");
+
+        // Same, but the destination is not on PATH: the fact that is
+        // about the destination rather than any shadow stands alone.
+        let without_dest = format!("{}:{}", source_bin.display(), distro_bin.display());
+        let unreachable = notes(without_dest);
+        assert_eq!(
+            unreachable,
+            vec![format!("{} is not on PATH", dest.join("bin").display())],
+            "the binary is unreachable by name, and that is said plainly"
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -5983,6 +6288,7 @@ mod tests {
             None,
             false,
             PinPolicy::Infer,
+            ShadowReport::OnCommit,
             &mut Frontend::Terminal,
         )
         .unwrap_err();
@@ -6685,6 +6991,7 @@ mod tests {
             None,
             false,
             PinPolicy::Infer,
+            ShadowReport::OnCommit,
             &mut Frontend::Captured {
                 on_line: &mut |k, l| lines.push((k, l.to_owned())),
                 before_placement: &mut |_| {
