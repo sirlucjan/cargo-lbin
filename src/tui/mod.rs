@@ -323,28 +323,201 @@ struct PendingMigrate {
     snap: crate::MigrationSnapshot,
 }
 
+/// A group of per-member lines in a batch's closing panel: the
+/// backend's key for it, and the heading the person reads.
+struct BatchSection<K> {
+    key: K,
+    header: &'static str,
+    entries: BatchEntries,
+}
+
+/// The queue and the tallies of a batch, and nothing about what its
+/// members do.
+///
+/// This is the part two batches were always going to have in common:
+/// how many there are, how many are done, what each of them had to say
+/// and what is left if the batch stops early. What it deliberately does
+/// *not* hold is the meaning of any of it — which outcome belongs in
+/// which section, whether a failure ends the batch, what the summary
+/// calls the work. Those differ per operation and stay with the
+/// operation; a runner that knew them would be a runner with `if kind`
+/// in it, which is the thing this extraction exists to avoid.
+///
+/// Sections are declared by the backend at construction, in the order
+/// the panel should show them, and named afterwards by the backend's
+/// own key — never by the heading, which is there to be read.
+struct BatchRunner<T, K> {
+    queue: std::collections::VecDeque<T>,
+    total: usize,
+    succeeded: usize,
+    sections: Vec<BatchSection<K>>,
+    /// The last mid-batch reload failure, resurfaced at the summary.
+    reload_error: Option<String>,
+}
+
+impl<T, K: Copy + PartialEq + std::fmt::Debug> BatchRunner<T, K> {
+    /// Declared with the backend's own key per section, paired with the
+    /// heading it shows. The key is what `record` names; the heading is
+    /// only ever read. Keeping them apart means rewording a panel
+    /// cannot silently move where a member's lines are filed.
+    fn new(queue: std::collections::VecDeque<T>, sections: &[(K, &'static str)]) -> Self {
+        Self {
+            total: queue.len(),
+            queue,
+            succeeded: 0,
+            sections: sections
+                .iter()
+                .map(|(key, header)| BatchSection {
+                    key: *key,
+                    header,
+                    entries: Vec::new(),
+                })
+                .collect(),
+            reload_error: None,
+        }
+    }
+
+    /// The member to start next, if the queue still has one.
+    fn next_member(&mut self) -> Option<T> {
+        self.queue.pop_front()
+    }
+
+    fn remaining(&self) -> usize {
+        self.queue.len()
+    }
+
+    /// One member finished well.
+    fn succeeded(&mut self) {
+        self.succeeded += 1;
+    }
+
+    /// One member has something to say, filed under a section the
+    /// backend declared.
+    ///
+    /// A key that was never declared is a programming error, and it
+    /// panics rather than dropping the lines or filing them beside a
+    /// neighbour. Both of those would be quiet: the diagnostics would
+    /// vanish, the count behind them would stay zero, and a batch that
+    /// failed could end up presenting itself as one that did not.
+    fn record(&mut self, key: K, name: &str, lines: Vec<String>) {
+        let section = self
+            .sections
+            .iter_mut()
+            .find(|s| s.key == key)
+            .unwrap_or_else(|| panic!("batch section {key:?} was never declared"));
+        section.entries.push((name.to_owned(), lines));
+    }
+
+    /// How many members are filed under a section — and, like `record`,
+    /// loud about a key that was never declared. A silent zero here
+    /// would be the same lie arriving by the other door: a backend
+    /// asking about the wrong section would read "nothing failed" and
+    /// summarise a batch that did.
+    fn recorded(&self, key: K) -> usize {
+        self.sections
+            .iter()
+            .find(|s| s.key == key)
+            .unwrap_or_else(|| panic!("batch section {key:?} was never declared"))
+            .entries
+            .len()
+    }
+
+    fn quiet(&self) -> bool {
+        self.reload_error.is_none() && self.sections.iter().all(|s| s.entries.is_empty())
+    }
+
+    /// The closing panel's lines: the non-empty sections in declared
+    /// order, then the reload failure if there was one.
+    fn report_lines(&self) -> Vec<String> {
+        let mut lines: Vec<String> = Vec::new();
+        for section in &self.sections {
+            if section.entries.is_empty() {
+                continue;
+            }
+            if !lines.is_empty() {
+                lines.push(String::new());
+            }
+            lines.push(section.header.to_owned());
+            for (name, entry_lines) in &section.entries {
+                lines.push(crate::text::sanitize(&format!("  {name}:")));
+                for line in entry_lines {
+                    lines.push(crate::text::sanitize(&format!("    {line}")));
+                }
+            }
+        }
+        if let Some(e) = &self.reload_error {
+            if !lines.is_empty() {
+                lines.push(String::new());
+            }
+            lines.push(crate::text::sanitize(&format!(
+                "(and a mid-batch list reload failed: {e})"
+            )));
+        }
+        lines
+    }
+
+    /// `<head>`, plus what was left when a batch stopped early. The
+    /// head is the backend's sentence: only it knows what the work was
+    /// called or where it was going.
+    fn summary(&self, head: &str, ended_early: Option<&str>) -> String {
+        let mut summary = head.to_owned();
+        if let Some(how) = ended_early {
+            let unprocessed = self.remaining();
+            // write!, not push_str(&format!(..)): no second allocation.
+            let _ = std::fmt::Write::write_fmt(
+                &mut summary,
+                format_args!(" ({how}; {unprocessed} not attempted)"),
+            );
+        }
+        summary
+    }
+}
+
+/// A batch member's name and the lines it contributed to the summary.
+type BatchEntries = Vec<(String, Vec<String>)>;
+
 /// A confirmed `M`: `migrate --all` as a queue of the very single
 /// migrations `m` runs — each its own unit, preflight and cancel door.
 /// The batch owns the tally and one final summary: the CLI's
 /// "reported, and the batch moves on", in the TUI's shape.
+///
+/// The queue, plus the one fact that is migration's own.
+///
+/// Everything else — counts, per-member lines, what is left if it stops
+/// — lives in the runner. What stays here is the destination, because
+/// only a migration has one, and the section headers below, because
+/// only a migration can end with a destination committed and a source
+/// still standing.
 struct MigrateBatch {
     dest: PathBuf,
-    queue: std::collections::VecDeque<PendingMigrate>,
-    total: usize,
-    moved: usize,
-    /// `(name, lines)` — destination committed, source not retired: the
-    /// Incomplete reason plus that member's warnings.
-    warned: Vec<(String, Vec<String>)>,
-    /// `(name, lines)` — the same diagnostics a single failure panel
-    /// gets; the already-installed refusal counts as a shortfall, as on
-    /// the CLI.
-    failed: Vec<(String, Vec<String>)>,
-    /// `(name, warnings)` — fully migrated members whose build spoke
-    /// warnings: the summary must not launder them.
-    noticed: Vec<(String, Vec<String>)>,
-    /// The last mid-batch reload failure, resurfaced at the summary.
-    reload_error: Option<String>,
+    runner: BatchRunner<PendingMigrate, MigrateSection>,
 }
+
+/// What a migration's members can end up being, and therefore the
+/// sections `M`'s panel can have. Migration's own vocabulary: no other
+/// batch can commit a destination and leave a source standing.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum MigrateSection {
+    /// The same diagnostics a single failure panel gets; the
+    /// already-installed refusal counts as a shortfall, as on the CLI.
+    Failed,
+    /// Destination committed, source not retired: the Incomplete reason
+    /// plus that member's warnings.
+    Incomplete,
+    /// Fully migrated members whose build spoke warnings: the summary
+    /// must not launder them.
+    Noticed,
+}
+
+/// The headings those sections carry in the panel, in panel order.
+const MIGRATE_SECTIONS: &[(MigrateSection, &str)] = &[
+    (MigrateSection::Failed, "failed:"),
+    (
+        MigrateSection::Incomplete,
+        "destination committed, source not retired:",
+    ),
+    (MigrateSection::Noticed, "migrated, with build warnings:"),
+];
 
 /// Did the attempt actually start a worker?
 ///
@@ -1050,7 +1223,9 @@ impl App {
                         // A batch cannot wait on a worker that never existed: the refusal is
                         // recorded as a failure where the summary will not overwrite it.
                         Some(batch) => {
-                            batch.failed.push((member, vec![reason]));
+                            batch
+                                .runner
+                                .record(MigrateSection::Failed, &member, vec![reason]);
                             self.finalize_migrate_batch(Some("aborted"));
                         }
                         None => self.error(&reason),
@@ -1760,33 +1935,42 @@ impl App {
                 return;
             };
             if let Some(e) = reload_error {
-                batch.reload_error = Some(e);
+                batch.runner.reload_error = Some(e);
             }
-            // The same diagnostics contract as a single job, member by member:
-            // warnings not laundered, terse failures get the tail, Incomplete
-            // reasons travel with their member's warnings.
+            // The classification is migration's own — which outcome
+            // means what, and which section it belongs in. The runner
+            // only files it. The diagnostics contract is a single job's,
+            // member by member: warnings not laundered, terse failures
+            // get the tail, Incomplete reasons travel with their
+            // member's warnings.
             match outcome {
                 BuildOutcome::Success | BuildOutcome::Migrated(_) => {
-                    batch.moved += 1;
+                    batch.runner.succeeded();
                     if !warnings.is_empty() {
-                        batch.noticed.push((name.to_owned(), warnings));
+                        batch.runner.record(MigrateSection::Noticed, name, warnings);
                     }
                 }
                 BuildOutcome::Cancelled => {}
                 BuildOutcome::CompletedWithWarning(reason) => {
                     let mut lines = vec![crate::text::sanitize(&reason)];
                     lines.extend(warnings);
-                    batch.warned.push((name.to_owned(), lines));
+                    batch.runner.record(MigrateSection::Incomplete, name, lines);
                 }
                 BuildOutcome::Failed(e) => {
-                    batch
-                        .failed
-                        .push((name.to_owned(), Self::failure_lines(&e, tail)));
+                    batch.runner.record(
+                        MigrateSection::Failed,
+                        name,
+                        Self::failure_lines(&e, tail),
+                    );
                 }
             }
+            // A member counted in NOTICED also succeeded, so the tally
+            // is succeeded plus the two sections that are not it.
             (
-                batch.moved + batch.warned.len() + batch.failed.len(),
-                batch.total,
+                batch.runner.succeeded
+                    + batch.runner.recorded(MigrateSection::Incomplete)
+                    + batch.runner.recorded(MigrateSection::Failed),
+                batch.runner.total,
             )
         };
         if cancelled {
@@ -1797,7 +1981,7 @@ impl App {
         let next = self
             .migrate_batch
             .as_mut()
-            .and_then(|batch| batch.queue.pop_front());
+            .and_then(|batch| batch.runner.next_member());
         match next {
             Some(req) => self.pending_migrate = Some(req),
             None => self.finalize_migrate_batch(None),
@@ -1810,28 +1994,21 @@ impl App {
         let Some(batch) = self.migrate_batch.take() else {
             return;
         };
-        let MigrateBatch {
-            dest,
-            queue,
-            total,
-            moved,
-            warned,
-            failed,
-            noticed,
-            reload_error,
-        } = batch;
-        // Tally plus queue must add up to the plan: a refused member sits
-        // in `failed`, so "not attempted" is exactly what is still queued.
-        let mut summary = format!("migrated {moved} of {total} to {}", dest.display());
-        if let Some(how) = ended_early {
-            let unprocessed = queue.len();
-            // write!, not push_str(&format!(..)): no second allocation.
-            let _ = std::fmt::Write::write_fmt(
-                &mut summary,
-                format_args!(" ({how}; {unprocessed} not attempted)"),
-            );
-        }
-        if warned.is_empty() && failed.is_empty() && noticed.is_empty() && reload_error.is_none() {
+        let MigrateBatch { dest, runner } = batch;
+        // Tally plus queue must add up to the plan: a refused member
+        // sits in a section, so "not attempted" is exactly what is
+        // still queued. The head is migration's to word — only it knows
+        // where the crates were going.
+        let summary = runner.summary(
+            &format!(
+                "migrated {} of {} to {}",
+                runner.succeeded,
+                runner.total,
+                dest.display()
+            ),
+            ended_early,
+        );
+        if runner.quiet() {
             if ended_early.is_some() {
                 self.warn(&summary);
             } else {
@@ -1839,41 +2016,13 @@ impl App {
             }
             return;
         }
-        let mut lines = Vec::new();
-        let section = |lines: &mut Vec<String>, header: &str, entries: &[(String, Vec<String>)]| {
-            if entries.is_empty() {
-                return;
-            }
-            if !lines.is_empty() {
-                lines.push(String::new());
-            }
-            lines.push(header.to_owned());
-            for (name, entry_lines) in entries {
-                lines.push(crate::text::sanitize(&format!("  {name}:")));
-                for line in entry_lines {
-                    lines.push(crate::text::sanitize(&format!("    {line}")));
-                }
-            }
-        };
-        section(&mut lines, "failed:", &failed);
-        section(
-            &mut lines,
-            "destination committed, source not retired:",
-            &warned,
-        );
-        section(&mut lines, "migrated, with build warnings:", &noticed);
-        if let Some(e) = reload_error {
-            if !lines.is_empty() {
-                lines.push(String::new());
-            }
-            lines.push(crate::text::sanitize(&format!(
-                "(and a mid-batch list reload failed: {e})"
-            )));
-        }
         self.pin_report(BuildReport {
-            title: format!("migrate --all: {moved} of {total} migrated"),
-            lines,
-            failed: !failed.is_empty(),
+            title: format!(
+                "migrate --all: {} of {} migrated",
+                runner.succeeded, runner.total
+            ),
+            lines: runner.report_lines(),
+            failed: runner.recorded(MigrateSection::Failed) > 0,
         });
         self.warn(&format!(
             "{summary} — details in the panel; Esc/Enter dismisses"
@@ -2628,22 +2777,11 @@ impl App {
                     });
                 }
                 OnConfirm::MigrateAll { dest, plan } => {
-                    let mut queue: std::collections::VecDeque<PendingMigrate> =
-                        plan.into_iter().collect();
-                    let total = queue.len();
-                    let Some(first) = queue.pop_front() else {
+                    let mut runner = BatchRunner::new(plan.into_iter().collect(), MIGRATE_SECTIONS);
+                    let Some(first) = runner.next_member() else {
                         return;
                     };
-                    self.migrate_batch = Some(MigrateBatch {
-                        dest,
-                        queue,
-                        total,
-                        moved: 0,
-                        warned: Vec::new(),
-                        failed: Vec::new(),
-                        noticed: Vec::new(),
-                        reload_error: None,
-                    });
+                    self.migrate_batch = Some(MigrateBatch { dest, runner });
                     self.pending_migrate = Some(first);
                 }
             }
@@ -3448,6 +3586,19 @@ mod tests {
         Version::parse(s).unwrap()
     }
 
+    /// A migrate runner mid-flight: `total` planned, `succeeded`
+    /// already done, the rest still queued.
+    fn batch_runner(
+        queue: std::collections::VecDeque<PendingMigrate>,
+        total: usize,
+        succeeded: usize,
+    ) -> BatchRunner<PendingMigrate, MigrateSection> {
+        let mut runner = BatchRunner::new(queue, MIGRATE_SECTIONS);
+        runner.total = total;
+        runner.succeeded = succeeded;
+        runner
+    }
+
     fn manifest(entries: &[(&str, &str)]) -> Manifest {
         let mut m = Manifest::default();
         for (name, version) in entries {
@@ -4085,6 +4236,69 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// The runner files and counts; it does not judge. Sections are the
+    /// backend's, declared in panel order, and a member's outcome is
+    /// filed by the backend into one of them — which is the whole
+    /// division this extraction exists to make.
+    #[test]
+    fn the_runner_keeps_the_queue_and_the_backend_keeps_the_meaning() {
+        #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+        enum Section {
+            Failed,
+            Noted,
+            Undeclared,
+        }
+        let mut runner: BatchRunner<u8, Section> = BatchRunner::new(
+            [1u8, 2, 3].into_iter().collect(),
+            &[(Section::Failed, "failed:"), (Section::Noted, "noted:")],
+        );
+        assert_eq!(runner.total, 3);
+        assert_eq!(runner.next_member(), Some(1));
+        assert_eq!(runner.remaining(), 2, "what a stop would leave unattempted");
+        assert!(runner.quiet(), "nothing to show yet");
+
+        runner.succeeded();
+        runner.record(Section::Failed, "bar", vec!["boom".to_owned()]);
+        runner.record(Section::Noted, "baz", vec!["warning: x".to_owned()]);
+        assert_eq!(runner.recorded(Section::Failed), 1);
+        assert!(!runner.quiet(), "a filed line means a panel");
+
+        // Sections appear in the order the backend declared, not the
+        // order things happened.
+        let lines = runner.report_lines();
+        let failed_at = lines.iter().position(|l| l == "failed:").unwrap();
+        let noted_at = lines.iter().position(|l| l == "noted:").unwrap();
+        assert!(failed_at < noted_at, "{lines:?}");
+        assert!(lines.iter().any(|l| l.contains("boom")), "{lines:?}");
+
+        // The head is the backend's sentence; the runner only appends
+        // what it alone knows — how much was left.
+        assert_eq!(
+            runner.summary("did 1 of 3", Some("cancelled")),
+            "did 1 of 3 (cancelled; 2 not attempted)"
+        );
+        assert_eq!(runner.summary("did 1 of 3", None), "did 1 of 3");
+
+        // A section the backend never declared is a programming error,
+        // and it is loud: neither the lines nor the count behind them
+        // may go missing quietly.
+        let declared: &[(Section, &str)] = &[(Section::Failed, "f:")];
+        let writing = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut runner: BatchRunner<u8, Section> =
+                BatchRunner::new(std::collections::VecDeque::new(), declared);
+            runner.record(Section::Undeclared, "qux", vec!["lost".to_owned()]);
+        }));
+        assert!(writing.is_err(), "filing into an undeclared section panics");
+        // And asking about one: a silent zero would be the same lie
+        // arriving by the other door.
+        let reading = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let runner: BatchRunner<u8, Section> =
+                BatchRunner::new(std::collections::VecDeque::new(), declared);
+            runner.recorded(Section::Undeclared)
+        }));
+        assert!(reading.is_err(), "asking about one panics too");
+    }
+
     /// The record says what the person did. A downgrade's panel, its
     /// messages and its failure title all speak the operation's own
     /// word — calling it an install would describe something nobody
@@ -4306,13 +4520,7 @@ mod tests {
         // members has an empty job slot and a live queue.
         app.migrate_batch = Some(MigrateBatch {
             dest: prefix.join("elsewhere"),
-            queue: std::collections::VecDeque::new(),
-            total: 1,
-            moved: 0,
-            warned: Vec::new(),
-            failed: Vec::new(),
-            noticed: Vec::new(),
-            reload_error: None,
+            runner: batch_runner(std::collections::VecDeque::new(), 1, 0),
         });
         app.remove_confirmed("bar".into());
         assert!(
@@ -4492,13 +4700,7 @@ mod tests {
         // announce what the destination committed, not echo the plan.
         app.migrate_batch = Some(MigrateBatch {
             dest: dest.clone(),
-            queue: [pending("bar")].into_iter().collect(),
-            total: 2,
-            moved: 0,
-            warned: Vec::new(),
-            failed: Vec::new(),
-            noticed: Vec::new(),
-            reload_error: None,
+            runner: batch_runner([pending("bar")].into_iter().collect(), 2, 0),
         });
         let no_tail = VecDeque::new();
         app.finish_batch_step(
@@ -4510,8 +4712,12 @@ mod tests {
         );
         assert!(app.pending_migrate.is_some(), "the queue advanced");
         let batch = app.migrate_batch.as_ref().unwrap();
-        assert_eq!(batch.moved, 1);
-        assert_eq!(batch.noticed.len(), 1, "the shadow warning survived");
+        assert_eq!(batch.runner.succeeded, 1);
+        assert_eq!(
+            batch.runner.recorded(MigrateSection::Noticed),
+            1,
+            "the shadow warning survived"
+        );
         assert!(
             app.message
                 .as_ref()
@@ -4542,13 +4748,7 @@ mod tests {
         // ...and a cancel ends the batch with the queue dropped.
         app.migrate_batch = Some(MigrateBatch {
             dest: dest.clone(),
-            queue: [pending("baz"), pending("qux")].into_iter().collect(),
-            total: 3,
-            moved: 1,
-            warned: Vec::new(),
-            failed: Vec::new(),
-            noticed: Vec::new(),
-            reload_error: None,
+            runner: batch_runner([pending("baz"), pending("qux")].into_iter().collect(), 3, 1),
         });
         app.finish_batch_step(
             "bar",
