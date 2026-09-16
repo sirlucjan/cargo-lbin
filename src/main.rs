@@ -92,8 +92,22 @@ enum Cmd {
         crates: Vec<String>,
         /// Build with the crate's committed Cargo.lock (reproducible; skips
         /// newer dependency releases until the crate itself releases)
-        #[arg(long)]
+        #[arg(long, conflicts_with = "reinstall")]
         locked: bool,
+        /// Rebuild what is already installed, exactly as the manifest
+        /// records it
+        ///
+        /// The entry is the specification: its version, its pin and its
+        /// `--locked` are all carried over. For rebuilding after a
+        /// toolchain, libc or compiler-flag change — new artifacts, same
+        /// logical installation. Naming a version or `--locked`
+        /// alongside it is a usage error: the entry already says both.
+        ///
+        /// Cargo still uses the registry and its caches to build that
+        /// version; what is not asked is *which* version or policy to
+        /// apply.
+        #[arg(long)]
+        reinstall: bool,
     },
     /// Remove previously installed binaries
     Remove {
@@ -339,7 +353,11 @@ fn main() -> ExitCode {
         eprintln!("warning: {note}");
     }
     let result = match cli.cmd {
-        Cmd::Install { ref crates, locked } => cmd_install(&cli.prefix, crates, locked),
+        Cmd::Install {
+            ref crates,
+            locked,
+            reinstall,
+        } => cmd_install(&cli.prefix, crates, locked, reinstall),
         Cmd::Remove { ref crates } => cmd_remove(&cli.prefix, crates),
         Cmd::Verify { json } => cmd_verify(&cli.prefix, json),
         Cmd::Pin { ref crates } => cmd_set_pinned(&cli.prefix, crates, true),
@@ -1570,25 +1588,22 @@ fn pasteable_prefix(prefix: &Path) -> Option<String> {
     pasteable_path_arg("--prefix", prefix)
 }
 
-/// The reinstall a disk finding may name — `None` when the prefix has
-/// no safe spelling. When present it is true: the audited prefix
-/// always, the pinned version (a bare `install` bounces off the pin),
-/// `--locked` when the entry carries it. Only the prefix needs
-/// quoting: name and version already passed validation — shell-inert
-/// alphabets.
-fn reinstall_hint(prefix: &Path, name: &str, entry: &Entry) -> Option<String> {
+/// The repair a disk finding may name — `None` when the prefix has no
+/// safe spelling.
+///
+/// `--reinstall` is the exact shape a repair wants: rebuild *this*
+/// installation, whatever it is. Spelling the entry out instead — a
+/// version for a pinned crate, `--locked` when it carries it, nothing
+/// for an unpinned one — repaired an unpinned crate by moving it to
+/// the newest release, which is a version change wearing a repair's
+/// clothes. The flag reads the entry the same way verify just did.
+/// Only the prefix needs quoting: the name already passed validation —
+/// a shell-inert alphabet.
+fn reinstall_hint(prefix: &Path, name: &str, _entry: &Entry) -> Option<String> {
     let prefix_arg = pasteable_prefix(prefix)?;
-    let mut hint = format!("cargo lbin install {name}");
-    if entry.pinned {
-        hint.push('@');
-        hint.push_str(&entry.version);
-    }
-    if entry.locked {
-        hint.push_str(" --locked");
-    }
-    hint.push(' ');
-    hint.push_str(&prefix_arg);
-    Some(hint)
+    Some(format!(
+        "cargo lbin install --reinstall {name} {prefix_arg}"
+    ))
 }
 
 /// One managed binary's disk verdict: the remedy text and the bare
@@ -2503,42 +2518,124 @@ pub(crate) fn tui_install_one(
     Ok(())
 }
 
-fn cmd_install(prefix: &Path, crates: &[String], locked: bool) -> Result<()> {
+fn cmd_install(prefix: &Path, crates: &[String], locked: bool, reinstall: bool) -> Result<()> {
     // Parsed and de-duplicated first: the pin check runs once against the
     // manifest as it is now (see `parse_all`).
     let specs = InstallSpec::parse_all(crates)?;
+    if reinstall && let Some(s) = specs.iter().find(|s| s.version.is_some()) {
+        // Two answers to "which version", and no reason to prefer one:
+        // the entry already states it.
+        bail!(
+            "`--reinstall` takes the version from the manifest; \
+             drop `@` from `{}` or drop `--reinstall`",
+            s.name
+        );
+    }
     let cache = cache_dir()?;
     let _lock = StateLock::acquire(prefix, &Mode::Exclusive)?;
     let mut manifest = Manifest::load(prefix)?;
-    // A bare reinstall builds the newest version — exactly what a pin
+    // A bare install builds the newest version — exactly what a pin
     // forbids; refuse before the first build. Naming a version is a
-    // re-pin and is allowed.
-    let unversioned: Vec<String> = specs
+    // re-pin and is allowed, and `--reinstall` never leaves the version
+    // the pin declares, so it has nothing to refuse.
+    if !reinstall {
+        let unversioned: Vec<String> = specs
+            .iter()
+            .filter(|s| s.version.is_none())
+            .map(|s| s.name.clone())
+            .collect();
+        refuse_pinned(&manifest, &unversioned)?;
+    }
+    // Every plan is resolved before the first build: "not installed" is
+    // knowable from the manifest alone, and a batch that discovers it
+    // after twenty minutes of compiling spent that time to report
+    // something it knew at the start.
+    let plans: Vec<Option<ReinstallPlan>> = specs
         .iter()
-        .filter(|s| s.version.is_none())
-        .map(|s| s.name.clone())
-        .collect();
-    refuse_pinned(&manifest, &unversioned)?;
+        .map(|s| {
+            reinstall
+                .then(|| reinstall_plan(&manifest, &s.name))
+                .transpose()
+        })
+        .collect::<Result<_>>()?;
     let mut frontend = Frontend::Terminal;
     // Before the first build: the person still holds the whole batch
     // and has invested nothing.
     for w in duplicate_install_warnings(prefix, &manifest, specs.iter().map(|s| s.name.as_str())) {
         frontend.warning(&w);
     }
-    for spec in &specs {
+    for (spec, plan) in specs.iter().zip(&plans) {
+        // `--reinstall` reads the entry as the specification — version,
+        // pin and `--locked` together — so what it rebuilds is this
+        // installation rather than whatever the registry now calls
+        // newest. The read above needs no further guarding: this lock
+        // was taken before the manifest was loaded and is held across
+        // every build in the batch, so nothing else can move an entry
+        // between the plan and its commit.
+        let (version, locked, pin) = match plan {
+            Some(plan) => (
+                Some(&plan.version),
+                plan.locked,
+                PinPolicy::Exactly(plan.pinned),
+            ),
+            // `Infer` is install's own rule: an exact version pins,
+            // otherwise an existing pin is carried over.
+            None => (spec.version.as_ref(), locked, PinPolicy::Infer),
+        };
         install_and_commit(
             prefix,
             &cache,
             &mut manifest,
             &spec.name,
-            spec.version.as_ref(),
+            version,
             locked,
-            PinPolicy::Infer,
+            pin,
             ShadowReport::OnCommit,
             &mut frontend,
         )?;
     }
     Ok(())
+}
+
+/// What `--reinstall` rebuilds: the entry, read as a specification.
+///
+/// Three facts, not one. The version says what to build; the pin and
+/// `--locked` say what this installation *is*, and a rebuild that
+/// dropped either would change the thing it claims to preserve — an
+/// unpinned crate must not come back pinned just because the version
+/// was named, and a crate built reproducibly must not quietly start
+/// resolving dependencies afresh.
+struct ReinstallPlan {
+    version: Version,
+    pinned: bool,
+    locked: bool,
+}
+
+fn reinstall_plan(manifest: &Manifest, name: &str) -> Result<ReinstallPlan> {
+    // Nothing to re-install, and installing the newest instead would be
+    // answering a question nobody asked.
+    let entry = manifest
+        .crates
+        .get(name)
+        .with_context(|| format!("not installed: {name}"))?;
+    // Destructured exhaustively, like `MigrationSnapshot`: this claims
+    // to rebuild the entry, so a field added later must be considered
+    // here rather than silently dropped. `bins` is the one part the
+    // build decides for itself — the rebuild recomputes it.
+    let Entry {
+        version,
+        bins: _,
+        locked,
+        pinned,
+    } = entry;
+    let version = Version::parse(version).with_context(|| {
+        format!("`{name}` records an unparsable version ({version}); verify says more")
+    })?;
+    Ok(ReinstallPlan {
+        version,
+        pinned: *pinned,
+        locked: *locked,
+    })
 }
 
 /// Error if any of `crates` is pinned: a pin is the more deliberate
@@ -5617,7 +5714,7 @@ mod tests {
         assert_eq!(errors.len(), 1);
         assert!(errors[0].message.contains("is missing"), "{errors:?}");
         assert!(
-            errors[0].message.contains("install okcrate"),
+            errors[0].message.contains("install --reinstall okcrate"),
             "the finding names the repair: {errors:?}"
         );
         assert!(
@@ -5671,26 +5768,6 @@ mod tests {
         )
         .unwrap();
 
-        // A pinned crate's remedy names the pinned version — a bare
-        // `install` would be refused by the pin itself.
-        let mut pinned = Manifest::load(&prefix).unwrap();
-        pinned.crates.get_mut("okcrate").unwrap().pinned = true;
-        fs::remove_file(prefix.join("bin/okcrate")).unwrap();
-        let (errors, _) = verify_entries(&prefix, &pinned);
-        assert!(
-            errors[0].message.contains("install okcrate@0.1.0"),
-            "the pinned remedy is the exact re-pin: {errors:?}"
-        );
-
-        // A locked entry's remedy carries --locked: a repair that
-        // silently changes the entry's build policy is not a repair.
-        let mut locked = Manifest::load(&prefix).unwrap();
-        locked.crates.get_mut("okcrate").unwrap().locked = true;
-        let (errors, _) = verify_entries(&prefix, &locked);
-        assert!(
-            errors[0].message.contains("--locked"),
-            "the locked remedy keeps the policy: {errors:?}"
-        );
         fs::write(prefix.join("bin/okcrate"), "#!/bin/sh\ntrue\n").unwrap();
         fs::set_permissions(
             prefix.join("bin/okcrate"),
@@ -6121,7 +6198,10 @@ mod tests {
             .hint
             .as_deref()
             .expect("a missing binary names its repair");
-        assert!(hint.starts_with("cargo lbin install okcrate@"), "{hint}");
+        assert!(
+            hint.starts_with("cargo lbin install --reinstall okcrate"),
+            "{hint}"
+        );
         assert!(
             f.message.contains(hint),
             "the human line embeds the same command the field carries"
@@ -6659,6 +6739,149 @@ mod tests {
             outside.join("keep").exists() && outside.join(".lease").exists(),
             "zero traversal: the link's target is untouched by the scan"
         );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// One remedy for every entry, whatever the entry says. `--reinstall`
+    /// reads the pin, the version and `--locked` itself, so the hint
+    /// does not restate them — and cannot drift from them.
+    #[test]
+    fn the_repair_hint_reads_the_entry_instead_of_restating_it() {
+        let root = std::env::temp_dir().join("cargo-lbin-test-verify-remedy");
+        let _ = fs::remove_dir_all(&root);
+        let prefix = seeded_prefix(&root, "prefix", "okcrate", false, false);
+        fs::remove_file(prefix.join("bin/okcrate")).unwrap();
+
+        let mut pinned = Manifest::load(&prefix).unwrap();
+        pinned.crates.get_mut("okcrate").unwrap().pinned = true;
+        let (errors, _) = verify_entries(&prefix, &pinned);
+        assert!(
+            errors[0].message.contains("install --reinstall okcrate"),
+            "the pinned remedy rebuilds the entry: {errors:?}"
+        );
+        assert!(
+            !errors[0].message.contains("okcrate@"),
+            "and does not name a version the entry already holds: {errors:?}"
+        );
+
+        let mut locked = Manifest::load(&prefix).unwrap();
+        locked.crates.get_mut("okcrate").unwrap().locked = true;
+        let (errors, _) = verify_entries(&prefix, &locked);
+        assert!(
+            !errors[0].message.contains("--locked"),
+            "nor a build policy it already carries: {errors:?}"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// `--reinstall` rebuilds the entry, not the newest release — and
+    /// gives back the same entry: same version, same pin, same
+    /// `--locked`. The fake cargo would happily build 0.2.0 if asked
+    /// for "latest", so the version alone proves the registry was not
+    /// consulted for the choice.
+    #[test]
+    fn reinstall_rebuilds_the_entry_and_returns_it_unchanged() {
+        let root = std::env::temp_dir().join("cargo-lbin-test-reinstall-entry");
+        let _ = fs::remove_dir_all(&root);
+        let _fake = crate::stage::FakeCargo::install(&versioned_fake(&root, "okcrate"));
+
+        for (pinned, locked) in [(true, true), (false, false), (true, false), (false, true)] {
+            // seeded_prefix's order is (locked, pinned).
+            let prefix = seeded_prefix(
+                &root,
+                &format!("p-{pinned}-{locked}"),
+                "okcrate",
+                locked,
+                pinned,
+            );
+            cmd_install(&prefix, &["okcrate".to_owned()], false, true).unwrap();
+            let entry = Manifest::load(&prefix).unwrap().crates["okcrate"].clone();
+            assert_eq!(
+                entry.version, "0.1.0",
+                "the entry's version, not whatever latest resolves to"
+            );
+            assert_eq!(entry.pinned, pinned, "the pin is preserved, either way");
+            assert_eq!(entry.locked, locked, "and so is --locked");
+            assert!(
+                prefix.join("bin/okcrate").exists(),
+                "and the binary is placed"
+            );
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Three refusals, all of the same shape: the entry is the
+    /// specification, so a second source for any part of it is a usage
+    /// error, and an absent entry is nothing to rebuild.
+    #[test]
+    fn reinstall_refuses_a_second_source_of_truth() {
+        let root = std::env::temp_dir().join("cargo-lbin-test-reinstall-refusals");
+        let _ = fs::remove_dir_all(&root);
+        let prefix = seeded_prefix(&root, "prefix", "okcrate", false, false);
+
+        let err = cmd_install(&prefix, &["okcrate@0.1.0".to_owned()], false, true)
+            .expect_err("two answers to which version");
+        assert!(
+            format!("{err:#}").contains("takes the version from the manifest"),
+            "{err:#}"
+        );
+
+        let err = cmd_install(&prefix, &["nosuchcrate".to_owned()], false, true)
+            .expect_err("nothing to rebuild");
+        assert!(
+            format!("{err:#}").contains("not installed: nosuchcrate"),
+            "{err:#}"
+        );
+
+        // And it is a preflight, not a late discovery: an absent crate
+        // behind a present one stops the batch before the first build,
+        // because the manifest already knew.
+        let _fake = crate::stage::FakeCargo::install(&versioned_fake(&root, "okcrate"));
+        // The binary is removed first: a rebuild would put it back, so
+        // its absence afterwards is evidence that no build ran — a
+        // manifest comparison alone would pass even if `okcrate` had
+        // been rebuilt to the same version.
+        fs::remove_file(prefix.join("bin/okcrate")).unwrap();
+        let before = fs::read_to_string(prefix.join("share/cargo-lbin/manifest.json")).unwrap();
+        let err = cmd_install(
+            &prefix,
+            &["okcrate".to_owned(), "nosuchcrate".to_owned()],
+            false,
+            true,
+        )
+        .expect_err("the batch refuses as a whole");
+        assert!(
+            format!("{err:#}").contains("not installed: nosuchcrate"),
+            "{err:#}"
+        );
+        assert!(
+            !prefix.join("bin/okcrate").exists(),
+            "nothing was built before the knowable refusal"
+        );
+        assert_eq!(
+            fs::read_to_string(prefix.join("share/cargo-lbin/manifest.json")).unwrap(),
+            before,
+            "and nothing was committed"
+        );
+
+        // `--locked` is refused by clap itself, where a flag conflict
+        // belongs — before any prefix is touched.
+        let conflict = <Cli as clap::CommandFactory>::command().try_get_matches_from(vec![
+            "cargo-lbin",
+            "install",
+            "--reinstall",
+            "--locked",
+            "okcrate",
+        ]);
+        assert!(
+            conflict.is_err(),
+            "--locked and --reinstall both answer build policy"
+        );
+
+        // And the entry is untouched by any of it.
+        let entry = Manifest::load(&prefix).unwrap().crates["okcrate"].clone();
+        assert_eq!(entry.version, "0.1.0");
+        assert!(!entry.pinned);
         let _ = fs::remove_dir_all(&root);
     }
 

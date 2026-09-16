@@ -338,12 +338,12 @@ mod tests {
             errors: vec![crate::Finding {
                 kind: "binary-missing",
                 message: "`foo`: managed binary /usr/local/bin/foo is missing — reinstall: \
-                          cargo lbin install foo --prefix=/usr/local"
+                          cargo lbin install --reinstall foo --prefix=/usr/local"
                     .into(),
                 krate: Some("foo".into()),
                 bin: Some("foo".into()),
                 path: Some(PathBuf::from("/usr/local/bin/foo")),
-                hint: Some("cargo lbin install foo --prefix=/usr/local".into()),
+                hint: Some("cargo lbin install --reinstall foo --prefix=/usr/local".into()),
             }],
             warnings: vec![crate::Finding {
                 kind: "stale-stages",
@@ -366,11 +366,11 @@ mod tests {
   "errors": [
     {
       "kind": "binary-missing",
-      "message": "`foo`: managed binary /usr/local/bin/foo is missing — reinstall: cargo lbin install foo --prefix=/usr/local",
+      "message": "`foo`: managed binary /usr/local/bin/foo is missing — reinstall: cargo lbin install --reinstall foo --prefix=/usr/local",
       "crate": "foo",
       "bin": "foo",
       "path": "/usr/local/bin/foo",
-      "hint": "cargo lbin install foo --prefix=/usr/local"
+      "hint": "cargo lbin install --reinstall foo --prefix=/usr/local"
     }
   ],
   "warnings": [

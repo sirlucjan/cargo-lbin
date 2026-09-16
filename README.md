@@ -95,7 +95,7 @@ cargo lbin tui
 
 | Command | Purpose |
 | --- | --- |
-| `install <crate[@version]>... [--locked]` | Build crates with Cargo and install their binaries; `@version` installs exactly that version and pins it |
+| `install <crate[@version]>... [--locked] [--reinstall]` | Build crates with Cargo and install their binaries; `@version` installs exactly that version and pins it; `--reinstall` rebuilds what is already installed, exactly as the manifest records it |
 | `remove <crate>...` | Remove managed crates and their binaries |
 | `pin <crate>...` / `unpin <crate>...` | Pin crates to their installed version / release the pin |
 | `pinned [--check] [--json]` | List pinned crates and whether newer versions exist |
@@ -143,7 +143,9 @@ cargo lbin install some-tool --locked
 
 The `--locked` choice is stored per crate and reused on future updates.
 
-Installing an already managed crate is a full reinstall: it is rebuilt in a fresh staging directory and its managed binaries are replaced. Changing `--locked` on a reinstall therefore takes effect instead of being skipped as "already installed".
+A plain `install NAME` of an already managed crate is a full rebuild and replacement: it is built in a fresh staging directory and its managed binaries are replaced, so changing `--locked` this way takes effect instead of being skipped as "already installed". It also resolves the version afresh, which for an unpinned crate means the newest release.
+
+`install --reinstall NAME` rebuilds what is already installed without re-selecting the crate version or its stored policy: the manifest entry is authoritative for the version, the pin and `--locked`, and all three are carried over. Dependencies are still resolved by Cargo as they would be for any build — unless the entry carries `--locked`, which is exactly what that flag records. A pinned crate comes back pinned at the same version, an unpinned one comes back unpinned, and a crate built reproducibly is rebuilt the same way. It is the shape wanted when the environment moves rather than the crate — a new toolchain, a new libc, different compiler flags — and it is what `verify` names when a managed binary needs repairing, because repairing an installation should not also change which version it is. Because the entry already answers both questions, naming a version (`install --reinstall foo@1.2.3`) or passing `--locked` alongside it is a usage error, and `--reinstall` on a crate this prefix does not manage is `not installed`. Cargo still uses the registry and its caches to build that version; what `cargo-lbin` does not ask is *which* version or policy to apply.
 
 Installing a crate that another known prefix already manages — and this one does not — warns before the first build starts, so the batch can still be abandoned before any minutes are invested:
 
@@ -362,7 +364,7 @@ cargo lbin unpin hexyl
 
 `install NAME@VERSION` pins as part of installing (see [Install](#install)); `pin` is for a crate already in place.
 
-A pinned crate is left out of `update --all` — listed as `[pinned, skipped]` so the hold is visible, never silent, and not queried at all, so a pinned crate whose lookup fails cannot stop the others from updating — and refused by `update NAME` and by `install NAME` (a reinstall builds the newest version, which is what the pin forbids) until it is unpinned. `migrate` rebuilds a pinned crate at exactly its pinned version, while an unpinned one gets the latest (see [Migrate](#migrate)): the pin is a declaration of version policy, honored wherever a version is chosen, not merely a hold against the next update. `checkupdate` and `list` still check and report a newer version when one exists: the pin is a decision about what to do with that fact, not a reason to hide it. `list` marks pinned crates with `[pinned]`, and a pin set by another process between confirming an update and running it counts as changed state, so that crate is skipped. Removing a pinned crate is allowed; a pin holds a version, not a binary.
+A pinned crate is left out of `update --all` — listed as `[pinned, skipped]` so the hold is visible, never silent, and not queried at all, so a pinned crate whose lookup fails cannot stop the others from updating — and refused by `update NAME` and by `install NAME` (which would build the newest release, exactly what the pin forbids) until it is unpinned. `install --reinstall NAME` is allowed on a pinned crate and leaves the pin alone: it never leaves the version the pin declares, so there is nothing for the refusal to protect. `migrate` rebuilds a pinned crate at exactly its pinned version, while an unpinned one gets the latest (see [Migrate](#migrate)): the pin is a declaration of version policy, honored wherever a version is chosen, not merely a hold against the next update. `checkupdate` and `list` still check and report a newer version when one exists: the pin is a decision about what to do with that fact, not a reason to hide it. `list` marks pinned crates with `[pinned]`, and a pin set by another process between confirming an update and running it counts as changed state, so that crate is skipped. Removing a pinned crate is allowed; a pin holds a version, not a binary.
 
 Pinning writes the manifest, so it needs the same privilege as installing into the prefix.
 
@@ -495,7 +497,7 @@ cargo lbin verify
 ```
 
 ```
-error: `foo`: managed binary /home/user/.local/bin/foo is missing — reinstall: cargo lbin install foo --prefix=/home/user/.local
+error: `foo`: managed binary /home/user/.local/bin/foo is missing — reinstall: cargo lbin install --reinstall foo --prefix=/home/user/.local
 warning: 2 stage directories under /home/user/.cache/cargo-lbin with no live owner — possible leftover build debris; inspect, then `cargo lbin clean --stages` when safe (for pre-lease stages the owner test is a PID heuristic: a PID can be reused, and an orphaned build may still hold the directory)
 ```
 

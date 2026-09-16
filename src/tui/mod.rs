@@ -1038,7 +1038,9 @@ impl App {
             }
             PendingAction::UpdateAll => crate::cmd_update(&self.prefix, &[], true, false),
             PendingAction::Install { crates, locked } => {
-                crate::cmd_install(&self.prefix, crates, *locked)
+                // The interface's install line takes a crate spec, not
+                // flags: `--reinstall` stays a CLI-only modifier.
+                crate::cmd_install(&self.prefix, crates, *locked, false)
             }
             PendingAction::Remove(name) => {
                 crate::cmd_remove(&self.prefix, std::slice::from_ref(name))
