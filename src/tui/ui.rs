@@ -12,6 +12,11 @@ use super::{App, Filter, InputPurpose, MessageKind, RowStatus};
 use crate::report::describe_age;
 
 pub fn draw(frame: &mut Frame, app: &App) {
+    // Asked once and used everywhere the footer's height matters: the
+    // constraint that reserves it, and the pinned report's ceiling
+    // below. A second copy of this number is how a layout starts
+    // disagreeing with itself.
+    let footer_h = footer_height(app, frame.area().width);
     // The gauge gets its own framed transient panel: the footer stays
     // free for messages, which the old arrangement hid for the whole
     // build.
@@ -23,7 +28,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
                 Constraint::Min(5),
                 Constraint::Length(resting_details_height(app)),
                 Constraint::Length(3),
-                Constraint::Length(3),
+                Constraint::Length(footer_h),
             ],
         )
         .areas(frame.area());
@@ -41,7 +46,15 @@ pub fn draw(frame: &mut Frame, app: &App) {
     // are the thing being read. Bounded by the terminal, floored at the
     // resting height, still scrollable past either.
     let details_h = if app.build_report.is_some() {
-        frame.area().height.saturating_sub(11).clamp(9, 16)
+        // What is left after the rows that are not the report: the
+        // header's three, the list's minimum five, and however many the
+        // key bar folded into. The last of those used to be a constant
+        // 3 baked into this subtraction.
+        frame
+            .area()
+            .height
+            .saturating_sub(8 + footer_h)
+            .clamp(9, 16)
     } else {
         resting_details_height(app)
     };
@@ -51,7 +64,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
             Constraint::Length(3),
             Constraint::Min(5),
             Constraint::Length(details_h),
-            Constraint::Length(3),
+            Constraint::Length(footer_h),
         ],
     )
     .areas(frame.area());
@@ -457,23 +470,81 @@ fn key_bar(app: &App) -> &'static str {
     }
 }
 
+/// The key bar as it fits: one line where the terminal is wide enough,
+/// folded at `·` boundaries where it is not.
+///
+/// Never truncated by the fold. A bar cut off mid-list claims the
+/// interface has fewer keys than it has — the same class of untruth as
+/// a stale warning, only quieter, and it grows every time a key is
+/// added. Folding costs a line of height and says everything.
+///
+/// Two promises that cannot both hold on a very narrow terminal: every
+/// key present, and no entry split in half. Entries win —
+/// [`MIN_FOLD_WIDTH`] is the floor this folds to, and below it the
+/// terminal does the cutting. A twenty-column terminal has worse
+/// problems than its key bar.
+fn key_bar_lines(app: &App, width: u16) -> Vec<String> {
+    let bar = key_bar(app);
+    let width = usize::from(width.max(MIN_FOLD_WIDTH));
+    if bar.chars().count() <= width {
+        return vec![bar.to_owned()];
+    }
+    let mut lines = Vec::new();
+    // The leading space is the bar's own indent; every folded line keeps
+    // it so the columns line up under each other.
+    let mut line = String::from(" ");
+    for part in bar.trim_start().split(" · ") {
+        let addition = if line.len() > 1 { 3 } else { 0 } + part.chars().count();
+        if line.chars().count() + addition > width && line.len() > 1 {
+            lines.push(std::mem::take(&mut line));
+            line.push(' ');
+        }
+        if line.len() > 1 {
+            line.push_str(" · ");
+        }
+        line.push_str(part);
+    }
+    if line.len() > 1 {
+        lines.push(line);
+    }
+    lines
+}
+
+/// Below this the bar is folded as if the terminal were this wide, and
+/// the terminal truncates what does not fit: splitting `T reinstall
+/// all` across lines would be worse than either.
+///
+/// Twenty-one, not twenty: the longest entry any bar carries is twenty
+/// characters (`manifest unavailable`, `any other key cancel`) and
+/// every line also carries the bar's leading space. At twenty the
+/// floor itself would overflow by one, which is precisely the case
+/// this floor exists to keep out of the folding logic.
+const MIN_FOLD_WIDTH: u16 = 21;
+
+/// Two fixed rows — status and message — under however many the key bar
+/// needs at this width.
+fn footer_height(app: &App, width: u16) -> u16 {
+    2 + u16::try_from(key_bar_lines(app, width).len()).unwrap_or(1)
+}
+
 fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     use std::fmt::Write as _;
+    let keys = key_bar_lines(app, area.width);
     let [keys_area, status_area, line_area] = Layout::new(
         Direction::Vertical,
         [
-            Constraint::Length(1),
+            Constraint::Length(u16::try_from(keys.len()).unwrap_or(1)),
             Constraint::Length(1),
             Constraint::Length(1),
         ],
     )
     .areas(area);
 
-    let keys = key_bar(app);
-    frame.render_widget(
-        Paragraph::new(Span::styled(keys, Style::default().fg(Color::DarkGray))),
-        keys_area,
-    );
+    let keys: Vec<Line> = keys
+        .into_iter()
+        .map(|l| Line::from(Span::styled(l, Style::default().fg(Color::DarkGray))))
+        .collect();
+    frame.render_widget(Paragraph::new(keys), keys_area);
 
     let checked = match app.report_age {
         Some(age) => format!("checked {}", describe_age(age)),
@@ -864,6 +935,82 @@ mod tests {
             8,
             "with no offer the entry's own height is back"
         );
+        let _ = std::fs::remove_dir_all(&prefix);
+    }
+
+    /// The bar folds instead of truncating: every key stays visible at
+    /// any width, and the folds land on separators so no entry is cut
+    /// in half. A bar that silently drops `q quit` claims the interface
+    /// has fewer keys than it has.
+    #[test]
+    fn the_key_bar_folds_rather_than_hiding_keys() {
+        let prefix = std::env::temp_dir().join("cargo-lbin-test-tui-keybar");
+        let _ = std::fs::remove_dir_all(&prefix);
+        std::fs::create_dir_all(&prefix).unwrap();
+        let app = crate::tui::App::new(&prefix).unwrap();
+        let whole = key_bar(&app);
+        let entries: Vec<&str> = whole.trim_start().split(" · ").collect();
+
+        // Widths a terminal is actually used at; below MIN_FOLD_WIDTH
+        // the contract hands the cutting back to the terminal, which is
+        // stated at the function and not worth asserting here.
+        for width in [200u16, 120, 100, 80, 60, 40] {
+            let lines = key_bar_lines(&app, width);
+            for line in &lines {
+                assert!(
+                    line.chars().count() <= usize::from(width),
+                    "width {width}: line overflows: {line}"
+                );
+            }
+            let rejoined: Vec<String> = lines
+                .iter()
+                .flat_map(|l| l.trim_start().split(" · "))
+                .map(str::to_owned)
+                .collect();
+            assert_eq!(
+                rejoined, entries,
+                "width {width}: every key survives the fold"
+            );
+            assert_eq!(
+                footer_height(&app, width),
+                2 + u16::try_from(lines.len()).unwrap(),
+                "the footer reserves what the bar needs"
+            );
+        }
+        // The floor holds for the longest entry any state carries: a
+        // degraded prefix says `manifest unavailable`, twenty
+        // characters, and the line it sits on adds the leading space.
+        let broken = prefix.join("broken");
+        std::fs::create_dir_all(broken.join("share/cargo-lbin")).unwrap();
+        std::fs::write(broken.join("share/cargo-lbin/manifest.json"), "not json").unwrap();
+        let mut degraded = crate::tui::App::new(&prefix).unwrap();
+        degraded.jump_to_prefix(broken);
+        assert!(
+            key_bar(&degraded).contains("manifest unavailable"),
+            "the degraded bar is the one with the longest entry"
+        );
+        for line in key_bar_lines(&degraded, MIN_FOLD_WIDTH) {
+            assert!(
+                line.chars().count() <= usize::from(MIN_FOLD_WIDTH),
+                "the floor must fit the longest entry plus its indent: {line}"
+            );
+        }
+
+        // Wide enough is still one line: folding costs height, so it is
+        // not paid where it buys nothing.
+        assert_eq!(key_bar_lines(&app, 400).len(), 1);
+        assert_eq!(
+            footer_height(&app, 400),
+            3,
+            "and the footer is its old self"
+        );
+
+        // The pinned report's ceiling is computed from the same height,
+        // not from a constant: a bar that folds into more rows leaves
+        // the report fewer, rather than overlapping it.
+        let narrow = footer_height(&app, 60);
+        let wide = footer_height(&app, 400);
+        assert!(narrow > wide, "a narrow terminal folds into more rows");
         let _ = std::fs::remove_dir_all(&prefix);
     }
 
