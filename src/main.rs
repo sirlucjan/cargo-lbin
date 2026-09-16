@@ -88,7 +88,11 @@ enum Cmd {
     ///
     /// `NAME@VERSION` installs exactly that version and pins it.
     Install {
-        #[arg(required = true, value_name = "NAME[@VERSION]")]
+        #[arg(
+            required_unless_present = "all",
+            conflicts_with = "all",
+            value_name = "NAME[@VERSION]"
+        )]
         crates: Vec<String>,
         /// Build with the crate's committed Cargo.lock (reproducible; skips
         /// newer dependency releases until the crate itself releases)
@@ -108,6 +112,30 @@ enum Cmd {
         /// apply.
         #[arg(long)]
         reinstall: bool,
+        /// Rebuild every crate installed under the prefix
+        ///
+        /// Only with `--reinstall`, and it changes the scope, nothing
+        /// else: each entry is rebuilt as its own specification, pinned
+        /// ones included — a pin holds a version, and this is the
+        /// operation that does not change one. The plan is printed and
+        /// confirmed first, because a sweep can mean a great many
+        /// builds.
+        #[arg(long, requires = "reinstall")]
+        all: bool,
+        /// Skip the confirmation prompt (only the sweep asks one)
+        ///
+        /// Refused without `--all`, because there is no prompt to skip
+        /// there — a flag the parser accepts and the command ignores is
+        /// worse than one it refuses. Checked in dispatch, not with
+        /// clap's `requires = "all"`: on clap 4.6 that constraint is
+        /// satisfied by a `SetTrue` flag's own default, so `install
+        /// --reinstall -y foo` parses (verified; `required_unless_present`
+        /// checks runtime presence and is why `crates` works). The only
+        /// thing `requires` enforced was `--all`'s *own* requirement of
+        /// `--reinstall`, transitively — a misleading error for the
+        /// wrong reason, gone once `--reinstall` is on the line.
+        #[arg(long, short)]
+        yes: bool,
     },
     /// Remove previously installed binaries
     Remove {
@@ -353,10 +381,17 @@ fn main() -> ExitCode {
         eprintln!("warning: {note}");
     }
     let result = match cli.cmd {
+        // Two scopes, two entry points: `--all` names the prefix, a list
+        // names its members, and clap has already ruled out both at once.
+        Cmd::Install { all: true, yes, .. } => cmd_reinstall_all(&cli.prefix, yes),
+        Cmd::Install { yes: true, .. } => Err(anyhow::anyhow!(
+            "`-y` skips the confirmation `--all` asks for; without it there is no prompt to skip"
+        )),
         Cmd::Install {
             ref crates,
             locked,
             reinstall,
+            ..
         } => cmd_install(&cli.prefix, crates, locked, reinstall),
         Cmd::Remove { ref crates } => cmd_remove(&cli.prefix, crates),
         Cmd::Verify { json } => cmd_verify(&cli.prefix, json),
@@ -2593,6 +2628,137 @@ fn cmd_install(prefix: &Path, crates: &[String], locked: bool, reinstall: bool) 
             ShadowReport::OnCommit,
             &mut frontend,
         )?;
+    }
+    Ok(())
+}
+
+/// `install --reinstall --all`: the same operation, every entry.
+///
+/// Scope is the only thing `--all` changes. Each crate is rebuilt as
+/// its own specification, so a pinned one is included rather than
+/// skipped — `update --all` skips pins because it would move them off
+/// their version, and this is precisely the operation that does not.
+/// The pair is worth stating: `update --all` changes versions where
+/// policy allows, `install --reinstall --all` changes neither version
+/// nor policy and rebuilds the state as it stands.
+///
+/// The plan is shown and confirmed first. Not because the operation is
+/// dangerous — it changes neither version nor policy — but because the
+/// scope is large and each entry costs a full build, and this tool
+/// shows what it is about to spend.
+///
+/// Failures do not stop the sweep, as in `update --all`: crates are
+/// independent, and one that no longer builds under a new toolchain is
+/// the reason to know about the rest, not to stop asking. The exit code
+/// answers whether the confirmed plan was carried out in full.
+fn cmd_reinstall_all(prefix: &Path, yes: bool) -> Result<()> {
+    let cache = cache_dir()?;
+    // Phase 1: read-only snapshot under a shared lock, released before
+    // the prompt — an unanswered "proceed?" must not block the prefix.
+    // Phase 2 reloads and re-verifies anyway. The single-crate path
+    // needs none of this: it has no prompt, so its exclusive lock spans
+    // the whole operation and nothing can move underneath it.
+    let snapshot = {
+        let _lock = StateLock::acquire(prefix, &Mode::Shared)?;
+        Manifest::load(prefix)?
+    };
+    let names: Vec<String> = snapshot.crates.keys().cloned().collect();
+    if names.is_empty() {
+        println!("nothing installed under {}", prefix.display());
+        return Ok(());
+    }
+    // Resolved before anything is shown: a plan that cannot be made is
+    // not a plan to confirm.
+    let planned: Vec<(String, ReinstallPlan)> = names
+        .into_iter()
+        .map(|n| reinstall_plan(&snapshot, &n).map(|p| (n, p)))
+        .collect::<Result<_>>()?;
+    for (name, plan) in &planned {
+        let pinned = if plan.pinned { " [pinned]" } else { "" };
+        let locked = if plan.locked { " [locked]" } else { "" };
+        println!("{name} {}{pinned}{locked}", plan.version);
+    }
+    println!(
+        "rebuild {} crate(s) under {}",
+        planned.len(),
+        prefix.display()
+    );
+    if !yes && !confirm("proceed with reinstall?")? {
+        println!("aborted");
+        return Ok(());
+    }
+    apply_reinstalls(prefix, &cache, &planned)
+}
+
+/// The mutating half of the sweep: exclusive lock, fresh manifest, each
+/// confirmed plan re-verified against it.
+///
+/// What was shown is what is rebuilt. The plan named three facts per
+/// crate — version, pin, `--locked` — so all three are re-checked: a
+/// crate updated, pinned, unpinned or removed during the prompt is no
+/// longer the crate that was confirmed, and it is skipped with a note
+/// rather than rebuilt against a state nobody agreed to. A crate
+/// installed during the prompt is not swept either: it was not in the
+/// plan.
+fn apply_reinstalls(
+    prefix: &Path,
+    cache: &Path,
+    planned: &[(String, ReinstallPlan)],
+) -> Result<()> {
+    let _lock = StateLock::acquire(prefix, &Mode::Exclusive)?;
+    let mut manifest = Manifest::load(prefix)?;
+    let total = planned.len();
+    let mut rebuilt = 0usize;
+    let mut skipped: Vec<&str> = Vec::new();
+    let mut failed: Vec<&str> = Vec::new();
+    let mut frontend = Frontend::Terminal;
+    for (i, (name, plan)) in planned.iter().enumerate() {
+        println!("[{}/{total}] {name}", i + 1);
+        let unchanged = manifest.crates.get(name).is_some_and(|e| {
+            e.version == plan.version.to_string()
+                && e.pinned == plan.pinned
+                && e.locked == plan.locked
+        });
+        if !unchanged {
+            eprintln!("skipping `{name}`: state changed since the reinstall was confirmed");
+            skipped.push(name);
+            continue;
+        }
+        match install_and_commit(
+            prefix,
+            cache,
+            &mut manifest,
+            name,
+            Some(&plan.version),
+            plan.locked,
+            PinPolicy::Exactly(plan.pinned),
+            ShadowReport::OnCommit,
+            &mut frontend,
+        ) {
+            Ok(_) => rebuilt += 1,
+            Err(err) => {
+                eprintln!("error: rebuilding `{name}` failed: {err:#}");
+                failed.push(name);
+            }
+        }
+    }
+    println!("rebuilt {rebuilt} of {total}");
+    // Asked for `total` rebuilds; any shortfall exits non-zero, as
+    // everywhere else: the exit code answers whether the confirmed plan
+    // was carried out in full.
+    let mut shortfall = Vec::new();
+    if !failed.is_empty() {
+        shortfall.push(format!("failed: {}", failed.join(", ")));
+    }
+    if !skipped.is_empty() {
+        shortfall.push(format!("skipped: {}", skipped.join(", ")));
+    }
+    if !shortfall.is_empty() {
+        bail!(
+            "{} of {total} rebuilds not applied ({})",
+            total - rebuilt,
+            shortfall.join("; ")
+        );
     }
     Ok(())
 }
@@ -6806,6 +6972,274 @@ mod tests {
                 prefix.join("bin/okcrate").exists(),
                 "and the binary is placed"
             );
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A fake cargo that builds whatever crate it is asked for: `$2` is
+    /// the name, `$4` the stage root. The sweep needs it, because a
+    /// sweep by definition names more than one crate.
+    fn any_crate_fake(root: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let fake_bin = root.join("fakebin");
+        fs::create_dir_all(&fake_bin).unwrap();
+        let script = fake_bin.join("cargo");
+        fs::write(
+            &script,
+            "#!/bin/sh\n\
+             name=$2\n\
+             ver=0.2.0\n\
+             for a in \"$@\"; do\n\
+             case \"$a\" in =*) ver=${a#=};; esac\n\
+             done\n\
+             mkdir -p \"$4/bin\"\n\
+             printf '#!/bin/sh\\ntrue\\n' > \"$4/bin/$name\"\n\
+             chmod 755 \"$4/bin/$name\"\n\
+             printf '%s' \"{\\\"installs\\\":{\\\"$name $ver (registry+https://github.com/rust-lang/crates.io-index)\\\":{\\\"bins\\\":[\\\"$name\\\"]}}}\" > \"$4/.crates2.json\"\n\
+             exit 0\n",
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        script
+    }
+
+    /// A fake cargo that refuses one crate by name and builds every
+    /// other, for testing what a sweep does around a failure.
+    fn failing_fake(root: &Path, failing: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let fake_bin = root.join("fakebin");
+        fs::create_dir_all(&fake_bin).unwrap();
+        let script = fake_bin.join("cargo");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\n\
+                 name=$2\n\
+                 [ \"$name\" = \"{failing}\" ] && {{ echo 'error: could not compile' >&2; exit 101; }}\n\
+                 ver=0.2.0\n\
+                 for a in \"$@\"; do\n\
+                 case \"$a\" in =*) ver=${{a#=}};; esac\n\
+                 done\n\
+                 mkdir -p \"$4/bin\"\n\
+                 printf '#!/bin/sh\\ntrue\\n' > \"$4/bin/$name\"\n\
+                 chmod 755 \"$4/bin/$name\"\n\
+                 printf '%s' \"{{\\\"installs\\\":{{\\\"$name $ver (registry+https://github.com/rust-lang/crates.io-index)\\\":{{\\\"bins\\\":[\\\"$name\\\"]}}}}}}\" > \"$4/.crates2.json\"\n\
+                 exit 0\n"
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        script
+    }
+
+    /// The sweep is the same operation, wider: every entry keeps its own
+    /// version, pin and `--locked`, and a pinned crate is rebuilt rather
+    /// than skipped — a pin holds a version, and this is the operation
+    /// that does not change one.
+    #[test]
+    fn reinstall_all_rebuilds_every_entry_as_its_own_specification() {
+        let root = std::env::temp_dir().join("cargo-lbin-test-reinstall-all");
+        let _ = fs::remove_dir_all(&root);
+        let prefix = seeded_prefix(&root, "prefix", "okcrate", true, true);
+        // A second entry, unpinned and unlocked, seeded into the same
+        // manifest: the sweep must treat the two differently.
+        {
+            let mut m = Manifest::load(&prefix).unwrap();
+            m.crates.insert(
+                "othercrate".to_owned(),
+                Entry {
+                    version: "0.1.0".to_owned(),
+                    bins: vec!["othercrate".to_owned()],
+                    locked: false,
+                    pinned: false,
+                },
+            );
+            m.store(&prefix).unwrap();
+        }
+        let _fake = crate::stage::FakeCargo::install(&any_crate_fake(&root));
+
+        cmd_reinstall_all(&prefix, true).unwrap();
+
+        let m = Manifest::load(&prefix).unwrap();
+        let ok = &m.crates["okcrate"];
+        assert_eq!(ok.version, "0.1.0", "the pinned entry keeps its version");
+        assert!(
+            ok.pinned && ok.locked,
+            "and its policy: pinned={} locked={}",
+            ok.pinned,
+            ok.locked
+        );
+        let other = &m.crates["othercrate"];
+        assert_eq!(other.version, "0.1.0", "and the unpinned one keeps its too");
+        assert!(
+            !other.pinned && !other.locked,
+            "without acquiring a pin on the way: pinned={} locked={}",
+            other.pinned,
+            other.locked
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A crate that no longer builds is the reason to hear about the
+    /// rest, not to stop asking: the sweep carries on, rebuilds what it
+    /// can, and the exit code says the confirmed plan was not carried
+    /// out in full. This is the one place where a batch differs from
+    /// `install`'s named list, which stops at the first failure.
+    #[test]
+    fn a_failing_crate_does_not_stop_the_sweep() {
+        let root = std::env::temp_dir().join("cargo-lbin-test-reinstall-all-failure");
+        let _ = fs::remove_dir_all(&root);
+        let prefix = seeded_prefix(&root, "prefix", "brokencrate", false, false);
+        {
+            let mut m = Manifest::load(&prefix).unwrap();
+            m.crates.insert(
+                "okcrate".to_owned(),
+                Entry {
+                    version: "0.1.0".to_owned(),
+                    bins: vec!["okcrate".to_owned()],
+                    locked: false,
+                    pinned: false,
+                },
+            );
+            m.store(&prefix).unwrap();
+        }
+        // Both binaries are removed first, so a rebuild is the only way
+        // either of them can come back.
+        let _ = fs::remove_file(prefix.join("bin/brokencrate"));
+        let _ = fs::remove_file(prefix.join("bin/okcrate"));
+        let _fake = crate::stage::FakeCargo::install(&failing_fake(&root, "brokencrate"));
+
+        let err = cmd_reinstall_all(&prefix, true).expect_err("a shortfall is not a success");
+        let text = format!("{err:#}");
+        assert!(text.contains("1 of 2 rebuilds not applied"), "{text}");
+        assert!(text.contains("brokencrate"), "and it names which: {text}");
+
+        assert!(
+            prefix.join("bin/okcrate").exists(),
+            "the crate after the failing one was still built"
+        );
+        assert!(
+            !prefix.join("bin/brokencrate").exists(),
+            "and the failing one placed nothing"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The prompt is a window, so what was confirmed is re-checked
+    /// before it is acted on — all three facts the plan showed. A crate
+    /// that moved in the meantime is skipped with a note, and the
+    /// shortfall is in the exit code.
+    #[test]
+    fn a_plan_confirmed_against_a_state_that_moved_is_not_carried_out() {
+        let root = std::env::temp_dir().join("cargo-lbin-test-reinstall-all-moved");
+        let _ = fs::remove_dir_all(&root);
+        let prefix = seeded_prefix(&root, "prefix", "okcrate", false, false);
+        let _fake = crate::stage::FakeCargo::install(&any_crate_fake(&root));
+
+        // A plan made against 0.1.0, unpinned and unlocked — the state
+        // the person would have seen and agreed to.
+        let planned = vec![(
+            "okcrate".to_owned(),
+            ReinstallPlan {
+                version: Version::parse("0.1.0").unwrap(),
+                pinned: false,
+                locked: false,
+            },
+        )];
+
+        // Each of the three facts alone is enough to disqualify it.
+        for mutate in [
+            (|e: &mut Entry| e.version = "0.3.0".to_owned()) as fn(&mut Entry),
+            |e: &mut Entry| e.pinned = true,
+            |e: &mut Entry| e.locked = true,
+        ] {
+            let mut m = Manifest::load(&prefix).unwrap();
+            mutate(m.crates.get_mut("okcrate").unwrap());
+            let expected = m.crates["okcrate"].version.clone();
+            m.store(&prefix).unwrap();
+            let _ = fs::remove_file(prefix.join("bin/okcrate"));
+
+            let err = apply_reinstalls(&prefix, &root.join("cache"), &planned)
+                .expect_err("a plan about a state that is gone");
+            assert!(
+                format!("{err:#}").contains("skipped: okcrate"),
+                "the shortfall names it: {err:#}"
+            );
+            assert!(
+                !prefix.join("bin/okcrate").exists(),
+                "and nothing was rebuilt against the new state"
+            );
+            assert_eq!(
+                Manifest::load(&prefix).unwrap().crates["okcrate"].version,
+                expected,
+                "the entry is left exactly as the other process left it"
+            );
+            // Restore the baseline for the next case.
+            let mut m = Manifest::load(&prefix).unwrap();
+            let e = m.crates.get_mut("okcrate").unwrap();
+            e.version = "0.1.0".to_owned();
+            e.pinned = false;
+            e.locked = false;
+            m.store(&prefix).unwrap();
+        }
+
+        // A crate that vanished during the prompt is the same answer.
+        let mut m = Manifest::load(&prefix).unwrap();
+        m.crates.remove("okcrate");
+        m.store(&prefix).unwrap();
+        let err = apply_reinstalls(&prefix, &root.join("cache"), &planned)
+            .expect_err("nothing left to rebuild");
+        assert!(format!("{err:#}").contains("skipped: okcrate"), "{err:#}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// An empty prefix is an answer, not a confirmation prompt over an
+    /// empty list — and `--all` without `--reinstall` has no meaning to
+    /// guess at.
+    #[test]
+    fn reinstall_all_says_so_when_there_is_nothing_to_rebuild() {
+        let root = std::env::temp_dir().join("cargo-lbin-test-reinstall-all-empty");
+        let _ = fs::remove_dir_all(&root);
+        let prefix = root.join("prefix");
+        fs::create_dir_all(prefix.join("bin")).unwrap();
+        fs::create_dir_all(prefix.join("share/cargo-lbin")).unwrap();
+        Manifest::default().store(&prefix).unwrap();
+
+        cmd_reinstall_all(&prefix, true).unwrap();
+        assert!(
+            Manifest::load(&prefix).unwrap().crates.is_empty(),
+            "nothing installed, nothing done"
+        );
+
+        let bare = <Cli as clap::CommandFactory>::command().try_get_matches_from(vec![
+            "cargo-lbin",
+            "install",
+            "--all",
+        ]);
+        assert!(bare.is_err(), "`--all` alone does not say what to install");
+        let both = <Cli as clap::CommandFactory>::command().try_get_matches_from(vec![
+            "cargo-lbin",
+            "install",
+            "--reinstall",
+            "--all",
+            "okcrate",
+        ]);
+        assert!(both.is_err(), "two ways of naming the scope");
+
+        // `-y` skips a prompt, and only the sweep asks one: accepted
+        // elsewhere it would be a flag the command ignores. Clap's
+        // `requires` cannot express this for a bool flag (see the arg's
+        // doc), so dispatch refuses the shape, and this pins the shape
+        // it refuses — including the one `requires` let through.
+        for args in [
+            vec!["cargo-lbin", "install", "-y", "okcrate"],
+            vec!["cargo-lbin", "install", "--reinstall", "-y", "okcrate"],
+        ] {
+            let cli = <Cli as clap::Parser>::try_parse_from(args.clone()).expect("parses");
+            let Cmd::Install { all, yes, .. } = cli.cmd else {
+                panic!("install: {args:?}")
+            };
+            assert!(yes && !all, "the shape dispatch refuses: {args:?}");
         }
         let _ = fs::remove_dir_all(&root);
     }

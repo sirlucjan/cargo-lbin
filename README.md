@@ -96,6 +96,7 @@ cargo lbin tui
 | Command | Purpose |
 | --- | --- |
 | `install <crate[@version]>... [--locked] [--reinstall]` | Build crates with Cargo and install their binaries; `@version` installs exactly that version and pins it; `--reinstall` rebuilds what is already installed, exactly as the manifest records it |
+| `install --reinstall --all [-y]` | Rebuild every crate installed under the prefix, each as its own entry |
 | `remove <crate>...` | Remove managed crates and their binaries |
 | `pin <crate>...` / `unpin <crate>...` | Pin crates to their installed version / release the pin |
 | `pinned [--check] [--json]` | List pinned crates and whether newer versions exist |
@@ -146,6 +147,13 @@ The `--locked` choice is stored per crate and reused on future updates.
 A plain `install NAME` of an already managed crate is a full rebuild and replacement: it is built in a fresh staging directory and its managed binaries are replaced, so changing `--locked` this way takes effect instead of being skipped as "already installed". It also resolves the version afresh, which for an unpinned crate means the newest release.
 
 `install --reinstall NAME` rebuilds what is already installed without re-selecting the crate version or its stored policy: the manifest entry is authoritative for the version, the pin and `--locked`, and all three are carried over. Dependencies are still resolved by Cargo as they would be for any build — unless the entry carries `--locked`, which is exactly what that flag records. A pinned crate comes back pinned at the same version, an unpinned one comes back unpinned, and a crate built reproducibly is rebuilt the same way. It is the shape wanted when the environment moves rather than the crate — a new toolchain, a new libc, different compiler flags — and it is what `verify` names when a managed binary needs repairing, because repairing an installation should not also change which version it is. Because the entry already answers both questions, naming a version (`install --reinstall foo@1.2.3`) or passing `--locked` alongside it is a usage error, and `--reinstall` on a crate this prefix does not manage is `not installed`. Cargo still uses the registry and its caches to build that version; what `cargo-lbin` does not ask is *which* version or policy to apply.
+
+`install --reinstall --all` widens the scope and nothing else: every crate under the prefix is rebuilt as its own entry, pinned ones included — `update --all` skips pins because it would move them off their version, and this is the operation that does not. The plan is printed and confirmed first (`-y` skips the prompt), because a sweep can mean a great many builds and this tool shows what it is about to spend. The prompt holds no lock: the plan is read under a shared lock that is released before the question, and each confirmed entry is re-checked under the exclusive lock that follows — a crate updated, pinned, unpinned or removed while the question waited is skipped with a note rather than rebuilt against a state nobody agreed to, and a crate installed meanwhile is not swept, because it was not in the plan. A failing crate does not stop the rest, as in `update --all`: the summary counts what was rebuilt and the exit code is non-zero when the confirmed plan was not carried out in full. The pair is the point:
+
+```bash
+cargo lbin update --all              # change versions where policy allows
+cargo lbin install --reinstall --all # change neither version nor policy; rebuild the state
+```
 
 Installing a crate that another known prefix already manages — and this one does not — warns before the first build starts, so the batch can still be abandoned before any minutes are invested:
 
