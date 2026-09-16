@@ -346,11 +346,31 @@ struct MigrateBatch {
     reload_error: Option<String>,
 }
 
-/// Did `start_migrate` actually start a worker? A refusal carries its
-/// reason — the summary must not overwrite it.
+/// Did the attempt actually start a worker?
+///
+/// Three answers, and the third exists because the second must not
+/// hide a side effect. A refusal is the end of that attempt; a
+/// `NeedsTerminal` is the attempt asking to be run somewhere else, and
+/// it carries the action rather than scheduling it. The difference is
+/// invisible with one build and fatal with a queue: a runner told
+/// "refused" would record the member and move on while a handoff it
+/// never agreed to ran the same crate in the terminal.
+///
+/// Both `start_build` and `start_migrate` answer with this, and that is
+/// the whole contract a queue needs from them: *something* comes back
+/// for every member, so a slot is never left waiting on an answer that
+/// is not coming. What to do with each — stop, record and carry on,
+/// hand over, refuse the whole batch — belongs to whoever owns the
+/// queue, not here.
 enum StartOutcome {
     Started,
     Refused(String),
+    /// This attempt cannot run captured; here is what would run it, and
+    /// why. Nothing has been scheduled.
+    NeedsTerminal {
+        action: PendingAction,
+        reason: String,
+    },
 }
 
 /// What the escalation preflight found; see `preflight_escalation`.
@@ -1010,7 +1030,17 @@ impl App {
                 continue;
             }
             if let Some(req) = self.pending_build.take() {
-                self.start_build(terminal, &req)?;
+                // No queue yet, so both answers are the person's: a
+                // refusal to read, a handover to schedule. A batch
+                // backend will take the same two and decide otherwise.
+                match self.start_build(terminal, &req)? {
+                    StartOutcome::Started => {}
+                    StartOutcome::Refused(reason) => self.error(&reason),
+                    StartOutcome::NeedsTerminal { action, reason } => {
+                        self.info(&reason);
+                        self.pending = Some(action);
+                    }
+                }
                 continue;
             }
             if let Some(req) = self.pending_migrate.take() {
@@ -1107,6 +1137,49 @@ impl App {
         Ok(())
     }
 
+    /// The one door to a password, for everything that may need one.
+    ///
+    /// Ask, then check again. The second check is the point: an
+    /// interactive `sudo -v` can succeed on a configuration that caches
+    /// nothing, and every privileged call downstream runs `sudo -n`.
+    /// Detecting that here turns it into an answer the caller can act
+    /// on; detecting it downstream turns it into a failure halfway
+    /// through the work.
+    ///
+    /// The caller supplies both *whether* privilege is needed — the
+    /// probes differ by operation, a pin touching only the state half —
+    /// and *what for*, because the sentence shown above sudo's prompt
+    /// is the only explanation the person gets, and "install under" is
+    /// false for a removal.
+    fn authorize(
+        terminal: &mut DefaultTerminal,
+        prefix: &Path,
+        escalate: bool,
+        purpose: crate::privileged::AuthPurpose,
+    ) -> Result<Preflight> {
+        if !escalate {
+            return Ok(Preflight::Ready);
+        }
+        let fresh = match crate::privileged::credentials_fresh() {
+            Ok(fresh) => fresh,
+            Err(e) => return Ok(Preflight::Reported(format!("{e:#}"))),
+        };
+        if fresh {
+            return Ok(Preflight::Ready);
+        }
+        let owned = prefix.to_path_buf();
+        if let Err(e) = Self::suspended(terminal, || {
+            crate::privileged::preauthorize(&owned, true, purpose)
+        })? {
+            return Ok(Preflight::Reported(format!("{e:#}")));
+        }
+        match crate::privileged::credentials_fresh() {
+            Ok(true) => Ok(Preflight::Ready),
+            Ok(false) => Ok(Preflight::NoCache),
+            Err(e) => Ok(Preflight::Reported(format!("{e:#}"))),
+        }
+    }
+
     /// What the escalation preflight found for one prefix; each captured
     /// workflow maps the outcomes to what it can offer.
     fn preflight_escalation(terminal: &mut DefaultTerminal, prefix: &Path) -> Result<Preflight> {
@@ -1127,44 +1200,21 @@ impl App {
         }
         // Everything else waits for the placement door, where the
         // credentials are actually spent: a build that fails should not
-        // have cost a password, and one that succeeds should not have
-        // held a warm timestamp for its whole length. The worker's
-        // `sudo -n` has a door of its own — NeedAuth suspends the screen
-        // and asks — so deferring costs nothing except on a sudo that
-        // refuses to cache at all, where the refusal now arrives after
-        // the build instead of before it.
-        if !StateLock::preparation_needs_privilege(prefix) {
-            return Ok(Preflight::Ready);
-        }
-        let fresh = match crate::privileged::credentials_fresh() {
-            Ok(fresh) => fresh,
-            Err(e) => {
-                return Ok(Preflight::Reported(format!("{e:#}")));
-            }
-        };
-        let prefix = prefix.to_path_buf();
-        if !fresh
-            && let Err(e) = Self::suspended(terminal, || {
-                crate::privileged::preauthorize(
-                    &prefix,
-                    true,
-                    crate::privileged::AuthPurpose::Placement,
-                )
-            })?
-        {
-            return Ok(Preflight::Reported(format!("{e:#}")));
-        }
-        // Right after validation the timestamp should be warm; a sudo that
-        // does not cache is detected now, not by the worker's `sudo -n`.
-        match crate::privileged::credentials_fresh() {
-            Ok(true) => Ok(Preflight::Ready),
-            Ok(false) => Ok(Preflight::NoCache),
-            Err(e) => Ok(Preflight::Reported(format!("{e:#}"))),
-        }
+        // have cost a password, and one that succeeds should not hold a
+        // warm timestamp for its whole length.
+        Self::authorize(
+            terminal,
+            prefix,
+            StateLock::preparation_needs_privilege(prefix),
+            crate::privileged::AuthPurpose::Placement,
+        )
     }
 
-    /// Can captured placement run? `false` means the attempt is over:
-    /// either it was reported, or it left as a terminal handoff.
+    /// Can captured placement run, and if not, what should happen
+    /// instead — a refusal to report, or the command that would do the
+    /// work in the terminal. The answer is returned, never acted on:
+    /// scheduling a handoff here would make `Refused` a lie for anyone
+    /// downstream who believed it.
     ///
     /// Captured placement runs `sudo -n`; a non-caching sudo would be
     /// asked a question it cannot voice, so the work falls back to the
@@ -1178,12 +1228,13 @@ impl App {
         terminal: &mut DefaultTerminal,
         req: &PendingBuild,
         name: &str,
-    ) -> Result<bool> {
+    ) -> Result<Option<StartOutcome>> {
         match Self::preflight_escalation(terminal, &self.prefix.clone())? {
-            Preflight::Ready => Ok(true),
+            // Nothing to answer with: the caller may go on and start a
+            // worker, which is the only thing entitled to say `Started`.
+            Preflight::Ready => Ok(None),
             Preflight::NoCache => {
-                self.info("sudo does not cache credentials here; handing the terminal over");
-                self.pending = Some(match &req.intent {
+                let action = match &req.intent {
                     BuildIntent::Downgrade(_) => PendingAction::Downgrade(name.to_owned()),
                     // A reinstall hands over as a reinstall: `install
                     // NAME` there would resolve a fresh version, which
@@ -1193,36 +1244,51 @@ impl App {
                         crates: vec![req.spec.clone()],
                         locked: req.locked,
                     },
-                });
-                Ok(false)
+                };
+                // Returned, not scheduled. Whoever asked decides: a
+                // person gets the handover, a queue may refuse it —
+                // what neither gets is a CLI run they never agreed to.
+                Ok(Some(StartOutcome::NeedsTerminal {
+                    action,
+                    reason: "sudo does not cache credentials here; handing the terminal over"
+                        .to_owned(),
+                }))
             }
-            Preflight::Reported(message) => {
-                self.error(&message);
-                Ok(false)
-            }
+            Preflight::Reported(message) => Ok(Some(StartOutcome::Refused(message))),
         }
     }
 
     /// A captured install. The run loop calls this because only it owns
     /// the terminal: whatever the preflight still has to ask happens
     /// here, on a suspended screen — never inside the alternate one.
-    fn start_build(&mut self, terminal: &mut DefaultTerminal, req: &PendingBuild) -> Result<()> {
+    /// Start one build, or say why none started.
+    ///
+    /// Every exit carries an outcome, as `start_migrate`'s does. A path
+    /// that returned quietly was fine while a build was always somebody
+    /// pressing a key — the message had been shown, there was nothing
+    /// waiting on an answer. It stops being fine the moment a queue is
+    /// waiting for this member's fate: a silent return leaves the queue
+    /// holding a slot that will never be filled. The reason travels
+    /// with the refusal and is reported by the caller, so that a batch
+    /// can record it instead of a message vanishing into the footer.
+    fn start_build(
+        &mut self,
+        terminal: &mut DefaultTerminal,
+        req: &PendingBuild,
+    ) -> Result<StartOutcome> {
         let (raw_spec, locked) = (req.spec.as_str(), req.locked);
         let spec = match InstallSpec::parse_all(std::slice::from_ref(&raw_spec.to_owned())) {
             Ok(mut specs) => specs.remove(0),
-            Err(e) => {
-                self.error(&format!("{e:#}"));
-                return Ok(());
-            }
+            Err(e) => return Ok(StartOutcome::Refused(format!("{e:#}"))),
         };
-        if self.refuses_for_pin(&req.intent, &spec) {
-            return Ok(());
+        if let Some(reason) = self.refuses_for_pin(&req.intent, &spec) {
+            return Ok(StartOutcome::Refused(reason));
         }
         // A new attempt supersedes the previous report — a stale failure
         // over a fresh run would report on the wrong world.
         self.build_report = None;
-        if !self.escalation_ready(terminal, req, &spec.name)? {
-            return Ok(());
+        if let Some(answered) = self.escalation_ready(terminal, req, &spec.name)? {
+            return Ok(answered);
         }
         let (tx, rx) = mpsc::channel();
         let (auth_tx, auth_rx) = mpsc::channel();
@@ -1309,7 +1375,7 @@ impl App {
             },
             cancel_deadline: None,
         });
-        Ok(())
+        Ok(StartOutcome::Started)
     }
 
     /// Does this migration's *retirement* escalate where the
@@ -1603,17 +1669,23 @@ impl App {
     /// from a thing to preserve into a reason to refuse preserving it:
     /// `t` on a pinned crate would be blocked by the very fact it was
     /// about to keep.
-    fn refuses_for_pin(&mut self, intent: &BuildIntent, spec: &InstallSpec) -> bool {
-        matches!(intent, BuildIntent::Install) && self.refused_by_advisory_pin_check(spec)
+    fn refuses_for_pin(&mut self, intent: &BuildIntent, spec: &InstallSpec) -> Option<String> {
+        if !matches!(intent, BuildIntent::Install) {
+            return None;
+        }
+        self.advisory_pin_refusal(spec)
     }
 
     /// Advisory pin check before anyone types a password. Silent,
     /// nonblocking: busy yields "not now", never a frozen UI; the
-    /// authoritative pass runs in the worker. True = stop here (message
-    /// already shown).
-    fn refused_by_advisory_pin_check(&mut self, spec: &InstallSpec) -> bool {
+    /// authoritative pass runs in the worker.
+    ///
+    /// Returns the reason rather than showing it: a refusal belongs to
+    /// whoever asked for the build — a person, who wants it in the
+    /// footer, or a queue, which must record it as this member's fate.
+    fn advisory_pin_refusal(&mut self, spec: &InstallSpec) -> Option<String> {
         if spec.version.is_some() {
-            return false;
+            return None;
         }
         let advisory = StateLock::try_acquire_with(
             &self.prefix,
@@ -1624,20 +1696,16 @@ impl App {
         if let Ok(Some(_lock)) = advisory {
             match Manifest::load(&self.prefix) {
                 Ok(m) if m.crates.get(&spec.name).is_some_and(|e| e.pinned) => {
-                    self.error(&format!(
+                    return Some(format!(
                         "{} is pinned; `p` unpins it, or name a version to re-pin",
                         spec.name
                     ));
-                    return true;
                 }
                 Ok(_) => {}
-                Err(e) => {
-                    self.error(&format!("{e:#}"));
-                    return true;
-                }
+                Err(e) => return Some(format!("{e:#}")),
             }
         }
-        false
+        None
     }
 
     /// Leaves the TUI, runs `f` on the real terminal, re-enters. The
@@ -3949,16 +4017,21 @@ mod tests {
         let bare = InstallSpec::parse_all(&["foo".to_owned()])
             .unwrap()
             .remove(0);
+        let refusal = app
+            .refuses_for_pin(&BuildIntent::Install, &bare)
+            .expect("`install foo` would move a pinned crate off its version");
         assert!(
-            app.refuses_for_pin(&BuildIntent::Install, &bare),
-            "`install foo` would move a pinned crate off its version"
+            refusal.contains("pinned"),
+            "and the reason travels with the refusal: {refusal}"
         );
         assert!(
-            !app.refuses_for_pin(&BuildIntent::Reinstall, &bare),
+            app.refuses_for_pin(&BuildIntent::Reinstall, &bare)
+                .is_none(),
             "but `t` keeps that very version — the pin is not a reason to refuse"
         );
         assert!(
-            !app.refuses_for_pin(&BuildIntent::Downgrade("1.2.0".to_owned()), &bare),
+            app.refuses_for_pin(&BuildIntent::Downgrade("1.2.0".to_owned()), &bare)
+                .is_none(),
             "and a downgrade names the version it wants"
         );
 
@@ -3969,7 +4042,46 @@ mod tests {
         let bar = InstallSpec::parse_all(&["bar".to_owned()])
             .unwrap()
             .remove(0);
-        assert!(!app.refuses_for_pin(&BuildIntent::Install, &bar));
+        assert!(app.refuses_for_pin(&BuildIntent::Install, &bar).is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Every way a build can fail to start now says so. The queue that
+    /// arrives in the next patches needs exactly this: an answer per
+    /// member, never silence — a member whose start returned quietly
+    /// would leave the queue holding a slot forever.
+    #[test]
+    fn a_build_that_does_not_start_says_why() {
+        let root = std::env::temp_dir().join("cargo-lbin-test-tui-start-outcome");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("bin")).unwrap();
+        std::fs::create_dir_all(root.join("share/cargo-lbin")).unwrap();
+        let mut m = manifest(&[("foo", "1.2.0")]);
+        m.crates.get_mut("foo").unwrap().pinned = true;
+        m.store(&root).unwrap();
+        let mut app = App::new(&root).unwrap();
+
+        // The pin refusal: a reason, not a message already spent on the
+        // footer where a batch could not reach it.
+        let bare = InstallSpec::parse_all(&["foo".to_owned()])
+            .unwrap()
+            .remove(0);
+        let reason = app
+            .refuses_for_pin(&BuildIntent::Install, &bare)
+            .expect("a pinned crate refuses a bare install");
+        assert!(reason.contains("pinned"), "{reason}");
+        assert!(
+            app.message.is_none(),
+            "and it is not shown here: the caller decides where it lands"
+        );
+
+        // And a refusal schedules nothing: the caller decides, which is
+        // the difference between "this member failed" and "this member
+        // is about to run in the terminal behind your back".
+        assert!(
+            app.pending.is_none(),
+            "a refusal is not a handover in disguise"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
