@@ -5185,9 +5185,17 @@ mod tests {
         match leftovers.as_slice() {
             [] => {}
             [run] => {
-                assert_eq!(
-                    crate::stage::probe_lease(run),
-                    crate::stage::LeaseState::Released,
+                // Waited for, not asserted at once: the build waited on
+                // its direct child, but the fake cargo is `sh` running
+                // `sleep`, and when sh forks rather than execs, the
+                // sleeper — holding the inherited lease — dies from the
+                // group's SIGTERM a moment after its parent does. On a
+                // two-core runner that moment is wide enough to probe
+                // into.
+                assert!(
+                    crate::stage::eventually(std::time::Duration::from_secs(10), || {
+                        crate::stage::probe_lease(run) == crate::stage::LeaseState::Released
+                    }),
                     "a vetoed run is released once its last inheritor exits"
                 );
                 assert!(
@@ -5369,9 +5377,17 @@ mod tests {
         match leftovers.as_slice() {
             [] => {}
             [run] => {
-                assert_eq!(
-                    crate::stage::probe_lease(run),
-                    crate::stage::LeaseState::Released,
+                // Waited for, not asserted at once: the build waited on
+                // its direct child, but the fake cargo is `sh` running
+                // `sleep`, and when sh forks rather than execs, the
+                // sleeper — holding the inherited lease — dies from the
+                // group's SIGTERM a moment after its parent does. On a
+                // two-core runner that moment is wide enough to probe
+                // into.
+                assert!(
+                    crate::stage::eventually(std::time::Duration::from_secs(10), || {
+                        crate::stage::probe_lease(run) == crate::stage::LeaseState::Released
+                    }),
                     "a vetoed run is released once its last inheritor exits"
                 );
                 assert!(
