@@ -453,7 +453,7 @@ fn key_bar(app: &App) -> &'static str {
         " ↑/↓ select · c cancel · ? help · q quit"
     } else {
         " ↑/↓ select · Tab filter · Enter/u update · U update all · i install · x remove · \
-         m migrate · M migrate all · B other prefix · p pin · D downgrade · v verify · r check · s search · ? help · q quit"
+         m migrate · M migrate all · B other prefix · p pin · D downgrade · t reinstall · T reinstall all · v verify · r check · s search · ? help · q quit"
     }
 }
 
@@ -613,6 +613,11 @@ fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
         "            update --all holds it back, m migrates exactly it",
         "            (in place unless pinning needs sudo)",
         "D           downgrade: the panel offers older versions, a digit installs one",
+        "t           reinstall selected crate: rebuild exactly as installed —",
+        "            same version, same pin, same --locked, new artifacts",
+        "            (for a new toolchain or system library)",
+        "T           reinstall all crates under this prefix; the plan and its",
+        "            confirmation happen in the terminal",
         "v           verify: the manifest's claims checked against the disk,",
         "            read-only; violations and warnings land in a panel,",
         "            naming the repair where one is unambiguous",

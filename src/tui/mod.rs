@@ -198,6 +198,16 @@ enum OnConfirm {
 #[derive(Clone)]
 enum PendingAction {
     Update(String),
+    /// `install --reinstall --all`: the sweep, always in the terminal.
+    /// It prints a plan and asks before spending a great many builds,
+    /// and that exchange has a better home in the CLI than behind a
+    /// panel — the same judgement `U` makes.
+    ReinstallAll,
+    /// `install --reinstall`: same fallback case as the downgrade below
+    /// — where sudo caches nothing, the rebuild leaves as the command
+    /// that reads the entry, not as a plain install that would resolve
+    /// a fresh version.
+    Reinstall(String),
     /// `downgrade`: only as the fallback when captured placement cannot
     /// run (sudo caches nothing here). The command asks for a version
     /// again, which is the price of the handover — and it keeps the
@@ -272,6 +282,11 @@ enum BuildOutcome {
 /// this — the worker reports outcomes, never prose.
 enum BuildKind {
     Install,
+    /// A rebuild of the entry as it stands, started by `t`. Same
+    /// pipeline as an install, different word — and a record that
+    /// called it an install would describe a version choice nobody
+    /// made.
+    Reinstall,
     /// An install of an exact older version, started from the panel's
     /// offer. It differs from `Install` only in what the record calls
     /// it — the pipeline underneath is the same — but a record that
@@ -291,6 +306,7 @@ impl BuildKind {
         match self {
             BuildKind::Install => "install",
             BuildKind::Downgrade => "downgrade",
+            BuildKind::Reinstall => "reinstall",
             // Tuple variant, tuple pattern: a pattern should not lie
             // about the shape.
             BuildKind::Migrate(_) => "migrate",
@@ -589,13 +605,28 @@ fn auth_gate(
 
 /// A build the run loop still has to start, because starting one needs
 /// the terminal: the escalation preflight may have to ask for a
-/// password. `expect` carries a downgrade's premise — the version the
-/// manifest must still hold — down to the worker, where it is checked
-/// under the build's own lock.
+/// password. `intent` says which of the three builds this is — see
+/// [`BuildIntent`] — and travels with the request to the worker.
 struct PendingBuild {
     spec: String,
     locked: bool,
-    expect: Option<String>,
+    intent: BuildIntent,
+}
+
+/// What the queued build is, which decides both the worker it reaches
+/// and the word the record uses.
+///
+/// The three differ only in where the version and the pin come from:
+/// an install takes both from the line the person typed, a downgrade
+/// takes the version from a keypress against a premise, a reinstall
+/// takes everything from the manifest entry and changes none of it.
+#[derive(Clone, PartialEq, Eq, Debug)]
+enum BuildIntent {
+    Install,
+    /// The version the offer was computed against, re-checked under the
+    /// worker's lock.
+    Downgrade(String),
+    Reinstall,
 }
 
 /// The versions `D` offers for the selected crate, and the version they
@@ -1032,6 +1063,10 @@ impl App {
         ratatui::try_restore().context("leaving the TUI")?;
         println!();
         let outcome = match action {
+            PendingAction::ReinstallAll => crate::cmd_reinstall_all(&self.prefix, false),
+            PendingAction::Reinstall(name) => {
+                crate::cmd_install(&self.prefix, std::slice::from_ref(name), false, true)
+            }
             PendingAction::Downgrade(name) => crate::cmd_downgrade(&self.prefix, name),
             PendingAction::Update(name) => {
                 crate::cmd_update(&self.prefix, std::slice::from_ref(name), false, false)
@@ -1039,7 +1074,8 @@ impl App {
             PendingAction::UpdateAll => crate::cmd_update(&self.prefix, &[], true, false),
             PendingAction::Install { crates, locked } => {
                 // The interface's install line takes a crate spec, not
-                // flags: `--reinstall` stays a CLI-only modifier.
+                // flags: `--reinstall` is not typed here, it has its own
+                // key (`t`), and `--all` is `T`'s handoff.
                 crate::cmd_install(&self.prefix, crates, *locked, false)
             }
             PendingAction::Remove(name) => {
@@ -1147,9 +1183,13 @@ impl App {
             Preflight::Ready => Ok(true),
             Preflight::NoCache => {
                 self.info("sudo does not cache credentials here; handing the terminal over");
-                self.pending = Some(match &req.expect {
-                    Some(_) => PendingAction::Downgrade(name.to_owned()),
-                    None => PendingAction::Install {
+                self.pending = Some(match &req.intent {
+                    BuildIntent::Downgrade(_) => PendingAction::Downgrade(name.to_owned()),
+                    // A reinstall hands over as a reinstall: `install
+                    // NAME` there would resolve a fresh version, which
+                    // is the one thing this operation must not do.
+                    BuildIntent::Reinstall => PendingAction::Reinstall(name.to_owned()),
+                    BuildIntent::Install => PendingAction::Install {
                         crates: vec![req.spec.clone()],
                         locked: req.locked,
                     },
@@ -1175,7 +1215,7 @@ impl App {
                 return Ok(());
             }
         };
-        if self.refused_by_advisory_pin_check(&spec) {
+        if self.refuses_for_pin(&req.intent, &spec) {
             return Ok(());
         }
         // A new attempt supersedes the previous report — a stale failure
@@ -1193,7 +1233,7 @@ impl App {
         let worker_tx = tx.clone();
         // A downgrade's premise travels into the worker, where the lock
         // that decides it is held.
-        let expect = req.expect.clone();
+        let intent = req.intent.clone();
         std::thread::spawn(move || {
             let line_tx = worker_tx.clone();
             let control = worker_control;
@@ -1212,12 +1252,19 @@ impl App {
             // One door per intent: an install places what was asked for,
             // a downgrade first makes the statement its name implies —
             // under the lock, not against a snapshot.
-            let result = match (&expect, &spec.version) {
-                (Some(expected), Some(version)) => crate::tui_downgrade_one(
+            let result = match (&intent, &spec.version) {
+                (BuildIntent::Downgrade(expected), Some(version)) => crate::tui_downgrade_one(
                     &prefix,
                     &spec.name,
                     expected,
                     version,
+                    &mut on_line,
+                    &mut before_placement,
+                    &control,
+                ),
+                (BuildIntent::Reinstall, _) => crate::tui_reinstall_one(
+                    &prefix,
+                    &spec.name,
                     &mut on_line,
                     &mut before_placement,
                     &control,
@@ -1253,12 +1300,12 @@ impl App {
             started: std::time::Instant::now(),
             needs_auth: None,
             control,
-            // The premise is what makes this a downgrade, so it is also
-            // what the record answers to.
-            kind: if req.expect.is_some() {
-                BuildKind::Downgrade
-            } else {
-                BuildKind::Install
+            // The intent decides the word the record uses, as it
+            // decided the door the worker took.
+            kind: match req.intent {
+                BuildIntent::Downgrade(_) => BuildKind::Downgrade,
+                BuildIntent::Reinstall => BuildKind::Reinstall,
+                BuildIntent::Install => BuildKind::Install,
             },
             cancel_deadline: None,
         });
@@ -1550,6 +1597,20 @@ impl App {
     /// nonblocking: busy yields "not now", never a frozen UI; the
     /// authoritative pass runs in the worker. True = stop here (message
     /// already shown).
+    /// Does the pin refuse this request?
+    ///
+    /// Only an install, and only an unversioned one. A pin refuses
+    /// `install NAME` because that resolves the newest release and
+    /// moves the crate off the version it declares — but a downgrade
+    /// names its version, and a reinstall *restates the entry*, pin
+    /// included. Applying the refusal to those two would turn the pin
+    /// from a thing to preserve into a reason to refuse preserving it:
+    /// `t` on a pinned crate would be blocked by the very fact it was
+    /// about to keep.
+    fn refuses_for_pin(&mut self, intent: &BuildIntent, spec: &InstallSpec) -> bool {
+        matches!(intent, BuildIntent::Install) && self.refused_by_advisory_pin_check(spec)
+    }
+
     fn refused_by_advisory_pin_check(&mut self, spec: &InstallSpec) -> bool {
         if spec.version.is_some() {
             return false;
@@ -1832,7 +1893,7 @@ impl App {
                 // destination committed (Migrated's payload), never the
                 // frozen plan's.
                 let note = match kind {
-                    BuildKind::Install | BuildKind::Downgrade => tail
+                    BuildKind::Install | BuildKind::Downgrade | BuildKind::Reinstall => tail
                         .iter()
                         .rev()
                         .find(|l| l.starts_with("installed "))
@@ -2136,6 +2197,14 @@ impl App {
             // Toggle from what the row shows; the command re-reads under the
             // lock, so a pin changed elsewhere is reported, not overwritten.
             KeyCode::Char('p') => self.pin_selected(),
+            // Rebuild the selected entry as it stands: no value to
+            // supply, so the keypress is the whole interaction. The
+            // build runs in the panel like any single-crate install.
+            KeyCode::Char('t') => self.start_reinstall(),
+            // Every entry under this prefix. A sweep shows a plan and
+            // asks, and that conversation belongs to the terminal — the
+            // same reason `U` hands over.
+            KeyCode::Char('T') => self.queue(PendingAction::ReinstallAll),
             // The version choice happens here: a known action wanting one
             // value, which is what this interface is for. The build that
             // follows runs in the panel, with `c` and the warning record
@@ -2548,7 +2617,7 @@ impl App {
                     self.pending_build = Some(PendingBuild {
                         spec,
                         locked,
-                        expect: None,
+                        intent: BuildIntent::Install,
                     });
                 }
                 Ok((crates, locked)) => self.queue(PendingAction::Install { crates, locked }),
@@ -2724,6 +2793,29 @@ impl App {
         self.message = None;
     }
 
+    /// `t`: rebuild the selected crate from its own entry.
+    ///
+    /// The interface supplies a name and nothing else. Version, pin and
+    /// `--locked` are read by the worker under the lock that commits
+    /// them, because the rows are a snapshot and an entry can move
+    /// between the keypress and the build.
+    fn start_reinstall(&mut self) {
+        if self.anything_running() {
+            self.error("busy; wait for the current job to finish");
+            return;
+        }
+        let Some(row) = self.selected_row() else {
+            return;
+        };
+        let name = row.name.clone();
+        self.info(&format!("rebuilding {name} as installed"));
+        self.pending_build = Some(PendingBuild {
+            spec: name,
+            locked: false,
+            intent: BuildIntent::Reinstall,
+        });
+    }
+
     /// `D`: ask the index which older versions exist for the selected
     /// crate. Read-only and cancellable, like every other one-shot — the
     /// mutation is the build that a chosen version starts, and nothing
@@ -2807,7 +2899,7 @@ impl App {
         self.pending_build = Some(PendingBuild {
             spec: format!("{name}@{version}"),
             locked: false,
-            expect: Some(current),
+            intent: BuildIntent::Downgrade(current),
         });
     }
 
@@ -3182,6 +3274,8 @@ fn action_label(action: &PendingAction) -> String {
     match action {
         PendingAction::Update(name) => format!("update {name}"),
         PendingAction::Downgrade(name) => format!("downgrade {name}"),
+        PendingAction::Reinstall(name) => format!("reinstall {name}"),
+        PendingAction::ReinstallAll => "reinstall all".to_owned(),
         PendingAction::UpdateAll => "update --all".to_owned(),
         PendingAction::Install { crates, locked } => {
             let mut label = format!("install {}", crates.join(" "));
@@ -3594,8 +3688,8 @@ mod tests {
         let req = app.pending_build.as_ref().expect("a build was requested");
         assert_eq!(req.spec, "foo@1.1.0", "that exact version, nothing else");
         assert_eq!(
-            req.expect.as_deref(),
-            Some("1.2.0"),
+            req.intent,
+            BuildIntent::Downgrade("1.2.0".to_owned()),
             "and the premise travels with it, to be checked under the lock"
         );
         assert!(
@@ -3793,6 +3887,89 @@ mod tests {
             !app.migration_escalates_late(Path::new("/usr/local")),
             "no promise about a timestamp that may or may not lapse"
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `t` asks for a rebuild of the entry and nothing else: the
+    /// request carries a bare name, because version, pin and
+    /// `--locked` are read by the worker under the lock that commits
+    /// them. The record calls it by its own word.
+    #[test]
+    fn a_reinstall_key_queues_the_entry_not_a_version() {
+        let root = std::env::temp_dir().join("cargo-lbin-test-tui-reinstall-key");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let mut app = App::new(&root).unwrap();
+        let mut m = manifest(&[("foo", "1.2.0")]);
+        let entry = m.crates.get_mut("foo").unwrap();
+        entry.pinned = true;
+        entry.locked = true;
+        app.rows = rows_from(&m, None, &BTreeMap::new());
+
+        app.start_reinstall();
+        let req = app.pending_build.as_ref().expect("a build was requested");
+        assert_eq!(req.spec, "foo", "a name, with no version attached");
+        assert_eq!(req.intent, BuildIntent::Reinstall);
+        assert!(
+            !req.spec.contains('@'),
+            "the entry's version is not restated into the request: {}",
+            req.spec
+        );
+        assert_eq!(BuildKind::Reinstall.verb(), "reinstall");
+
+        // And it refuses while something else is running, like every
+        // other mutation started from the list.
+        app.pending_build = None;
+        let (_tx, rx) = mpsc::channel();
+        app.job = Some(Job::Verify {
+            rx,
+            started: std::time::Instant::now(),
+            cancel: cancel_flag(),
+        });
+        app.start_reinstall();
+        assert!(app.pending_build.is_none(), "no build is queued over a job");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A pin is what `t` preserves, so it cannot be what stops `t`.
+    /// The refusal belongs to `install NAME`, which would resolve the
+    /// newest release; a reinstall restates the entry, pin included,
+    /// and a downgrade names its own version.
+    #[test]
+    fn a_pin_refuses_an_install_and_lets_a_rebuild_through() {
+        let root = std::env::temp_dir().join("cargo-lbin-test-tui-pin-gate");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("bin")).unwrap();
+        std::fs::create_dir_all(root.join("share/cargo-lbin")).unwrap();
+        let mut m = manifest(&[("foo", "1.2.0")]);
+        m.crates.get_mut("foo").unwrap().pinned = true;
+        m.store(&root).unwrap();
+        let mut app = App::new(&root).unwrap();
+
+        let bare = InstallSpec::parse_all(&["foo".to_owned()])
+            .unwrap()
+            .remove(0);
+        assert!(
+            app.refuses_for_pin(&BuildIntent::Install, &bare),
+            "`install foo` would move a pinned crate off its version"
+        );
+        assert!(
+            !app.refuses_for_pin(&BuildIntent::Reinstall, &bare),
+            "but `t` keeps that very version — the pin is not a reason to refuse"
+        );
+        assert!(
+            !app.refuses_for_pin(&BuildIntent::Downgrade("1.2.0".to_owned()), &bare),
+            "and a downgrade names the version it wants"
+        );
+
+        // An unpinned crate refuses nothing, whatever the intent.
+        let mut m = manifest(&[("bar", "1.0.0")]);
+        m.crates.get_mut("bar").unwrap().pinned = false;
+        m.store(&root).unwrap();
+        let bar = InstallSpec::parse_all(&["bar".to_owned()])
+            .unwrap()
+            .remove(0);
+        assert!(!app.refuses_for_pin(&BuildIntent::Install, &bar));
         let _ = std::fs::remove_dir_all(&root);
     }
 

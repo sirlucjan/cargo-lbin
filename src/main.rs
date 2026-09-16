@@ -2502,6 +2502,53 @@ pub(crate) fn tui_downgrade_one(
     Ok(())
 }
 
+/// `install --reinstall` for the captured frontend: the entry, read
+/// under the lock that will commit it.
+///
+/// Same specification as the CLI's — version, pin and `--locked` from
+/// the manifest — and read *here* rather than passed in from the
+/// interface, because the rows are a snapshot and this lock is not.
+/// The panel's request carries only a name.
+#[cfg(feature = "tui")]
+pub(crate) fn tui_reinstall_one(
+    prefix: &Path,
+    name: &str,
+    on_line: &mut dyn FnMut(LineKind, &str),
+    before_placement: &mut dyn FnMut(&Path) -> Result<()>,
+    control: &BuildControl,
+) -> Result<()> {
+    let cache = cache_dir()?;
+    let _lock = StateLock::acquire_with(
+        prefix,
+        &Mode::Exclusive,
+        privileged::Policy::for_prefix(prefix).screen_owned(),
+        &mut |s| on_line(LineKind::Notice, s),
+    )?;
+    let mut manifest = Manifest::load(prefix)?;
+    let plan = reinstall_plan(&manifest, name)?;
+    let mut frontend = Frontend::Captured {
+        on_line,
+        before_placement,
+        control,
+        checkpoint: None,
+    };
+    // `Exactly`, not `Infer`: an exact version infers a pin, and this
+    // operation must return the entry it found — an unpinned crate
+    // rebuilt must not come back pinned.
+    install_and_commit(
+        prefix,
+        &cache,
+        &mut manifest,
+        name,
+        Some(&plan.version),
+        plan.locked,
+        PinPolicy::Exactly(plan.pinned),
+        ShadowReport::OnCommit,
+        &mut frontend,
+    )?;
+    Ok(())
+}
+
 /// One crate for the TUI, end to end: same locking, pin refusal and
 /// pipeline as `cmd_install`; the exclusive lock spans build and
 /// placement — serialization per prefix is a documented invariant.
@@ -7477,6 +7524,42 @@ mod tests {
             .map(|e| e.map(|e| e.unwrap().path()).collect())
             .unwrap_or_default();
         assert_eq!(runs.len(), 1, "the stage is kept as forensics: {runs:?}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// And the worker behind `t` finishes what the gate now lets
+    /// through: a pinned, locked entry comes back pinned and locked, at
+    /// the same version, with the binary rebuilt.
+    #[cfg(feature = "tui")]
+    #[test]
+    fn a_captured_reinstall_returns_the_entry_it_found() {
+        let root = std::env::temp_dir().join("cargo-lbin-test-tui-reinstall-worker");
+        let _ = fs::remove_dir_all(&root);
+        let prefix = seeded_prefix(&root, "prefix", "okcrate", true, true);
+        let _fake = crate::stage::FakeCargo::install(&versioned_fake(&root, "okcrate"));
+        fs::remove_file(prefix.join("bin/okcrate")).unwrap();
+        let control = BuildControl::new();
+
+        tui_reinstall_one(
+            &prefix,
+            "okcrate",
+            &mut |_, _| {},
+            &mut |_| Ok(()),
+            &control,
+        )
+        .unwrap();
+
+        let entry = Manifest::load(&prefix).unwrap().crates["okcrate"].clone();
+        assert_eq!(
+            entry.version, "0.1.0",
+            "the entry's version, not the newest"
+        );
+        assert!(entry.pinned, "a pinned crate stays pinned");
+        assert!(entry.locked, "and keeps its --locked");
+        assert!(
+            prefix.join("bin/okcrate").exists(),
+            "and was actually rebuilt"
+        );
         let _ = fs::remove_dir_all(&root);
     }
 
