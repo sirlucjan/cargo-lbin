@@ -404,9 +404,16 @@ fn detail_lines(row: &super::Row) -> Vec<Line<'static>> {
     }
     lines.push(kv("Binaries", &row.bins.join(", "), Style::default()));
     if row.locked {
+        // What it is, not who honours it. Naming commands goes stale —
+        // the old wording named one of three — and "every rebuild"
+        // would be false the other way, because a plain `install NAME`
+        // rebuilds too and sets this policy anew rather than carrying
+        // it. "Stored build policy" is both true and stable: operations
+        // acting *from* the entry preserve it, an explicit install
+        // request states it.
         lines.push(kv(
             "Locked",
-            "yes (--locked, reused on update)",
+            "yes (--locked, stored build policy)",
             Style::default(),
         ));
     } else {
@@ -527,6 +534,19 @@ fn footer_height(app: &App, width: u16) -> u16 {
     2 + u16::try_from(key_bar_lines(app, width).len()).unwrap_or(1)
 }
 
+/// What the line in front of the person takes.
+///
+/// The prompt is the only place the syntax is visible at the moment it
+/// is needed: `--locked` has always been accepted on the install line
+/// and was findable only in `?` — the wrong place to learn what the
+/// line you are typing into accepts.
+fn input_prompt(purpose: InputPurpose) -> &'static str {
+    match purpose {
+        InputPurpose::Install => "install (NAME[@VERSION]… [--locked]): ",
+        InputPurpose::Search => "search: ",
+    }
+}
+
 fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     use std::fmt::Write as _;
     let keys = key_bar_lines(app, area.width);
@@ -598,10 +618,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         );
         frame.render_widget(Paragraph::new(line), line_area);
     } else if let Some(input) = &app.input {
-        let label = match input.purpose {
-            InputPurpose::Install => "install: ",
-            InputPurpose::Search => "search: ",
-        };
+        let label = input_prompt(input.purpose);
         let text = format!(" {label}{}", input.buffer);
         // Cursor after the typed text; widths are clamped to u16 because
         // that is what the terminal addresses, and a line longer than the
@@ -934,6 +951,52 @@ mod tests {
             resting_details_height(&app),
             8,
             "with no offer the entry's own height is back"
+        );
+        let _ = std::fs::remove_dir_all(&prefix);
+    }
+
+    /// Two lines the interface writes about policy, and what each has
+    /// to get right. `--locked` is the entry's stored build policy:
+    /// operations rebuilding *from* the entry preserve it, an explicit
+    /// install request states it. The panel says that rather than
+    /// naming one command (too narrow — that was the old wording) or
+    /// claiming every rebuild carries it (too wide — a plain `install
+    /// NAME` does not). And the prompt shows the syntax it accepts,
+    /// because `--locked` was typeable there long before it was
+    /// findable.
+    #[test]
+    fn the_interface_describes_a_policy_by_its_rule_not_one_of_its_uses() {
+        let prefix = std::env::temp_dir().join("cargo-lbin-test-tui-policy-words");
+        let _ = std::fs::remove_dir_all(&prefix);
+        std::fs::create_dir_all(&prefix).unwrap();
+        let mut app = crate::tui::App::new(&prefix).unwrap();
+        let mut locked = row("foo");
+        locked.locked = true;
+        app.rows = vec![locked];
+
+        let locked_line = detail_lines(&app.rows[0])
+            .iter()
+            .map(line_text)
+            .find(|l| l.starts_with("Locked"))
+            .expect("the panel speaks about --locked");
+        assert!(
+            locked_line.contains("stored build policy"),
+            "what it is, not who honours it: {locked_line}"
+        );
+        assert!(
+            !locked_line.contains("on update)"),
+            "not a list of commands, which goes stale: {locked_line}"
+        );
+        assert!(
+            !locked_line.contains("every rebuild"),
+            "and not a claim a plain `install NAME` would falsify: {locked_line}"
+        );
+
+        let prompt = input_prompt(crate::tui::InputPurpose::Install);
+        assert!(prompt.contains("--locked"), "the prompt shows it: {prompt}");
+        assert!(
+            prompt.contains("NAME"),
+            "along with what else the line takes: {prompt}"
         );
         let _ = std::fs::remove_dir_all(&prefix);
     }

@@ -21,12 +21,20 @@ pub struct Entry {
     pub version: String,
     /// Binary names this crate installed into `<prefix>/bin`.
     pub bins: Vec<String>,
-    /// Whether the crate was built with `--locked`; reused on update.
+    /// Whether this managed entry uses `--locked`.
+    ///
+    /// Stored as build policy and preserved by operations that rebuild
+    /// *from* the existing entry — `update`, `migrate`, `install
+    /// --reinstall`. An explicit install request sets it from that
+    /// request instead, which is why a plain `install NAME` on a
+    /// managed crate clears it and `install NAME --locked` sets it.
     #[serde(default)]
     pub locked: bool,
     /// Held at its installed version: excluded from `update --all`,
-    /// refused by `update NAME`/`install NAME` until unpinned. A statement
-    /// about the future — survives everything but an explicit `unpin`.
+    /// refused by `update NAME`/`install NAME` until unpinned —
+    /// but not by `install --reinstall`, which rebuilds the version the
+    /// pin declares and restates the pin with it. A statement about the
+    /// future — survives everything but an explicit `unpin`.
     /// Absent in older manifests, which reads as "not pinned".
     #[serde(default)]
     pub pinned: bool,

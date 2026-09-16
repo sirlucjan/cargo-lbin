@@ -1593,10 +1593,6 @@ impl App {
         false
     }
 
-    /// Advisory pin check before anyone types a password. Silent,
-    /// nonblocking: busy yields "not now", never a frozen UI; the
-    /// authoritative pass runs in the worker. True = stop here (message
-    /// already shown).
     /// Does the pin refuse this request?
     ///
     /// Only an install, and only an unversioned one. A pin refuses
@@ -1611,6 +1607,10 @@ impl App {
         matches!(intent, BuildIntent::Install) && self.refused_by_advisory_pin_check(spec)
     }
 
+    /// Advisory pin check before anyone types a password. Silent,
+    /// nonblocking: busy yields "not now", never a frozen UI; the
+    /// authoritative pass runs in the worker. True = stop here (message
+    /// already shown).
     fn refused_by_advisory_pin_check(&mut self, spec: &InstallSpec) -> bool {
         if spec.version.is_some() {
             return false;

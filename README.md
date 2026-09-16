@@ -142,7 +142,7 @@ Build using the crate's committed `Cargo.lock`:
 cargo lbin install some-tool --locked
 ```
 
-The `--locked` choice is stored per crate and reused on future updates.
+The `--locked` choice is stored per crate as the entry's build policy. Operations that rebuild *from* that entry preserve it — `update`, `migrate` and `install --reinstall` alike — while an explicit `install NAME` states the policy anew, which is why installing a managed crate without the flag clears it and with the flag sets it.
 
 A plain `install NAME` of an already managed crate is a full rebuild and replacement: it is built in a fresh staging directory and its managed binaries are replaced, so changing `--locked` this way takes effect instead of being skipped as "already installed". It also resolves the version afresh, which for an unpinned crate means the newest release.
 
