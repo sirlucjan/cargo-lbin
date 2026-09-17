@@ -2502,6 +2502,297 @@ pub(crate) fn tui_downgrade_one(
     Ok(())
 }
 
+/// Cancellation for a batch of builds: the batch's own state, plus a
+/// handle to whichever member is building now.
+///
+/// A `BuildControl` is one-way — once a build passes into placement it
+/// cannot be reused — so a batch cannot have one. What a batch has is
+/// an intention to stop, and a pointer to the member that intention
+/// currently applies to. `c` sets the flag and asks the current member
+/// to stop: a member still compiling ends as `Cancelled`, one already
+/// placing finishes honestly, and either way the worker starts no one
+/// after it.
+#[cfg(feature = "tui")]
+struct BatchState {
+    stopping: bool,
+    current: Option<std::sync::Arc<BuildControl>>,
+}
+
+#[cfg(feature = "tui")]
+pub(crate) struct BatchControl {
+    state: std::sync::Mutex<BatchState>,
+}
+
+#[cfg(feature = "tui")]
+impl BatchControl {
+    pub(crate) fn new() -> Self {
+        Self {
+            state: std::sync::Mutex::new(BatchState {
+                stopping: false,
+                current: None,
+            }),
+        }
+    }
+
+    fn state(&self) -> std::sync::MutexGuard<'_, BatchState> {
+        // A poisoned lock means a worker panicked mid-batch; the state
+        // it left is still the truth about what is running.
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// May the next member start, and if so, publish its control —
+    /// as one step.
+    ///
+    /// Two steps would race: the worker could read "not stopping",
+    /// `c` could arrive and cancel a member that has already finished,
+    /// and the worker could then publish the next one and build it.
+    /// Asking and publishing under the same lock makes "stopped" mean
+    /// stopped.
+    fn try_begin_member(&self, control: &std::sync::Arc<BuildControl>) -> bool {
+        let mut state = self.state();
+        if state.stopping {
+            return false;
+        }
+        state.current = Some(std::sync::Arc::clone(control));
+        true
+    }
+
+    /// That member is done. The slot is cleared, so a `c` arriving
+    /// between members answers for the batch rather than for a build
+    /// that has already ended.
+    fn finish_member(&self) {
+        self.state().current = None;
+    }
+
+    /// Has the batch been told to stop? True from the moment `c` is
+    /// pressed, whether or not a member was building at the time.
+    pub(crate) fn cancelled(&self) -> bool {
+        self.state().stopping
+    }
+
+    /// Run `f` against the member building now, if there is one. The
+    /// lock is not held while `f` runs — it may block on the interface
+    /// — so this is for the worker's own use, where "the member
+    /// building now" is the one that called in.
+    fn with_current<R>(&self, f: impl FnOnce(&BuildControl) -> R) -> Option<R> {
+        let current = self.state().current.clone();
+        current.map(|control| f(&control))
+    }
+
+    /// `c`: stop the batch, and ask the member in flight to stop too.
+    ///
+    /// The batch always accepts — there is always a next member not to
+    /// start. What the member says is its own: a build still compiling
+    /// accepts, one already placing is past the point, and the answer
+    /// distinguishes the two so the interface can say which.
+    pub(crate) fn request_cancel(&self) -> BatchCancel {
+        let mut state = self.state();
+        state.stopping = true;
+        match state.current.clone() {
+            Some(control) => {
+                drop(state);
+                BatchCancel::Member(control.request_cancel())
+            }
+            None => BatchCancel::BetweenMembers,
+        }
+    }
+}
+
+/// What `c` reached in a batch: a member, with that member's answer, or
+/// the gap between two.
+#[cfg(feature = "tui")]
+pub(crate) enum BatchCancel {
+    Member(CancelOutcome),
+    BetweenMembers,
+}
+
+/// How the batch itself ended.
+///
+/// Separate from any member's outcome, because the two answer
+/// different questions. A member that failed ends the batch without
+/// the batch being cancelled; a cancel stops the plan whether or not
+/// the member in flight noticed in time. And a plan that ran to its
+/// last member completed, even if `c` arrived too late to stop that
+/// member — there was nothing left to stop.
+#[cfg(feature = "tui")]
+#[derive(Debug)]
+pub(crate) enum InstallBatchEnd {
+    Completed,
+    Cancelled,
+}
+
+/// How one member of a batch ended.
+///
+/// `Refused` is not `Failed`, and the difference is the person's to
+/// see: a crate whose build succeeded and whose placement could not be
+/// authorized did not fail to build. Saying it did would send someone
+/// looking at a compiler error that does not exist.
+#[cfg(feature = "tui")]
+pub(crate) enum MemberOutcome {
+    Installed,
+    Failed(anyhow::Error),
+    Refused(String),
+    Cancelled,
+}
+
+/// A privileged step was reached and could not be authorized.
+///
+/// Typed so the classification survives the trip out of
+/// `install_and_commit`, and carrying both what was being authorized
+/// and why it was not: one bit across the channel made every refusal
+/// look like every other, and a migration's retirement was being told
+/// it had failed to place something.
+#[cfg(feature = "tui")]
+#[derive(Debug)]
+pub(crate) struct AuthorizationRefused {
+    pub purpose: privileged::AuthPurpose,
+    pub reason: String,
+}
+
+#[cfg(feature = "tui")]
+impl std::fmt::Display for AuthorizationRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let what = match self.purpose {
+            privileged::AuthPurpose::Placement => "placement",
+            privileged::AuthPurpose::Retirement => "retiring the source installation",
+        };
+        write!(f, "{what} could not be authorized: {}", self.reason)
+    }
+}
+
+#[cfg(feature = "tui")]
+impl std::error::Error for AuthorizationRefused {}
+
+/// What a batch worker tells the interface as it goes.
+#[cfg(feature = "tui")]
+pub(crate) enum BatchStep<'a> {
+    /// About to build member `index` of the plan (zero-based).
+    Started { index: usize, name: &'a str },
+    /// That member is done, classified where its error was still
+    /// typed.
+    Finished {
+        name: &'a str,
+        outcome: MemberOutcome,
+    },
+}
+
+/// `install a b c` for the captured frontend: one operation, one lock,
+/// one manifest.
+///
+/// This is `cmd_install`'s loop, reported instead of printed, and it is
+/// a loop *here* rather than a queue in the interface for the sake of
+/// the contract: the exclusive lock is taken before the manifest is
+/// read and held until the last member commits, and the pin refusal and
+/// the duplicate warnings are computed for the entire plan before the
+/// first build starts. Three calls to `tui_install_one` would be three
+/// operations wearing one name — a plan checked against a manifest that
+/// could move under it, and a pinned crate discovered ten minutes in.
+///
+/// Members are reported through `step`; the caller classifies, counts
+/// and draws. Each member gets a fresh `BuildControl`, handed to the
+/// batch's control so `c` reaches the build actually running.
+#[cfg(feature = "tui")]
+pub(crate) fn tui_install_batch(
+    prefix: &Path,
+    specs: &[InstallSpec],
+    locked: bool,
+    on_line: &mut dyn FnMut(LineKind, &str),
+    before_placement: &mut dyn FnMut(&Path) -> Result<()>,
+    control: &BatchControl,
+    step: &mut dyn FnMut(BatchStep),
+) -> Result<InstallBatchEnd> {
+    let cache = cache_dir()?;
+    let _lock = StateLock::acquire_with(
+        prefix,
+        &Mode::Exclusive,
+        privileged::Policy::for_prefix(prefix).screen_owned(),
+        &mut |s| on_line(LineKind::Notice, s),
+    )?;
+    let mut manifest = Manifest::load(prefix)?;
+    // The whole plan, before the first build: a pin refusal or a typo
+    // must not arrive after ten minutes of compiling.
+    let unversioned: Vec<String> = specs
+        .iter()
+        .filter(|s| s.version.is_none())
+        .map(|s| s.name.clone())
+        .collect();
+    refuse_pinned(&manifest, &unversioned)?;
+    for w in duplicate_install_warnings(prefix, &manifest, specs.iter().map(|s| s.name.as_str())) {
+        on_line(LineKind::Warning, &w);
+    }
+    let mut end = InstallBatchEnd::Completed;
+    for (index, spec) in specs.iter().enumerate() {
+        let member = std::sync::Arc::new(BuildControl::new());
+        // Asking and publishing as one step: see `try_begin_member`.
+        // A refusal here means the batch was stopped with members still
+        // to go — which is a cancelled batch, not a completed one.
+        if !control.try_begin_member(&member) {
+            end = InstallBatchEnd::Cancelled;
+            break;
+        }
+        step(BatchStep::Started {
+            index,
+            name: &spec.name,
+        });
+        let mut frontend = Frontend::Captured {
+            on_line,
+            before_placement,
+            control: &member,
+            checkpoint: None,
+        };
+        let result = install_and_commit(
+            prefix,
+            &cache,
+            &mut manifest,
+            &spec.name,
+            spec.version.as_ref(),
+            locked,
+            PinPolicy::Infer,
+            ShadowReport::OnCommit,
+            &mut frontend,
+        );
+        control.finish_member();
+        // Classified here, where the error is still typed: a cancel and
+        // a placement refusal are not build failures, and the person
+        // must not be sent looking for a compiler error that does not
+        // exist.
+        let outcome = match result {
+            Ok(_) => MemberOutcome::Installed,
+            Err(e) if e.downcast_ref::<BuildCancelled>().is_some() => MemberOutcome::Cancelled,
+            // Only a refusal at *this* member's placement door makes it
+            // "built, but not placed"; anything else is a failure.
+            Err(e) => match e.downcast::<AuthorizationRefused>() {
+                Ok(refused) if matches!(refused.purpose, privileged::AuthPurpose::Placement) => {
+                    MemberOutcome::Refused(refused.reason)
+                }
+                Ok(other) => MemberOutcome::Failed(anyhow::Error::new(other)),
+                Err(e) => MemberOutcome::Failed(e),
+            },
+        };
+        let carry_on = matches!(outcome, MemberOutcome::Installed);
+        if matches!(outcome, MemberOutcome::Cancelled) {
+            end = InstallBatchEnd::Cancelled;
+        }
+        step(BatchStep::Finished {
+            name: &spec.name,
+            outcome,
+        });
+        // `install a b c` stops at the first member that does not
+        // install, whatever the reason.
+        if !carry_on {
+            break;
+        }
+    }
+    // Note what is *not* here: a final look at `control.cancelled()`. A
+    // plan that reached its last member completed, even if `c` came too
+    // late to stop that member — there was nothing after it to stop,
+    // and calling that a cancelled batch would report a stop that
+    // changed nothing.
+    Ok(end)
+}
+
 /// `install --reinstall` for the captured frontend: the entry, read
 /// under the lock that will commit it.
 ///
@@ -7559,6 +7850,243 @@ mod tests {
         assert!(
             prefix.join("bin/okcrate").exists(),
             "and was actually rebuilt"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The batch worker is one operation: one lock, one manifest, the
+    /// whole plan checked before the first build. The pin refusal is
+    /// the visible proof — `install foo bar` with `bar` pinned refuses
+    /// without building `foo`, exactly as the CLI does, where a queue
+    /// of single installs would have built it first.
+    #[cfg(feature = "tui")]
+    #[test]
+    fn an_install_batch_checks_the_whole_plan_before_the_first_build() {
+        let root = std::env::temp_dir().join("cargo-lbin-test-batch-preflight");
+        let _ = fs::remove_dir_all(&root);
+        let prefix = seeded_prefix(&root, "prefix", "pinnedcrate", false, true);
+        let _fake = crate::stage::FakeCargo::install(&any_crate_fake(&root));
+        let control = BatchControl::new();
+        let specs =
+            InstallSpec::parse_all(&["okcrate".to_owned(), "pinnedcrate".to_owned()]).unwrap();
+        let mut started: Vec<String> = Vec::new();
+
+        let err = tui_install_batch(
+            &prefix,
+            &specs,
+            false,
+            &mut |_, _| {},
+            &mut |_| Ok(()),
+            &control,
+            &mut |step| {
+                if let BatchStep::Started { name, .. } = step {
+                    started.push(name.to_owned());
+                }
+            },
+        )
+        .expect_err("a pinned member refuses the plan");
+        assert!(format!("{err:#}").contains("pinned"), "{err:#}");
+        assert!(
+            started.is_empty(),
+            "and nothing was built first: {started:?}"
+        );
+        assert!(
+            !prefix.join("bin/okcrate").exists(),
+            "the unpinned member was never placed"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Members run in order under that one lock, and a failure ends the
+    /// batch where `install a b c` would end it.
+    #[cfg(feature = "tui")]
+    #[test]
+    fn an_install_batch_stops_at_the_first_failure() {
+        let root = std::env::temp_dir().join("cargo-lbin-test-batch-stop");
+        let _ = fs::remove_dir_all(&root);
+        let prefix = seeded_prefix(&root, "prefix", "okcrate", false, false);
+        let _fake = crate::stage::FakeCargo::install(&failing_fake(&root, "brokencrate"));
+        let control = BatchControl::new();
+        let specs = InstallSpec::parse_all(&[
+            "okcrate".to_owned(),
+            "brokencrate".to_owned(),
+            "lastcrate".to_owned(),
+        ])
+        .unwrap();
+        let mut steps: Vec<String> = Vec::new();
+
+        tui_install_batch(
+            &prefix,
+            &specs,
+            false,
+            &mut |_, _| {},
+            &mut |_| Ok(()),
+            &control,
+            &mut |step| match step {
+                BatchStep::Started { name, .. } => steps.push(format!("start {name}")),
+                BatchStep::Finished { name, outcome } => {
+                    steps.push(format!(
+                        "end {name} {}",
+                        matches!(outcome, MemberOutcome::Installed)
+                    ));
+                }
+            },
+        )
+        .expect("the batch itself does not fail; its members do");
+
+        assert_eq!(
+            steps,
+            vec![
+                "start okcrate".to_owned(),
+                "end okcrate true".to_owned(),
+                "start brokencrate".to_owned(),
+                "end brokencrate false".to_owned(),
+            ],
+            "lastcrate is never attempted"
+        );
+        assert_eq!(
+            Manifest::load(&prefix).unwrap().crates.len(),
+            1,
+            "only the member that succeeded is committed"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A cancel between members stops the batch: the next one never
+    /// starts. Driven deterministically — the cancel arrives exactly in
+    /// the gap, which is the window `try_begin_member` closes.
+    #[cfg(feature = "tui")]
+    #[test]
+    fn a_cancel_between_members_starts_nobody_else() {
+        let root = std::env::temp_dir().join("cargo-lbin-test-batch-gap-cancel");
+        let _ = fs::remove_dir_all(&root);
+        let prefix = seeded_prefix(&root, "prefix", "okcrate", false, false);
+        let _fake = crate::stage::FakeCargo::install(&any_crate_fake(&root));
+        let control = BatchControl::new();
+        let specs =
+            InstallSpec::parse_all(&["okcrate".to_owned(), "nextcrate".to_owned()]).unwrap();
+        let mut started: Vec<String> = Vec::new();
+
+        tui_install_batch(
+            &prefix,
+            &specs,
+            false,
+            &mut |_, _| {},
+            &mut |_| Ok(()),
+            &control,
+            &mut |step| match step {
+                BatchStep::Started { name, .. } => started.push(name.to_owned()),
+                // The gap: the member is done, the next has not begun.
+                BatchStep::Finished { .. } => {
+                    control.request_cancel();
+                }
+            },
+        )
+        .unwrap();
+
+        assert_eq!(started, vec!["okcrate".to_owned()], "nextcrate never began");
+        assert!(
+            !prefix.join("bin/nextcrate").exists(),
+            "and nothing of it was placed"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A batch cancelled before it starts attempts nobody at all.
+    #[cfg(feature = "tui")]
+    #[test]
+    fn a_batch_cancelled_up_front_attempts_nobody() {
+        let root = std::env::temp_dir().join("cargo-lbin-test-batch-precancel");
+        let _ = fs::remove_dir_all(&root);
+        let prefix = seeded_prefix(&root, "prefix", "okcrate", false, false);
+        let _fake = crate::stage::FakeCargo::install(&any_crate_fake(&root));
+        let control = BatchControl::new();
+        control.request_cancel();
+        let specs = InstallSpec::parse_all(&["okcrate".to_owned()]).unwrap();
+        let mut started = 0usize;
+
+        let end = tui_install_batch(
+            &prefix,
+            &specs,
+            false,
+            &mut |_, _| {},
+            &mut |_| Ok(()),
+            &control,
+            &mut |step| {
+                if matches!(step, BatchStep::Started { .. }) {
+                    started += 1;
+                }
+            },
+        )
+        .unwrap();
+        assert!(
+            matches!(end, InstallBatchEnd::Cancelled),
+            "and the batch says so: a stop with members left is cancelled"
+        );
+        assert_eq!(started, 0, "a stopped batch begins nobody");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A cancel that lands while a member is building. Whether that
+    /// member ends cancelled or slips through is a race with its own
+    /// build — a fake cargo finishes before any checkpoint — so what is
+    /// asserted is what is guaranteed: the batch ends cancelled and
+    /// nobody after it starts. The V1 bug was exactly that guarantee,
+    /// missing: the flag was set and nobody read it.
+    #[cfg(feature = "tui")]
+    #[test]
+    fn a_cancel_while_a_member_builds_stops_the_batch() {
+        let root = std::env::temp_dir().join("cargo-lbin-test-batch-live-cancel");
+        let _ = fs::remove_dir_all(&root);
+        let prefix = seeded_prefix(&root, "prefix", "okcrate", false, false);
+        let _fake = crate::stage::FakeCargo::install(&any_crate_fake(&root));
+        let control = BatchControl::new();
+        let specs =
+            InstallSpec::parse_all(&["okcrate".to_owned(), "nextcrate".to_owned()]).unwrap();
+        let mut started: Vec<String> = Vec::new();
+        let mut outcomes: Vec<String> = Vec::new();
+        let mut asked = false;
+
+        let end = tui_install_batch(
+            &prefix,
+            &specs,
+            false,
+            // The cancel arrives while this member is building, once:
+            // pressing `c` repeatedly is a different test, and would
+            // escalate to SIGKILL instead of characterizing the first
+            // press.
+            &mut |_, _| {
+                if !asked {
+                    asked = true;
+                    control.request_cancel();
+                }
+            },
+            &mut |_| Ok(()),
+            &control,
+            &mut |step| match step {
+                BatchStep::Started { name, .. } => started.push(name.to_owned()),
+                BatchStep::Finished { outcome, .. } => outcomes.push(
+                    match outcome {
+                        MemberOutcome::Installed => "installed",
+                        MemberOutcome::Failed(_) => "failed",
+                        MemberOutcome::Refused(_) => "refused",
+                        MemberOutcome::Cancelled => "cancelled",
+                    }
+                    .to_owned(),
+                ),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(started, vec!["okcrate".to_owned()], "nextcrate never began");
+        assert_eq!(outcomes.len(), 1, "one member reported: {outcomes:?}");
+        assert!(
+            matches!(outcomes[0].as_str(), "installed" | "cancelled"),
+            "and it either finished or was stopped, nothing else: {outcomes:?}"
+        );
+        assert!(
+            matches!(end, InstallBatchEnd::Cancelled),
+            "and the batch's own end carries it"
         );
         let _ = fs::remove_dir_all(&root);
     }

@@ -258,6 +258,19 @@ enum BuildMsg {
         target: PathBuf,
         purpose: crate::privileged::AuthPurpose,
     },
+    /// A batch worker moving to the next member: the interface's cue to
+    /// say `[2/3] bar` and to file what follows under that name.
+    MemberStarted {
+        index: usize,
+        total: usize,
+        name: String,
+    },
+    /// A batch member is done, classified by the worker where its error
+    /// was still typed.
+    MemberDone {
+        name: String,
+        outcome: crate::MemberOutcome,
+    },
     /// Finished, classified by the worker where the error is at hand: the
     /// UI must not guess "cancelled" from a phase flag a late `c` can set
     /// after cargo died of its own causes.
@@ -321,6 +334,160 @@ struct PendingMigrate {
     version: String,
     dest: PathBuf,
     snap: crate::MigrationSnapshot,
+}
+
+/// What an install batch's members can end up being. Fewer than a
+/// migration's: an install has no half-done outcome to name — a crate
+/// is installed or it is not.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum InstallSection {
+    Failed,
+    /// Built, and then the placement door could not be opened. Not a
+    /// failure to build, and the panel must not imply one.
+    Refused,
+    Noticed,
+}
+
+/// The headings those sections carry, in panel order.
+const INSTALL_SECTIONS: &[(InstallSection, &str)] = &[
+    (InstallSection::Failed, "failed:"),
+    (InstallSection::Refused, "built, but not placed:"),
+    (InstallSection::Noticed, "installed, with build warnings:"),
+];
+
+/// `i a b c`: the presentation of a batch whose execution belongs to
+/// its worker.
+///
+/// The queue is not here. One operation holds one lock across every
+/// member, so the order of execution is the worker's — and a runner
+/// pretending to hand out members would be describing something that
+/// is not happening. What is here is what the person sees: which
+/// member is running, what each had to say, and the summary.
+struct InstallBatch {
+    runner: BatchRunner<(), InstallSection>,
+    /// The member whose lines are arriving now, if one is building.
+    /// `None` before the first and between members — which is exactly
+    /// when a failure belongs to the plan rather than to anyone.
+    current: Option<String>,
+    /// Members that got as far as starting. Counted here rather than
+    /// derived from the sections, because a plan refused before the
+    /// first build has no failed member and no attempt either.
+    attempted: usize,
+    /// Warnings spoken before any member started: the duplicate check
+    /// runs over the whole plan, and its lines belong to no crate.
+    plan_warnings: Vec<String>,
+}
+
+impl InstallBatch {
+    /// A member is starting: anything said before it belongs to the
+    /// plan, not to it.
+    fn begin_member(&mut self, name: &str, said_before: Vec<String>) {
+        // Before *any* member, not merely between two: `current` is
+        // also None in the gap, and a warning spoken there would belong
+        // to whoever spoke it, not to the plan.
+        if self.attempted == 0 {
+            self.plan_warnings.extend(said_before);
+        }
+        self.current = Some(name.to_owned());
+        self.attempted += 1;
+    }
+
+    /// A member is done, with its own warnings and its own tail.
+    ///
+    /// The same rules a single build follows: warnings survive a
+    /// success and are dropped on a failure — a rollback removed the
+    /// binaries they described — and a terse failure gets the tail.
+    fn finish_member(
+        &mut self,
+        name: &str,
+        outcome: &crate::MemberOutcome,
+        warnings: Vec<String>,
+        tail: &VecDeque<String>,
+    ) {
+        match outcome {
+            crate::MemberOutcome::Installed => {
+                self.runner.succeeded();
+                if !warnings.is_empty() {
+                    self.runner.record(InstallSection::Noticed, name, warnings);
+                }
+            }
+            crate::MemberOutcome::Failed(e) => {
+                self.runner
+                    .record(InstallSection::Failed, name, App::failure_lines(e, tail));
+            }
+            crate::MemberOutcome::Refused(reason) => {
+                self.runner.record(
+                    InstallSection::Refused,
+                    name,
+                    vec![crate::text::sanitize(reason)],
+                );
+            }
+            crate::MemberOutcome::Cancelled => {}
+        }
+        self.current = None;
+    }
+}
+
+/// The interface's answer to a worker waiting at a privileged step.
+///
+/// A refusal carries its reason, because there are several and they are
+/// not interchangeable: a password that did not authenticate, a sudo
+/// that authenticated and retained nothing, a probe that failed. One
+/// bit made them all look alike and left the worker inventing a
+/// sentence for whichever it guessed.
+enum AuthAnswer {
+    Authorized,
+    Refused(String),
+}
+
+/// What `c` reached: a build with its own answer, or a batch between
+/// members — where there is nothing to interrupt and nothing to
+/// SIGKILL, only a plan that will not continue.
+enum ActiveCancel {
+    Build(crate::CancelOutcome),
+    BatchBetweenMembers,
+}
+
+/// Whatever is running now, asked the same way whoever is asking.
+///
+/// A job used to hold a `BuildControl` because a job was one build. A
+/// batch is one operation over many builds, each with its own control,
+/// so the job holds the thing that knows which — and `c`, Ctrl-C, the
+/// grace-period escalation and the auth gate all ask through here
+/// rather than each learning what kind of job this is. The dummy
+/// control this replaces was the model leaking: three of those four
+/// doors were reaching a control that had never run anything.
+enum ActiveControl {
+    Single(std::sync::Arc<crate::BuildControl>),
+    Batch(std::sync::Arc<crate::BatchControl>),
+}
+
+impl ActiveControl {
+    fn request_cancel(&self) -> ActiveCancel {
+        match self {
+            Self::Single(control) => ActiveCancel::Build(control.request_cancel()),
+            Self::Batch(control) => match control.request_cancel() {
+                crate::BatchCancel::Member(answer) => ActiveCancel::Build(answer),
+                // Kept, not flattened into `Accepted`: there is no
+                // process to interrupt and none to kill, and a message
+                // promising SIGKILL would be promising something that
+                // cannot happen.
+                crate::BatchCancel::BetweenMembers => ActiveCancel::BatchBetweenMembers,
+            },
+        }
+    }
+
+    fn cancelled(&self) -> bool {
+        match self {
+            Self::Single(control) => control.cancelled(),
+            Self::Batch(control) => control.cancelled(),
+        }
+    }
+
+    /// A batch outlives the member `c` was too late for.
+    fn is_batch(&self) -> bool {
+        matches!(self, Self::Batch(_))
+    }
 }
 
 /// A group of per-member lines in a batch's closing panel: the
@@ -449,8 +616,12 @@ impl<T, K: Copy + PartialEq + std::fmt::Debug> BatchRunner<T, K> {
             if !lines.is_empty() {
                 lines.push(String::new());
             }
+            // Neutral on purpose: the runner does not know when its
+            // backend reloads. Migration reads between members, the
+            // install batch reads once at the end under no lock at all,
+            // and "mid-batch" would be false for the second.
             lines.push(crate::text::sanitize(&format!(
-                "(and a mid-batch list reload failed: {e})"
+                "(and the list reload failed: {e})"
             )));
         }
         lines
@@ -602,7 +773,15 @@ impl App {
         match &self.job {
             Some(Job::Build { name, control, .. }) => {
                 let name = name.clone();
-                match control.request_cancel() {
+                let answer = control.request_cancel();
+                let batch = control.is_batch();
+                let ActiveCancel::Build(outcome) = answer else {
+                    // Nothing is building: the plan stops, and that is
+                    // the whole of what can be promised.
+                    self.info("stopping: no further crate will be started");
+                    return;
+                };
+                match outcome {
                     crate::CancelOutcome::Accepted => {
                         self.arm_cancel_grace();
                         self.info(&format!("cancelling {name}… (c again sends SIGKILL)"));
@@ -612,6 +791,15 @@ impl App {
                     }
                     crate::CancelOutcome::AlreadyStopping => {
                         self.info("the build is already stopping");
+                    }
+                    // True of the member, and only of the member: the
+                    // batch behind it has already been told to stop and
+                    // will start nobody else.
+                    crate::CancelOutcome::TooLate if batch => {
+                        self.info(
+                            "placement already started for this crate; \
+                             the batch stops after it",
+                        );
                     }
                     crate::CancelOutcome::TooLate => {
                         self.info("placement already started; too late to cancel");
@@ -683,7 +871,7 @@ enum Job {
         name: String,
         rx: Receiver<BuildMsg>,
         /// The run loop's answer to `BuildMsg::NeedAuth`.
-        auth_tx: Sender<bool>,
+        auth_tx: Sender<AuthAnswer>,
         /// Units started, not finished: cargo announces a unit when it
         /// begins.
         units_started: usize,
@@ -703,8 +891,9 @@ enum Job {
         /// Set by `poll_job` on a revalidation request — carrying the prefix
         /// the escalation is for; answered by the run loop.
         needs_auth: Option<(PathBuf, crate::privileged::AuthPurpose)>,
-        /// The cancel state machine shared with the worker.
-        control: std::sync::Arc<crate::BuildControl>,
+        /// Whatever is running: one build's cancel state machine, or a
+        /// batch's, which knows which member holds it now.
+        control: ActiveControl,
         /// What is being built toward.
         kind: BuildKind,
         /// When an accepted cancel's grace runs out; one-shot. The run loop
@@ -771,7 +960,7 @@ const SEARCH_HITS: usize = 6;
 fn auth_gate(
     control: &crate::BuildControl,
     tx: &Sender<BuildMsg>,
-    auth_rx: &Receiver<bool>,
+    auth_rx: &Receiver<AuthAnswer>,
     escalating: &Path,
     purpose: crate::privileged::AuthPurpose,
 ) -> Result<()> {
@@ -786,9 +975,20 @@ fn auth_gate(
                 purpose,
             });
             match auth_rx.recv() {
-                Ok(true) => Ok(()),
-                Ok(false) if control.cancelled() => Err(anyhow::Error::new(crate::BuildCancelled)),
-                Ok(false) => anyhow::bail!("sudo authentication failed"),
+                Ok(AuthAnswer::Authorized) => Ok(()),
+                Ok(AuthAnswer::Refused(_)) if control.cancelled() => {
+                    Err(anyhow::Error::new(crate::BuildCancelled))
+                }
+                // Typed, and carrying both what was being authorized and
+                // why it was not: a batch tells a refused placement from
+                // a failed build, and a migration's retirement must not
+                // be told it failed to place anything.
+                Ok(AuthAnswer::Refused(reason)) => {
+                    Err(anyhow::Error::new(crate::AuthorizationRefused {
+                        purpose,
+                        reason,
+                    }))
+                }
                 Err(_) => anyhow::bail!("the interface went away mid-authorization"),
             }
         }
@@ -871,6 +1071,10 @@ pub struct App {
     pending_migrate: Option<PendingMigrate>,
     /// A running `M` batch; `finish_build` feeds it, `c` ends it.
     migrate_batch: Option<MigrateBatch>,
+    install_batch: Option<InstallBatch>,
+    /// Asked for, not yet started: starting needs the terminal, which
+    /// only the run loop has.
+    pending_install_batch: Option<(Vec<String>, bool)>,
     pub search_result: Option<SearchResult>,
     pub downgrade_choice: Option<DowngradeChoice>,
     /// A build's sticky report pinned to the details panel until dismissed.
@@ -961,6 +1165,8 @@ impl App {
             confirm: None,
             pending_migrate: None,
             migrate_batch: None,
+            install_batch: None,
+            pending_install_batch: None,
             search_result: None,
             downgrade_choice: None,
             build_report: None,
@@ -1071,6 +1277,8 @@ impl App {
     fn anything_running(&self) -> bool {
         self.job.is_some()
             || self.migrate_batch.is_some()
+            || self.install_batch.is_some()
+            || self.pending_install_batch.is_some()
             || self.pending_migrate.is_some()
             || self.pending_build.is_some()
             || self.pending.is_some()
@@ -1200,6 +1408,10 @@ impl App {
 
             if let Some(action) = self.pending.take() {
                 self.run_in_terminal(terminal, &action)?;
+                continue;
+            }
+            if let Some((crates, locked)) = self.pending_install_batch.take() {
+                self.start_install_batch(terminal, crates, locked)?;
                 continue;
             }
             if let Some(req) = self.pending_build.take() {
@@ -1540,7 +1752,7 @@ impl App {
             warnings: Vec::new(),
             started: std::time::Instant::now(),
             needs_auth: None,
-            control,
+            control: ActiveControl::Single(control),
             // The intent decides the word the record uses, as it
             // decided the door the worker took.
             kind: match req.intent {
@@ -1679,7 +1891,7 @@ impl App {
             warnings: Vec::new(),
             started: std::time::Instant::now(),
             needs_auth: None,
-            control,
+            control: ActiveControl::Single(control),
             kind: BuildKind::Migrate(Box::new(MigrateTarget { version, dest })),
             cancel_deadline: None,
         });
@@ -1724,7 +1936,10 @@ impl App {
         } else {
             None
         };
-        if matches!(outcome, Some(crate::CancelOutcome::Killed)) {
+        if matches!(
+            outcome,
+            Some(ActiveCancel::Build(crate::CancelOutcome::Killed))
+        ) {
             self.warn("the build ignored the cancel; SIGKILL sent");
         }
     }
@@ -1742,7 +1957,7 @@ impl App {
             && control.cancelled()
         {
             *needs_auth = None;
-            let _ = auth_tx.send(false);
+            let _ = auth_tx.send(AuthAnswer::Refused("cancelled".to_owned()));
             return Ok(());
         }
         // The prefix comes from the request, never the app: a migration
@@ -1761,31 +1976,35 @@ impl App {
         let outcome = Self::suspended(terminal, || {
             crate::privileged::preauthorize(&target, true, purpose)
         })?;
-        let ok = match outcome {
+        // Three different facts, and the worker is told which: it has a
+        // sentence to write about this, and a guess would be its own.
+        let answer = match outcome {
             Ok(()) => match crate::privileged::credentials_fresh() {
-                Ok(true) => true,
+                Ok(true) => AuthAnswer::Authorized,
                 // Validated and instantly stale: this sudo does not cache, and the
                 // noninteractive placement ahead cannot ask — fail loudly now.
                 Ok(false) => {
-                    self.warn(
-                        "sudo did not retain credentials; noninteractive placement cannot proceed",
-                    );
-                    false
+                    let reason =
+                        "sudo did not retain credentials; noninteractive placement cannot proceed";
+                    self.warn(reason);
+                    AuthAnswer::Refused(reason.to_owned())
                 }
                 Err(e) => {
-                    self.warn(&format!("{e:#}"));
-                    false
+                    let reason = format!("{e:#}");
+                    self.warn(&reason);
+                    AuthAnswer::Refused(reason)
                 }
             },
             Err(e) => {
-                self.warn(&format!("{e:#}"));
-                false
+                let reason = format!("{e:#}");
+                self.warn(&reason);
+                AuthAnswer::Refused(reason)
             }
         };
         if let Some(Job::Build { auth_tx, .. }) = &mut self.job {
             // `needs_auth` was taken with the target above; only the answer
             // remains.
-            let _ = auth_tx.send(ok);
+            let _ = auth_tx.send(answer);
         }
         Ok(())
     }
@@ -1988,6 +2207,156 @@ impl App {
         }
     }
 
+    /// The install batch is over: one summary, one reload.
+    ///
+    /// The reload waits for this moment because the worker held the
+    /// exclusive lock until it returned — reading between members would
+    /// have meant asking for a lock the operation itself was holding.
+    /// One read at the end is also the only one that describes
+    /// something settled.
+    fn finish_install_batch(
+        &mut self,
+        outcome: &BuildOutcome,
+        tail: &VecDeque<String>,
+        warnings: Vec<String>,
+    ) {
+        let Some(batch) = self.install_batch.take() else {
+            return;
+        };
+        let InstallBatch {
+            mut runner,
+            current,
+            attempted,
+            plan_warnings,
+            ..
+        } = batch;
+        // A failure with no member in flight is the operation's, not
+        // anyone's: the lock, the manifest, the whole-plan pin refusal.
+        // Filing it under a crate would claim an attempt that never
+        // happened.
+        let plan_failed = matches!(
+            (outcome, &current),
+            (
+                BuildOutcome::Failed(_) | BuildOutcome::CompletedWithWarning(_),
+                None
+            )
+        );
+        let plan_failure = match (outcome, &current) {
+            (BuildOutcome::Failed(e), None) => Some(Self::failure_lines(e, tail)),
+            (BuildOutcome::CompletedWithWarning(reason), None) => {
+                Some(vec![crate::text::sanitize(reason)])
+            }
+            _ => None,
+        };
+        // Nobody was building, so whatever is still in hand was said
+        // about the plan — a cancel can land after the duplicate check
+        // and before the first member, and those lines are not nobody's.
+        let plan_warnings = if current.is_none() {
+            let mut all = plan_warnings;
+            all.extend(warnings.iter().cloned());
+            all
+        } else {
+            plan_warnings
+        };
+        // A member still in flight when the worker returned: its own
+        // lines, under its own name.
+        if let Some(name) = &current {
+            match outcome {
+                BuildOutcome::Failed(e) => {
+                    runner.record(InstallSection::Failed, name, Self::failure_lines(e, tail));
+                }
+                BuildOutcome::CompletedWithWarning(reason) => {
+                    runner.record(
+                        InstallSection::Failed,
+                        name,
+                        vec![crate::text::sanitize(reason)],
+                    );
+                }
+                BuildOutcome::Success | BuildOutcome::Migrated(_) | BuildOutcome::Cancelled => {
+                    if !warnings.is_empty() {
+                        runner.record(InstallSection::Noticed, name, warnings);
+                    }
+                }
+            }
+        }
+        if let Err(e) = self.reload() {
+            runner.reload_error = Some(format!("{e:#}"));
+        }
+        let installed = runner.succeeded;
+        let total = runner.total;
+        let refused = runner.recorded(InstallSection::Refused);
+        let failed = runner.recorded(InstallSection::Failed);
+        let cancelled = matches!(outcome, BuildOutcome::Cancelled);
+        let stopped = if cancelled {
+            Some("cancelled".to_owned())
+        } else if plan_failure.is_some() {
+            // Not "refused": a pin check refuses, a manifest that will
+            // not load simply fails, and the summary cannot tell which
+            // from here. What is true of both is where it happened.
+            Some("stopped before the first member".to_owned())
+        } else if refused > 0 {
+            Some("stopped: a member was built but could not be placed".to_owned())
+        } else if failed > 0 {
+            Some("stopped at a failure".to_owned())
+        } else {
+            None
+        };
+        // Attempts are counted as they start; what was never attempted
+        // is the rest of the plan. A plan refused before the first
+        // build attempted nobody.
+        let left = total.saturating_sub(attempted);
+        let mut summary = format!("installed {installed} of {total}");
+        if let Some(how) = &stopped {
+            let _ = std::fmt::Write::write_fmt(
+                &mut summary,
+                format_args!(" ({how}; {left} not attempted)"),
+            );
+        }
+        let lines = Self::batch_panel(&runner, plan_failure, plan_warnings);
+        if lines.is_empty() {
+            if stopped.is_some() {
+                self.warn(&summary);
+            } else {
+                self.info(&summary);
+            }
+            return;
+        }
+        self.pin_report(BuildReport {
+            title: format!("install: {installed} of {total} installed"),
+            lines,
+            // A plan that could not run is a failure of the operation,
+            // and the panel is red for it: only a refusal at the
+            // placement door leaves the report un-failed.
+            failed: failed > 0 || plan_failed,
+        });
+        self.warn(&format!(
+            "{summary} — details in the panel; Esc/Enter dismisses"
+        ));
+    }
+
+    /// The members' sections, then anything that belongs to the plan
+    /// rather than to any of them — under a heading that says so.
+    fn batch_panel(
+        runner: &BatchRunner<(), InstallSection>,
+        plan_failure: Option<Vec<String>>,
+        plan_warnings: Vec<String>,
+    ) -> Vec<String> {
+        let mut lines = runner.report_lines();
+        for block in [plan_failure, Some(plan_warnings).filter(|w| !w.is_empty())]
+            .into_iter()
+            .flatten()
+        {
+            if !lines.is_empty() {
+                lines.push(String::new());
+            }
+            lines.push("the plan:".to_owned());
+            for line in block {
+                lines.push(crate::text::sanitize(&format!("  {line}")));
+            }
+        }
+        lines
+    }
+
     /// The batch's one summary: counts in the footer, shortfalls in a
     /// panel — the already-installed refusal counted as on the CLI.
     fn finalize_migrate_batch(&mut self, ended_early: Option<&str>) {
@@ -2088,6 +2457,10 @@ impl App {
             && let BuildKind::Migrate(target) = kind
         {
             self.finish_batch_step(name, target, outcome, tail, warnings);
+            return;
+        }
+        if self.install_batch.is_some() {
+            self.finish_install_batch(&outcome, tail, warnings);
             return;
         }
         // A cancelled build ended exactly as asked: no panel, no log (the
@@ -2217,19 +2590,25 @@ impl App {
             // be cancelled, so there the exit waits it out.
             if let Some(Job::Build { control, .. }) = &self.job {
                 match control.request_cancel() {
-                    crate::CancelOutcome::Accepted => {
+                    // Between members: the plan stops, and quitting
+                    // waits for the member-less worker to return. There
+                    // is nothing here to kill.
+                    ActiveCancel::BatchBetweenMembers => {
+                        self.info("stopping: quitting when the batch finishes");
+                    }
+                    ActiveCancel::Build(crate::CancelOutcome::Accepted) => {
                         self.arm_cancel_grace();
                         self.info(
                             "cancelling; quitting when the build stops (Ctrl-C again: SIGKILL)",
                         );
                     }
-                    crate::CancelOutcome::Killed => {
+                    ActiveCancel::Build(crate::CancelOutcome::Killed) => {
                         self.warn("SIGKILL sent; quitting when the build stops");
                     }
-                    crate::CancelOutcome::AlreadyStopping => {
+                    ActiveCancel::Build(crate::CancelOutcome::AlreadyStopping) => {
                         self.info("the build is already stopping; quitting when it does");
                     }
-                    crate::CancelOutcome::TooLate => {
+                    ActiveCancel::Build(crate::CancelOutcome::TooLate) => {
                         self.info("placement in progress; quitting when it finishes");
                     }
                 }
@@ -2815,8 +3194,12 @@ impl App {
     fn submit_input(&mut self, purpose: InputPurpose, buffer: &str) {
         match purpose {
             InputPurpose::Install => match parse_install_input(buffer) {
-                // One crate builds in place; a batch is a longer conversation and
-                // keeps the handoff.
+                // More than one crate is one operation over a plan, and
+                // it runs here: the worker takes the lock, checks the
+                // whole plan and builds in order, all in the panel.
+                Ok((crates, locked)) if crates.len() > 1 => {
+                    self.pending_install_batch = Some((crates, locked));
+                }
                 Ok((crates, locked)) if crates.len() == 1 => {
                     let spec = crates.into_iter().next().expect("len checked");
                     self.info(&format!("building {spec}…"));
@@ -3019,6 +3402,163 @@ impl App {
             spec: name,
             locked: false,
             intent: BuildIntent::Reinstall,
+        });
+    }
+
+    /// `i` with more than one crate: one operation, one worker.
+    ///
+    /// The preflight here is the one that cannot wait: preparing a
+    /// prefix's lock file for the first time, which happens before any
+    /// build and cannot ask for a password from inside a worker. A sudo
+    /// that caches nothing at *that* point hands the whole plan over,
+    /// because nothing has been built yet and the operation can start
+    /// again elsewhere intact.
+    ///
+    /// Placement is not preauthorized here. Each member asks at its own
+    /// door, and a refusal there stops the batch with what came before
+    /// it committed — see `tui_install_batch`. After this, the worker
+    /// owns the lock, the manifest and the order; the interface owns
+    /// the screen and the cancel.
+    fn start_install_batch(
+        &mut self,
+        terminal: &mut DefaultTerminal,
+        crates: Vec<String>,
+        locked: bool,
+    ) -> Result<()> {
+        let specs = match InstallSpec::parse_all(&crates) {
+            Ok(specs) => specs,
+            Err(e) => {
+                self.error(&format!("{e:#}"));
+                return Ok(());
+            }
+        };
+        match Self::preflight_escalation(terminal, &self.prefix.clone())? {
+            Preflight::Ready => {}
+            Preflight::NoCache => {
+                self.info("sudo does not cache credentials here; handing the terminal over");
+                self.pending = Some(PendingAction::Install { crates, locked });
+                return Ok(());
+            }
+            Preflight::Reported(message) => {
+                self.error(&message);
+                return Ok(());
+            }
+        }
+        self.build_report = None;
+        let total = specs.len();
+        let control = std::sync::Arc::new(crate::BatchControl::new());
+        let mut runner: BatchRunner<(), InstallSection> =
+            BatchRunner::new(std::collections::VecDeque::new(), INSTALL_SECTIONS);
+        runner.total = total;
+        self.install_batch = Some(InstallBatch {
+            runner,
+            current: None,
+            attempted: 0,
+            plan_warnings: Vec::new(),
+        });
+        let (tx, rx) = mpsc::channel();
+        let (auth_tx, auth_rx) = mpsc::channel();
+        Self::spawn_install_batch(
+            self.prefix.clone(),
+            specs,
+            locked,
+            total,
+            std::sync::Arc::clone(&control),
+            tx,
+            auth_rx,
+        );
+        self.job = Some(Job::Build {
+            name: format!("{total} crates"),
+            rx,
+            auth_tx,
+            units_started: 0,
+            current: None,
+            tail: VecDeque::new(),
+            status_note: None,
+            warnings: Vec::new(),
+            started: std::time::Instant::now(),
+            needs_auth: None,
+            control: ActiveControl::Batch(std::sync::Arc::clone(&control)),
+            kind: BuildKind::Install,
+            cancel_deadline: None,
+        });
+        Ok(())
+    }
+
+    /// The batch's worker thread: it owns the lock, the manifest and the
+    /// order, and speaks only through the channel.
+    fn spawn_install_batch(
+        prefix: PathBuf,
+        specs: Vec<InstallSpec>,
+        locked: bool,
+        total: usize,
+        control: std::sync::Arc<crate::BatchControl>,
+        tx: Sender<BuildMsg>,
+        auth_rx: Receiver<AuthAnswer>,
+    ) {
+        let line_tx = tx.clone();
+        let worker_tx = tx.clone();
+        let step_tx = tx.clone();
+        thread::spawn(move || {
+            let mut on_line = |k: crate::LineKind, l: &str| {
+                let _ = line_tx.send(build_msg(k, l));
+            };
+            let mut before_placement = |escalating: &Path| {
+                // The same gate a single build uses, against the
+                // control of the member actually at the door: a cancel
+                // must be seen here, and a refusal must come back as a
+                // refusal rather than as a build failure.
+                control
+                    .with_current(|member| {
+                        auth_gate(
+                            member,
+                            &worker_tx,
+                            &auth_rx,
+                            escalating,
+                            crate::privileged::AuthPurpose::Placement,
+                        )
+                    })
+                    .unwrap_or_else(|| {
+                        Err(anyhow::anyhow!(
+                            "no member is building; the batch is already stopping"
+                        ))
+                    })
+            };
+            let mut step = |step: crate::BatchStep| match step {
+                crate::BatchStep::Started { index, name } => {
+                    let _ = step_tx.send(BuildMsg::MemberStarted {
+                        index,
+                        total,
+                        name: name.to_owned(),
+                    });
+                }
+                crate::BatchStep::Finished { name, outcome } => {
+                    let _ = step_tx.send(BuildMsg::MemberDone {
+                        name: name.to_owned(),
+                        outcome,
+                    });
+                }
+            };
+            let result = crate::tui_install_batch(
+                &prefix,
+                &specs,
+                locked,
+                &mut on_line,
+                &mut before_placement,
+                &control,
+                &mut step,
+            );
+            let outcome = match result {
+                Ok(crate::InstallBatchEnd::Completed) => BuildOutcome::Success,
+                // The batch's own end, not a member's: a member's fate
+                // arrived with its MemberDone.
+                Ok(crate::InstallBatchEnd::Cancelled) => BuildOutcome::Cancelled,
+                Err(e) if e.downcast_ref::<crate::BuildCancelled>().is_some() => {
+                    BuildOutcome::Cancelled
+                }
+                Err(e) => BuildOutcome::Failed(e),
+            };
+            let _ = tx.send(BuildMsg::Done(outcome));
         });
     }
 
@@ -3304,6 +3844,28 @@ impl App {
                         }
                         Ok(BuildMsg::NeedAuth { target, purpose }) => {
                             needs_auth = Some((target, purpose));
+                        }
+                        // A batch's framing: whose lines are these, and
+                        // what became of the member that just ended.
+                        // Only a batch sends them; a single build has
+                        // no members to frame.
+                        Ok(BuildMsg::MemberStarted { index, total, name }) => {
+                            // A new member's scope: its own warnings and
+                            // its own tail. What was said before the
+                            // first member belongs to the plan and is
+                            // already filed there.
+                            if let Some(batch) = self.install_batch.as_mut() {
+                                batch.begin_member(&name, std::mem::take(&mut warnings));
+                            }
+                            tail.clear();
+                            status_note = Some(format!("[{}/{total}] {name}", index + 1));
+                        }
+                        Ok(BuildMsg::MemberDone { name, outcome }) => {
+                            let spoken = std::mem::take(&mut warnings);
+                            let member_tail = std::mem::take(&mut tail);
+                            if let Some(batch) = self.install_batch.as_mut() {
+                                batch.finish_member(&name, &outcome, spoken, &member_tail);
+                            }
                         }
                         Ok(BuildMsg::Done(outcome)) => {
                             done = Some(outcome);
@@ -3767,7 +4329,7 @@ mod tests {
             warnings: Vec::new(),
             started: std::time::Instant::now(),
             needs_auth: None,
-            control: std::sync::Arc::clone(&control),
+            control: ActiveControl::Single(std::sync::Arc::clone(&control)),
             kind: BuildKind::Install,
             cancel_deadline: Some(std::time::Instant::now() + Duration::from_secs(60)),
         });
@@ -4299,6 +4861,251 @@ mod tests {
         assert!(reading.is_err(), "asking about one panics too");
     }
 
+    /// The interface asks for a batch and starts nothing itself: the
+    /// request waits for the run loop, which owns the terminal the
+    /// whole-plan preflight may need.
+    #[test]
+    fn a_multi_crate_install_line_asks_for_one_operation() {
+        let root = std::env::temp_dir().join("cargo-lbin-test-tui-batch-request");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let mut app = App::new(&root).unwrap();
+
+        app.submit_input(InputPurpose::Install, "foo bar baz --locked");
+        let (crates, locked) = app
+            .pending_install_batch
+            .take()
+            .expect("the batch is requested");
+        assert_eq!(crates, vec!["foo", "bar", "baz"], "in the order typed");
+        assert!(locked, "and the line's flag belongs to the whole plan");
+        assert!(
+            app.pending_build.is_none() && app.pending.is_none(),
+            "no single build, no handoff"
+        );
+
+        // One crate is still one build, not a batch of one.
+        app.submit_input(InputPurpose::Install, "solo");
+        assert!(app.pending_install_batch.is_none());
+        assert_eq!(
+            app.pending_build.take().map(|r| r.spec).as_deref(),
+            Some("solo")
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The batch's tallies and its one summary. The runner counts what
+    /// the worker reported; what was never attempted is the plan minus
+    /// what was settled, because the queue lives in the worker.
+    #[test]
+    fn an_install_batch_sums_up_once_and_says_what_was_left() {
+        let root = std::env::temp_dir().join("cargo-lbin-test-tui-batch-summary");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("bin")).unwrap();
+        std::fs::create_dir_all(root.join("share/cargo-lbin")).unwrap();
+        Manifest::default().store(&root).unwrap();
+        let mut app = App::new(&root).unwrap();
+        let mut runner: BatchRunner<(), InstallSection> =
+            BatchRunner::new(std::collections::VecDeque::new(), INSTALL_SECTIONS);
+        runner.total = 3;
+        runner.succeeded();
+        runner.record(
+            InstallSection::Noticed,
+            "foo",
+            vec!["warning: shadowed".to_owned()],
+        );
+        app.install_batch = Some(InstallBatch {
+            runner,
+            current: Some("bar".to_owned()),
+            attempted: 2,
+            plan_warnings: Vec::new(),
+        });
+
+        app.finish_install_batch(
+            &BuildOutcome::Failed(anyhow::anyhow!("boom")),
+            &VecDeque::new(),
+            Vec::new(),
+        );
+
+        assert!(app.install_batch.is_none(), "the batch is over");
+        let said = &app.message.as_ref().expect("a summary").text;
+        assert!(
+            said.contains("installed 1 of 3")
+                && said.contains("stopped at a failure")
+                && said.contains("1 not attempted"),
+            "{said}"
+        );
+        let report = app.build_report.as_ref().expect("shortfalls are shown");
+        assert!(report.failed, "a failed member marks the report");
+        assert!(
+            report.lines.iter().any(|l| l.contains("boom"))
+                && report.lines.iter().any(|l| l.contains("shadowed")),
+            "both sections survive: {:?}",
+            report.lines
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Three scopes, kept apart. A warning spoken before any member
+    /// started belongs to the plan and must not be pinned on the first
+    /// crate; a member that built and could not be placed is not a
+    /// member that failed to build; and what nobody attempted is
+    /// counted from the attempts, not from the failures.
+    #[test]
+    fn a_batch_reports_the_plan_the_member_and_the_refusal_apart() {
+        let root = std::env::temp_dir().join("cargo-lbin-test-tui-batch-scopes");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("bin")).unwrap();
+        std::fs::create_dir_all(root.join("share/cargo-lbin")).unwrap();
+        Manifest::default().store(&root).unwrap();
+        let mut app = App::new(&root).unwrap();
+        let mut runner: BatchRunner<(), InstallSection> =
+            BatchRunner::new(std::collections::VecDeque::new(), INSTALL_SECTIONS);
+        runner.total = 3;
+        let mut batch = InstallBatch {
+            runner,
+            current: None,
+            attempted: 0,
+            plan_warnings: Vec::new(),
+        };
+
+        // Said before anyone started: the duplicate check speaks about
+        // the plan.
+        batch.begin_member("foo", vec!["warning: also in /usr/local".to_owned()]);
+        batch.finish_member(
+            "foo",
+            &crate::MemberOutcome::Installed,
+            Vec::new(),
+            &VecDeque::new(),
+        );
+        batch.begin_member("bar", Vec::new());
+        batch.finish_member(
+            "bar",
+            &crate::MemberOutcome::Refused("no usable credentials".to_owned()),
+            Vec::new(),
+            &VecDeque::new(),
+        );
+        assert_eq!(batch.attempted, 2, "counted as they started");
+        app.install_batch = Some(batch);
+
+        app.finish_install_batch(&BuildOutcome::Success, &VecDeque::new(), Vec::new());
+
+        let said = &app.message.as_ref().expect("a summary").text;
+        assert!(
+            said.contains("installed 1 of 3")
+                && said.contains("could not be placed")
+                && said.contains("1 not attempted"),
+            "{said}"
+        );
+        let report = app.build_report.as_ref().expect("a panel");
+        assert!(
+            !report.failed,
+            "nothing failed to build; the panel must not say so"
+        );
+        let text = report.lines.join("\n");
+        assert!(
+            text.contains("built, but not placed:") && text.contains("bar"),
+            "the refusal has its own section: {text}"
+        );
+        assert!(
+            text.contains("the plan:") && text.contains("also in /usr/local"),
+            "and the plan's warning is the plan's: {text}"
+        );
+        let foo_line = report
+            .lines
+            .iter()
+            .position(|l| l.contains("foo"))
+            .map(|i| report.lines[i].clone());
+        assert!(
+            foo_line.is_none(),
+            "the first crate is not blamed for it: {foo_line:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A cancelled batch says so. The worker's own end carries it —
+    /// a member cancelled, or the plan stopped with members left — and
+    /// the summary counts what was never attempted.
+    #[test]
+    fn a_cancelled_batch_is_not_a_quiet_success() {
+        let root = std::env::temp_dir().join("cargo-lbin-test-tui-batch-cancelled");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("bin")).unwrap();
+        std::fs::create_dir_all(root.join("share/cargo-lbin")).unwrap();
+        Manifest::default().store(&root).unwrap();
+        let mut app = App::new(&root).unwrap();
+        let mut runner: BatchRunner<(), InstallSection> =
+            BatchRunner::new(std::collections::VecDeque::new(), INSTALL_SECTIONS);
+        runner.total = 3;
+        runner.succeeded();
+        app.install_batch = Some(InstallBatch {
+            runner,
+            current: None,
+            attempted: 1,
+            plan_warnings: Vec::new(),
+        });
+
+        app.finish_install_batch(&BuildOutcome::Cancelled, &VecDeque::new(), Vec::new());
+
+        let said = &app.message.as_ref().expect("a summary").text;
+        assert!(
+            said.contains("installed 1 of 3")
+                && said.contains("cancelled")
+                && said.contains("2 not attempted"),
+            "{said}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A plan that could not run stopped before anyone: the summary
+    /// says where, the panel is red, and no crate is blamed.
+    #[test]
+    fn a_plan_that_could_not_run_blames_no_crate() {
+        let root = std::env::temp_dir().join("cargo-lbin-test-tui-batch-plan-failure");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("bin")).unwrap();
+        std::fs::create_dir_all(root.join("share/cargo-lbin")).unwrap();
+        Manifest::default().store(&root).unwrap();
+        let mut app = App::new(&root).unwrap();
+        let mut runner: BatchRunner<(), InstallSection> =
+            BatchRunner::new(std::collections::VecDeque::new(), INSTALL_SECTIONS);
+        runner.total = 2;
+        app.install_batch = Some(InstallBatch {
+            runner,
+            current: None,
+            attempted: 0,
+            plan_warnings: Vec::new(),
+        });
+
+        app.finish_install_batch(
+            &BuildOutcome::Failed(anyhow::anyhow!("bar is pinned")),
+            &VecDeque::new(),
+            // Said by the duplicate check, before any member started and
+            // with nobody left to take them.
+            vec!["warning: also in /usr/local".to_owned()],
+        );
+
+        let said = &app.message.as_ref().expect("a summary").text;
+        assert!(
+            said.contains("installed 0 of 2")
+                && said.contains("stopped before the first member")
+                && said.contains("2 not attempted"),
+            "{said}"
+        );
+        let report = app.build_report.as_ref().expect("a panel");
+        assert!(
+            report.failed,
+            "an operation that could not run is a failure"
+        );
+        let text = report.lines.join("\n");
+        assert!(
+            text.contains("the plan:")
+                && text.contains("bar is pinned")
+                && text.contains("also in /usr/local"),
+            "both belong to the plan: {text}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// The record says what the person did. A downgrade's panel, its
     /// messages and its failure title all speak the operation's own
     /// word — calling it an install would describe something nobody
@@ -4325,7 +5132,7 @@ mod tests {
             warnings: Vec::new(),
             started: std::time::Instant::now(),
             needs_auth: None,
-            control: std::sync::Arc::new(crate::BuildControl::new()),
+            control: ActiveControl::Single(std::sync::Arc::new(crate::BuildControl::new())),
             kind: BuildKind::Downgrade,
             cancel_deadline: None,
         });
@@ -4401,7 +5208,7 @@ mod tests {
             warnings: Vec::new(),
             started: std::time::Instant::now(),
             needs_auth: None,
-            control: std::sync::Arc::new(crate::BuildControl::new()),
+            control: ActiveControl::Single(std::sync::Arc::new(crate::BuildControl::new())),
             kind: BuildKind::Install,
             cancel_deadline: None,
         });
@@ -4504,7 +5311,7 @@ mod tests {
             warnings: Vec::new(),
             started: std::time::Instant::now(),
             needs_auth: None,
-            control: std::sync::Arc::new(crate::BuildControl::new()),
+            control: ActiveControl::Single(std::sync::Arc::new(crate::BuildControl::new())),
             kind: BuildKind::Install,
             cancel_deadline: None,
         });
@@ -4657,7 +5464,7 @@ mod tests {
             warnings: Vec::new(),
             started: std::time::Instant::now(),
             needs_auth: None,
-            control: std::sync::Arc::new(crate::BuildControl::new()),
+            control: ActiveControl::Single(std::sync::Arc::new(crate::BuildControl::new())),
             kind: BuildKind::Install,
             cancel_deadline: None,
         });
@@ -5071,7 +5878,7 @@ mod tests {
             warnings: Vec::new(),
             started: std::time::Instant::now(),
             needs_auth: None,
-            control: std::sync::Arc::new(crate::BuildControl::new()),
+            control: ActiveControl::Single(std::sync::Arc::new(crate::BuildControl::new())),
             kind: BuildKind::Install,
             cancel_deadline: None,
         });
@@ -5135,7 +5942,7 @@ mod tests {
             warnings: Vec::new(),
             started: std::time::Instant::now(),
             needs_auth: None,
-            control: std::sync::Arc::new(crate::BuildControl::new()),
+            control: ActiveControl::Single(std::sync::Arc::new(crate::BuildControl::new())),
             kind: BuildKind::Install,
             cancel_deadline: None,
         });
@@ -5176,7 +5983,7 @@ mod tests {
             warnings: Vec::new(),
             started: std::time::Instant::now(),
             needs_auth: None,
-            control: std::sync::Arc::new(crate::BuildControl::new()),
+            control: ActiveControl::Single(std::sync::Arc::new(crate::BuildControl::new())),
             kind: BuildKind::Install,
             cancel_deadline: None,
         });
@@ -5234,7 +6041,10 @@ mod tests {
         ] {
             let line = match build_msg(kind, hostile) {
                 BuildMsg::Cargo(l) | BuildMsg::Notice(l) | BuildMsg::Warning(l) => l,
-                BuildMsg::NeedAuth { .. } | BuildMsg::Done(_) => {
+                BuildMsg::NeedAuth { .. }
+                | BuildMsg::Done(_)
+                | BuildMsg::MemberStarted { .. }
+                | BuildMsg::MemberDone { .. } => {
                     panic!("a line kind maps to a line message")
                 }
             };
