@@ -650,7 +650,13 @@ impl<T, K: Copy + PartialEq + std::fmt::Debug> BatchRunner<T, K> {
         // the first and leave the second permanently empty — quiet, and
         // exactly the kind of quiet the panic in `record` exists to
         // prevent.
-        debug_assert!(
+        // `assert!`, not `debug_assert!`: a duplicate key breaks the
+        // invariant in a release build exactly as it does in a debug
+        // one — everything files into the first section and the second
+        // stays empty — and the panic in `record` is not conditional
+        // either. A section table is a constant; if it is wrong, it is
+        // wrong everywhere.
+        assert!(
             sections
                 .iter()
                 .enumerate()
@@ -960,7 +966,7 @@ impl App {
                 Self::request_oneshot_cancel(cancel);
                 self.info(&note);
             }
-            Some(Job::UpdateSweepPlan { cancel, .. }) => {
+            Some(Job::UpdateSweepCheck { cancel, .. }) => {
                 Self::request_oneshot_cancel(cancel);
                 self.info("update check: cancel requested…");
             }
@@ -999,10 +1005,11 @@ enum Job {
         cancel: CancelFlag,
     },
     /// `U`'s check: the registry asked about every entry here, pinned
-    /// included — it is an update check and leaves one behind. The
-    /// longest thing this tool does without building, and cancellable
-    /// down to the individual request.
-    UpdateSweepPlan {
+    /// included — it is an update check and leaves one behind, which is
+    /// why it is named for what it does rather than for the plan it
+    /// happens to enable. The longest thing this tool does without
+    /// building, and cancellable down to the individual request.
+    UpdateSweepCheck {
         rx: Receiver<Result<Option<Vec<Checked>>>>,
         cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
     },
@@ -1098,7 +1105,7 @@ impl Job {
                     format!("searching crates.io for `{query}`…")
                 }
             }
-            Job::UpdateSweepPlan { cancel, .. } => {
+            Job::UpdateSweepCheck { cancel, .. } => {
                 if cancel.load(std::sync::atomic::Ordering::Relaxed) {
                     "update check: cancel requested…".to_owned()
                 } else {
@@ -1478,7 +1485,7 @@ impl App {
                     | Job::Downgrade { .. }
                     | Job::UpdatePlan { .. }
                     | Job::ReinstallPlan { .. }
-                    | Job::UpdateSweepPlan { .. }
+                    | Job::UpdateSweepCheck { .. }
             )
         )
     }
@@ -2687,8 +2694,24 @@ impl App {
     /// already cleared any older report, so anything pinned here is
     /// this build's own.
     fn show_live_warnings(&mut self, name: &str, kind: &BuildKind, warnings: &[String]) {
+        // In a batch the job's name is the whole operation ("3 crates"),
+        // and these lines belong to one member of it. The member
+        // building as the warning arrives is whose it is, named and
+        // numbered as the gauge names it — and the title keeps saying
+        // so after the batch has moved on, which is the point: a
+        // warning outlives the member that spoke it, and the gauge by
+        // then is describing somebody else.
+        let subject =
+            self.install_batch
+                .as_ref()
+                .and_then(|batch| {
+                    batch.current.as_ref().map(|member| {
+                        format!("[{}/{}] {member}", batch.attempted, batch.runner.total)
+                    })
+                })
+                .unwrap_or_else(|| name.to_owned());
         let report = BuildReport {
-            title: format!("{} {name}: warnings", kind.verb()),
+            title: format!("{} {subject}: warnings", kind.verb()),
             lines: warnings.to_vec(),
             failed: false,
         };
@@ -3991,18 +4014,18 @@ impl App {
         let prefix = self.prefix.clone();
         let token = std::sync::Arc::clone(&cancel);
         thread::spawn(move || {
-            let _ = tx.send(crate::tui_update_sweep_plan(&prefix, &|| {
+            let _ = tx.send(crate::tui_update_sweep_check(&prefix, &|| {
                 token.load(std::sync::atomic::Ordering::Relaxed)
             }));
         });
-        self.job = Some(Job::UpdateSweepPlan { rx, cancel });
+        self.job = Some(Job::UpdateSweepCheck { rx, cancel });
         self.message = None;
     }
 
     /// What the check found: nothing to do, or a plan to read and
     /// answer. Shown in full for the same reason `T`'s is — a count is
     /// not a plan.
-    fn finish_update_sweep_plan(&mut self, result: Result<Option<Vec<Checked>>>) {
+    fn finish_update_sweep_check(&mut self, result: Result<Option<Vec<Checked>>>) {
         // It is an update check, so it leaves an update check behind:
         // the same report `r` writes, applied to the list and persisted
         // for the next session. Asking the registry about forty crates
@@ -4375,18 +4398,18 @@ impl App {
             return Ok(());
         };
         match job {
-            Job::UpdateSweepPlan { rx, cancel } => match rx.try_recv() {
+            Job::UpdateSweepCheck { rx, cancel } => match rx.try_recv() {
                 Ok(result) => {
                     // A cancelled check discards its answer, whether the
                     // worker noticed the flag or finished first.
                     if cancel.load(std::sync::atomic::Ordering::Relaxed) {
                         self.info("update check cancelled");
                     } else {
-                        self.finish_update_sweep_plan(result);
+                        self.finish_update_sweep_check(result);
                     }
                 }
                 Err(TryRecvError::Empty) => {
-                    self.job = Some(Job::UpdateSweepPlan { rx, cancel });
+                    self.job = Some(Job::UpdateSweepCheck { rx, cancel });
                 }
                 Err(TryRecvError::Disconnected) => {
                     bail!("update check worker aborted; the terminal was reset by the panic")
@@ -4842,7 +4865,7 @@ fn rows_from(
 }
 
 /// `i` input: crate specs, `--locked` anywhere — the CLI's shape.
-/// Validated here so a typo fails in the footer, not after handoff;
+/// Validated here so a typo fails in the footer, before any build starts;
 /// passed on as typed.
 fn parse_install_input(buffer: &str) -> Result<(Vec<String>, bool)> {
     let mut crates = Vec::new();
@@ -4988,7 +5011,7 @@ mod tests {
             (vec!["bat@0.26.0".to_owned()], false)
         );
         assert!(parse_install_input("bat@^0.26").is_err());
-        // One crate, two specs: refused before the handoff — including
+        // One crate, two specs: refused before any build starts — including
         // identical tokens, which the CLI refuses too.
         assert!(parse_install_input("bat bat@0.26.0").is_err());
         assert!(parse_install_input("bat@0.26.0 bat@0.25.0").is_err());
@@ -6091,7 +6114,7 @@ mod tests {
                 latest: Version::parse(latest).unwrap(),
             })
             .collect();
-        app.finish_update_sweep_plan(Ok(Some(checked)));
+        app.finish_update_sweep_check(Ok(Some(checked)));
 
         // Every checked crate now has a status, pinned included.
         assert!(
@@ -6175,11 +6198,11 @@ mod tests {
         app.rows = rows_from(&manifest(&[("foo", "1.0.0")]), None, &BTreeMap::new());
         app.rows[0].status = RowStatus::Outdated(Version::parse("2.0.0").unwrap());
 
-        app.finish_update_sweep_plan(Ok(None));
+        app.finish_update_sweep_check(Ok(None));
         assert!(app.confirm.is_none(), "a cancelled check asks nothing");
         assert!(app.build_report.is_none(), "and shows no plan");
 
-        app.finish_update_sweep_plan(Err(anyhow::anyhow!("network down")));
+        app.finish_update_sweep_check(Err(anyhow::anyhow!("network down")));
         assert!(app.confirm.is_none(), "nor does a failed one");
         assert!(app.build_report.is_none());
         assert!(
@@ -6269,6 +6292,63 @@ mod tests {
         assert!(
             !said.contains("not attempted"),
             "and left nobody unattempted: {said}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Live warnings say whose they are. In a batch the job is named
+    /// for the whole operation, so a panel titled "install 3 crates:
+    /// warnings" leaves the reader to guess which crate spoke — and the
+    /// guess is usually wrong, because the lines outlive the member
+    /// that produced them.
+    #[test]
+    fn live_warnings_name_the_member_that_spoke_them() {
+        let root = std::env::temp_dir().join("cargo-lbin-test-tui-live-warning-title");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let mut app = App::new(&root).unwrap();
+        let mut runner: BatchRunner<(), InstallSection> =
+            BatchRunner::new(std::collections::VecDeque::new(), INSTALL_SECTIONS);
+        runner.total = 3;
+        let mut batch = InstallBatch {
+            runner,
+            shape: BatchShape::List,
+            current: None,
+            attempted: 0,
+            plan_warnings: Vec::new(),
+        };
+        // The states the worker actually produces: one member at a
+        // time, each finished before the next begins.
+        batch.begin_member("foo", Vec::new());
+        batch.finish_member(
+            "foo",
+            &crate::MemberOutcome::Installed,
+            Vec::new(),
+            &VecDeque::new(),
+        );
+        batch.begin_member("bar", Vec::new());
+        app.install_batch = Some(batch);
+
+        app.show_live_warnings(
+            "3 crates",
+            &BuildKind::Install,
+            &["warning: shadowed".to_owned()],
+        );
+        let title = app.build_report.as_ref().expect("a panel").title.clone();
+        assert!(title.contains("[2/3] bar"), "whose warnings: {title}");
+        assert!(
+            !title.contains("3 crates"),
+            "not the operation's own name: {title}"
+        );
+
+        // Outside a batch the job's name is the subject, as before.
+        app.install_batch = None;
+        app.show_live_warnings("solo", &BuildKind::Install, &["warning: x".to_owned()]);
+        assert!(
+            app.build_report
+                .as_ref()
+                .is_some_and(|r| r.title.contains("solo")),
+            "a single build is its own subject"
         );
         let _ = std::fs::remove_dir_all(&root);
     }

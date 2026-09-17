@@ -1,7 +1,8 @@
-//! Persisted result of the last `checkupdate` — the one command that
-//! queries the network; `list` annotates from it, nothing else
-//! refreshes it. A cache in the strict sense: losing it costs one
-//! `checkupdate`.
+//! Persisted result of the last update check — `checkupdate` from the
+//! command line, `r` in the interface, and `U`, which cannot ask the
+//! registry about a whole prefix and then pretend it did not. `list`
+//! and the JSON views annotate from it and refresh nothing. A cache in
+//! the strict sense: losing it costs one check.
 //!
 //! A full snapshot, not just the outdated crates: a reader must tell
 //! "checked and current" from "not checked at all", and both look
@@ -188,9 +189,12 @@ impl Report {
         Some((named, Status::UpToDate))
     }
 
-    /// The record for `name` as installed now, same exact-version rule as
-    /// `status_for`: `latest` is not always `current` for an up-to-date
-    /// crate (an installed version yanked since has a lower `latest`).
+    /// The record for `name` checked at exactly this version — the
+    /// strict question, deliberately narrower than `status_for`'s: that
+    /// one also answers for the update this report named, this one only
+    /// for what was actually checked. `latest` is not always `current`
+    /// for an up-to-date crate (an installed version yanked since has a
+    /// lower `latest`).
     pub fn checked_for(&self, name: &str, current: &Version) -> Option<&Checked> {
         self.crates
             .iter()

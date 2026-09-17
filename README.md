@@ -60,7 +60,7 @@ rustup's environment is not its job.
 
 Do **not** run `cargo-lbin` itself with `sudo`. Build scripts and proc macros must run as your normal user; `cargo-lbin` requests `sudo` itself only when placement under the canonical `/usr/local` prefix requires it.
 
-Where `cargo-lbin` asks for those credentials itself — placement, and a migration's retirement of the source — it names the reason first, because `sudo` prompts for a user and never for a purpose: `administrative privileges are required to install under /usr/local`, or `… to retire the source installation from /usr/local`. One sentence for both surfaces: the CLI prints it, and the TUI prints it on the terminal it steps off before suspending. (Operations that escalate inside a single privileged call, such as a `remove` or a pin flip needing `sudo`, still meet `sudo`'s own prompt directly.)
+Where `cargo-lbin` asks for those credentials itself — placement, and a migration's retirement of the source — it names the reason first, because `sudo` prompts for a user and never for a purpose: `administrative privileges are required to install under /usr/local`, or `… to retire the source installation from /usr/local`. One sentence for both surfaces: the CLI prints it, and the TUI prints it on the terminal it steps off before suspending. (In the interface a `remove` or a pin flip goes through the same authorization door as everything else; the terminal is handed over only when `sudo` cannot retain credentials.)
 
 ## Quick start
 
@@ -263,11 +263,11 @@ some-tool 1.2.3 [locked] (some-tool, some-toolctl)
 update check: 3h ago
 ```
 
-`list` never touches the network. Update annotations come only from the most recent `checkupdate` report:
+`list` never touches the network. Update annotations come only from the most recent recorded update check:
 
 - `-> VERSION` means a newer version was known at the last check.
-- `(up to date)` means that exact installed version was checked and found current.
-- No annotation means the crate was not covered by that report, for example because it was installed or updated afterwards.
+- `(up to date)` means the last check found this version current — either because it checked this exact version, or because this is the update that check named and it has since been installed.
+- No annotation means the report cannot speak about the installed version, for example because the crate was installed afterwards, or updated to something other than the version that check named.
 
 The report age is printed to stderr so stdout remains suitable for simple parsing. Without a saved report, `list` still lists the manifest and tells you that no update check has been recorded.
 
@@ -326,7 +326,7 @@ A successful check writes a full per-prefix snapshot, not merely the outdated en
 }
 ```
 
-`list --json` fields: `prefix` is the absolute, normalized prefix; `checked_at` is the Unix time of the last recorded check, or `null` if there is none; `pinned` mirrors the `pin` state; `status` is one of `up_to_date`, `outdated` or `unknown` (not covered by the last check — installed or updated since); `latest` is the newest version that check found, or `null` when the status is `unknown`. An empty prefix is `"crates": []`, not a message.
+`list --json` fields: `prefix` is the absolute, normalized prefix; `checked_at` is the Unix time of the last recorded check, or `null` if there is none; `pinned` mirrors the `pin` state; `status` is one of `up_to_date`, `outdated` or `unknown` (the last check cannot speak about this version — the crate was installed after it, or updated to something other than the version that check named); `latest` is the newest version that check found, or `null` when the status is `unknown`. An empty prefix is `"crates": []`, not a message.
 
 `pinned --json` uses the same per-crate shape as `list --json`; without `--check`, it is the pinned subset of the same recorded snapshot, entry for entry — details under [Pinned](#pinned).
 
@@ -711,7 +711,9 @@ A batch install is one operation: a single worker takes the prefix's lock once, 
 
 The sweeps work the same way. `U` snapshots the manifest under a shared lock, releases it before the registry requests and the confirmation — a check across fifty crates holds nothing — and asks about every entry, pinned ones included: it is an update check, so it leaves one behind, refreshing the list and the stored report exactly as `r` does. The plan it then shows is what that check found minus the pins, since a pin is a standing instruction rather than a gap in knowledge, and how many pinned crates have updates waiting is said rather than implied. One worker then holds the exclusive lock across the updates, revalidating each member against the plan and skipping one that moved.
 
-What is left of the old terminal handoff is one case: a `sudo` that caches nothing, where a noninteractive privileged step cannot run at all. A build discovers it before it starts; a removal or a pin flip discovers it at its door. There the CLI runs the whole operation, Cargo diagnostics and password prompts behave exactly as they do outside the TUI, and the interface returns when you press Enter.
+What is left of the old terminal handoff is one case: a `sudo` that caches nothing, where a noninteractive privileged step cannot run at all.
+
+A non-caching `sudo` discovered while preparing a prefix's first lock file hands the whole operation to the CLI before any build starts — except for a migration, which refuses and names the CLI command instead: a migration is a conversation about two prefixes, and the CLI is where it has one. Discovered later, at placement, it refuses the member that has already been built instead — the build is never repeated through `sudo`. A removal or a pin flip can hand over at its own authorization door, because it has no build to preserve. Where the CLI does run the operation, Cargo diagnostics and password prompts behave exactly as they do outside the TUI, and the interface returns when you press Enter.
 
 `D` offers the older versions in the panel: a cancellable lookup, then a numbered list — the same choice `cargo lbin downgrade` makes, so a browser of the whole history it is not — and a digit installs one. The list stops at nine because a digit names one entry; anything older is announced with a pointer to `install NAME@VERSION`. The build that follows is an ordinary in-panel install of an exact version: `c` cancels it, its warnings land in the panel, and the version is pinned for the same reason the command pins. The offer is computed against the version the row shows, so if the crate moves or disappears while the list is open, the digit starts nothing and says why.
 

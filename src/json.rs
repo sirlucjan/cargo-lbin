@@ -415,9 +415,6 @@ mod tests {
         );
     }
 
-    /// The representation as emitted, byte for byte: editing this test is
-    /// expected when a field is added; a schema bump only when an existing
-    /// field changes.
     /// The three surfaces answer the same question the same way. This
     /// one is easy to forget, because JSON has no screen to notice on:
     /// after `U` installs the update a report named, a script asking
@@ -458,6 +455,9 @@ mod tests {
         assert!(beyond.latest.is_none(), "absent knowledge, not a guess");
     }
 
+    /// The representation as emitted, byte for byte: editing this test is
+    /// expected when a field is added; a schema bump only when an existing
+    /// field changes.
     #[test]
     fn list_output_golden() {
         let out = ListOutput::build(

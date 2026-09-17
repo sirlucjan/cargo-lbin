@@ -2305,7 +2305,9 @@ fn bin_dir_prefix_note(prefix: &Path) -> Option<String> {
 /// The escalation union for operations placing/removing under bin. The
 /// build preflight, in-place removal and both retirements — the
 /// captured one and the CLI's — must never disagree about whether a
-/// prefix asks a password; private copies of this `||` would drift.
+/// prefix needs privilege; whether a password is actually *asked* for
+/// is sudo's timestamp to decide, and a warm one means none. Private
+/// copies of this `||` would drift.
 /// No longer TUI-only for exactly that reason: the CLI's migration
 /// asks the same question before it announces the password it needs.
 fn placement_needs_privilege(policy: privileged::Policy, prefix: &Path) -> Result<bool> {
@@ -2807,15 +2809,17 @@ pub(crate) struct PlannedUpdate {
 
 /// `U`'s check: what the registry says about every entry here.
 ///
-/// Pinned crates are not in the plan at all, as in the CLI: a pin is a
-/// standing instruction, and a sweep that refused once per pinned crate
-/// would be reporting a dozen refusals nobody asked for. The shared
+/// Every entry is asked about, pinned ones included: a pin says do not
+/// move this crate, not do not tell me about it, and a check that
+/// skipped them would blank their status on every sweep. Which of them
+/// may then be updated is the caller's question, not this one's. The
+/// shared
 /// lock is released before the network work — a check over a whole
 /// prefix is the longest thing this tool does without building — and
 /// the cancel token reaches `check_versions`, so a `c` stops the
 /// remaining requests rather than only discarding their answers.
 #[cfg(feature = "tui")]
-pub(crate) fn tui_update_sweep_plan(
+pub(crate) fn tui_update_sweep_check(
     prefix: &Path,
     should_cancel: &dyn Fn() -> bool,
 ) -> Result<Option<Vec<Checked>>> {
