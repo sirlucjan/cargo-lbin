@@ -2269,6 +2269,24 @@ fn late_escalation_note(name: &str, source: &Path) -> String {
     ))
 }
 
+/// The same heads-up for a run of builds placing into a privileged
+/// prefix.
+///
+/// Placement asks at each member's own door, after that member is
+/// built, so on a long batch the first prompt arrives minutes in and
+/// with nothing on screen that explains why. Said once before the
+/// first build, it promises the escalation and not the prompt —
+/// sudo's timestamp decides whether it asks at all, and after the
+/// first member it usually will not.
+#[cfg(feature = "tui")]
+pub(crate) fn batch_escalation_note(prefix: &Path) -> String {
+    text::sanitize(&format!(
+        "builds run unprivileged; placing under {} needs sudo after each \
+         build, and a password may be requested then",
+        prefix.display()
+    ))
+}
+
 /// A prefix whose last component is `bin` — almost certainly one
 /// directory too deep.
 ///

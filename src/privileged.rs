@@ -170,9 +170,11 @@ pub fn needs_privilege(dir: &Path) -> bool {
 /// Is sudo's credential timestamp warm right now?
 ///
 /// Asked where a password is about to be spent — the placement door —
-/// and not before a long build, so a build that fails costs no
-/// password and one that succeeds is not compiled under a warm
-/// timestamp this tool established. `sudo -n -v` asks about the
+/// and never warmed in advance for a build that may fail. In a batch
+/// a timestamp may still be warm from an earlier member's placement;
+/// every later build is a plain user's build regardless, because a
+/// warm timestamp is permission to ask sudo, not an identity cargo
+/// runs under. `sudo -n -v` asks about the
 /// timestamp itself, not any command; only when sudo would prompt is
 /// the reason announced, and `sudo -v` then owns the prompt —
 /// cargo-lbin never reads, buffers or forwards the password, a design

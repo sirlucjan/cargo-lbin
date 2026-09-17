@@ -213,7 +213,7 @@ enum OnConfirm {
     },
     /// `U`: the plan the person just read, member by member.
     UpdateAll { planned: Vec<crate::PlannedUpdate> },
-    /// `x`: the need for a password is decided fresh at the `y` —
+    /// `x`: the need for privilege is decided fresh at the `y` —
     /// the world may move while the prompt is open.
     Remove { name: String },
     /// `migrate --all`: the whole plan frozen at the keypress, one
@@ -1833,8 +1833,10 @@ impl App {
         }
         // Everything else waits for the placement door, where the
         // credentials are actually spent: a build that fails should not
-        // have cost a password, and one that succeeds should not hold a
-        // warm timestamp for its whole length.
+        // have cost a password. In a batch a later build may begin
+        // while sudo's timestamp is still warm from an earlier
+        // member's placement, and still runs unprivileged — the
+        // timestamp is permission to ask, not an identity.
         Self::authorize(
             terminal,
             prefix,
@@ -3756,6 +3758,26 @@ impl App {
         });
     }
 
+    /// Said once before a run of builds, when placement under this
+    /// prefix will need privilege.
+    ///
+    /// The prompt itself explains what it is for; this explains *when*
+    /// — that it comes after a build rather than now, which on a batch
+    /// of three heavy crates is the difference between an expected
+    /// pause and an alarming one. A prefix that needs nothing, or whose
+    /// privilege cannot be judged, announces nothing: a heads-up about
+    /// an escalation that may never happen is the false promise the
+    /// migration notice already avoids.
+    fn announce_batch_escalation(&mut self) {
+        let policy = crate::privileged::Policy::for_prefix(&self.prefix);
+        if matches!(
+            crate::placement_needs_privilege(policy, &self.prefix),
+            Ok(true)
+        ) {
+            self.info(&crate::batch_escalation_note(&self.prefix));
+        }
+    }
+
     /// `i` with more than one crate: one operation, one worker.
     ///
     /// The preflight here is the one that cannot wait: preparing a
@@ -3795,6 +3817,7 @@ impl App {
                 return Ok(());
             }
         }
+        self.announce_batch_escalation();
         self.build_report = None;
         let total = specs.len();
         let control = std::sync::Arc::new(crate::BatchControl::new());
@@ -3947,6 +3970,7 @@ impl App {
                 return Ok(());
             }
         }
+        self.announce_batch_escalation();
         self.build_report = None;
         let total = planned.len();
         let control = std::sync::Arc::new(crate::BatchControl::new());
@@ -4102,6 +4126,7 @@ impl App {
                 return Ok(());
             }
         }
+        self.announce_batch_escalation();
         self.build_report = None;
         let total = planned.len();
         let control = std::sync::Arc::new(crate::BatchControl::new());
@@ -6350,6 +6375,40 @@ mod tests {
                 .as_ref()
                 .is_some_and(|r| r.title.contains("solo")),
             "a single build is its own subject"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The heads-up before a batch says *when* privilege is spent, not
+    /// what it is for — the prompt says that itself. A prefix needing
+    /// no privilege announces nothing, because a promise of an
+    /// escalation that never happens is worse than silence.
+    #[test]
+    fn a_batch_announces_a_late_escalation_only_when_there_is_one() {
+        let root = std::env::temp_dir().join("cargo-lbin-test-tui-batch-heads-up");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("bin")).unwrap();
+        std::fs::create_dir_all(root.join("share/cargo-lbin")).unwrap();
+        Manifest::default().store(&root).unwrap();
+        let mut app = App::new(&root).unwrap();
+
+        // A writable prefix: nothing to warn about.
+        app.announce_batch_escalation();
+        assert!(
+            app.message.is_none(),
+            "a prefix that needs no privilege promises no escalation"
+        );
+
+        // And the sentence itself, where one is needed: it names the
+        // moment, and does not promise a prompt.
+        let note = crate::batch_escalation_note(std::path::Path::new("/usr/local"));
+        assert!(
+            note.contains("after each build") && note.contains("may be requested"),
+            "{note}"
+        );
+        assert!(
+            !note.contains("will be requested"),
+            "sudo's timestamp decides that, not us: {note}"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
