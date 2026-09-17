@@ -27,7 +27,7 @@ pub struct ListOutput {
     pub schema: u32,
     /// The prefix as an absolute, normalized path (see `report::identity`).
     pub prefix: PathBuf,
-    /// Unix seconds of the last `checkupdate`; `null` if none is recorded.
+    /// Unix seconds of the last recorded update check; `null` if none.
     pub checked_at: Option<u64>,
     pub crates: Vec<ListCrate>,
 }

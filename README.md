@@ -389,14 +389,15 @@ hexyl 0.14.0 -> 0.16.0
 update check: 3h ago
 ```
 
-By default `pinned` reads the last recorded `checkupdate` report, so it is
+By default `pinned` reads the last recorded update report, so it is
 offline and deterministic; in text output the report age is printed to
 stderr, and a crate the report does not cover is listed without an
 annotation rather than guessed about. `--json` keeps stdout
 machine-clean: one document, no age line; warnings still go to stderr. `--check` asks crates.io about the pinned crates now — and
 only about them — without touching the recorded report: the recorded
-snapshot belongs to `checkupdate`, and a partial one would misinform
-`list`. Exit codes follow `checkupdate`: `0` when a pinned crate is known to have
+snapshot is a full-prefix update check, and a pinned-only partial one
+must not replace it, whoever ran the full one — `checkupdate`, the
+interface's `r`, or `U`. Exit codes follow `checkupdate`: `0` when a pinned crate is known to have
 a newer version, `2` when no pinned crate is known to have one, `1` on
 error, so a shell hook or cron job can stay quiet until a held-back
 update actually exists. `pinned --json` uses the same per-crate JSON
@@ -660,7 +661,7 @@ cargo lbin tui
 └───────────────────────────────────────────────────────────┘
 ```
 
-The TUI starts entirely from disk — the manifest and the last `checkupdate` report. It performs no refresh, network request, update or installation on startup.
+The TUI starts entirely from disk — the manifest and the last recorded update report. It performs no refresh, network request, update or installation on startup.
 
 The Selected panel is the crate's full managed entry: installed version, `Latest` from the last check, every binary, and `Locked`/`Pinned` answered explicitly — in a details panel a missing line would read as "unknown", not as "no". Each copy under another known prefix appears as its own `Also in` line with its version — with a custom current prefix there can legally be two. Deliberately absent: lease and staging state (build plumbing, not crate state — `verify` and `clean` own it) and the full version history (`info --versions` is the archaeology; the panel's `Latest` is the decision surface).
 
@@ -872,7 +873,7 @@ or, when `XDG_CACHE_HOME` is unset:
 
 Builds use per-run staging directories under `stage-v2/`, named `<pid>-<nonce>` and owned through a `.lease` file the creating process locks (`flock(2)`) and every spawned child inherits — so independent operations cannot wipe each other's stages, ownership survives PID reuse, and a build orphaned by its cargo-lbin keeps its stage visibly owned until it exits. Pre-0.13 stages under `stage/` are still recognized by their PID-heuristic rules; the two layouts do not share a directory, so a concurrently installed 0.12 binary cannot sweep live leased runs.
 
-The last `checkupdate` snapshot is stored under `checkupdate/`, one file per normalized prefix. Relative prefixes are anchored to the current working directory before that cache key is derived, so `--prefix local` in two different directories refers to two different prefix states. The snapshot is presentation-only state: it has no expiry, only `checkupdate` refreshes it, and it can be deleted at any time.
+The last recorded update check is stored under `checkupdate/`, one file per normalized prefix. Relative prefixes are anchored to the current working directory before that cache key is derived, so `--prefix local` in two different directories refers to two different prefix states. The snapshot is presentation-only state: it has no expiry, only a full-prefix update check refreshes it — `checkupdate`, `r` or `U` — and it can be deleted at any time.
 
 ## Update rules
 

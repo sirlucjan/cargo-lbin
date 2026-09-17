@@ -210,7 +210,7 @@ enum Cmd {
     /// List pinned crates and whether newer versions exist (read-only,
     /// no sudo).
     ///
-    /// Reads the last recorded `checkupdate` by default; `--check` asks
+    /// Reads the last recorded update check by default; `--check` asks
     /// crates.io about the pinned crates instead, without touching the
     /// recorded report. Exit codes as `checkupdate`: 0 a pinned crate is
     /// known to have a newer version, 2 none is known to, 1 error
@@ -3691,7 +3691,7 @@ fn cmd_list(prefix: &Path, json: bool) -> Result<()> {
     // prefixes module for why an annotation must never wait on a
     // foreign lock.
     let also = prefixes::also_installed(prefix);
-    // Purely local: the last `checkupdate` result, if any. An unreadable
+    // Purely local: the last recorded update check, if any. An unreadable
     // report is a warning — the listing itself does not depend on it.
     let report = match cache_dir().and_then(|cache| Report::load(&cache, prefix)) {
         Ok(report) => report,

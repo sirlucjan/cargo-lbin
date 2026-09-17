@@ -71,7 +71,7 @@ pub struct Row {
     pub status: RowStatus,
 }
 
-/// What the last `checkupdate` says about a row — three states, the
+/// What the last recorded update check says about a row — three states, the
 /// third silence, never a guess (see `report::Status`).
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum RowStatus {
@@ -1020,9 +1020,9 @@ enum Job {
         cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
     },
     /// `u`'s lookup: what the registry says now, for one crate. The
-    /// interface's own row is a snapshot of the last `r`, and an update
-    /// is worth planning against the registry rather than against
-    /// whatever was true an hour ago.
+    /// interface's own row is the last recorded update check, and an
+    /// update is worth planning against the registry rather than
+    /// against whatever was true an hour ago.
     UpdatePlan {
         name: String,
         rx: Receiver<Result<crate::UpdatePlan>>,
@@ -3591,9 +3591,8 @@ impl App {
         });
     }
 
-    /// `r`: `checkupdate` on a thread; the report is written on the main
-    /// thread. `v`: the read-only audit on a worker — a fresh audit
-    /// supersedes whatever report was up.
+    /// `v`: the read-only audit on a worker — a fresh audit supersedes
+    /// whatever report was up.
     fn start_verify(&mut self) {
         if self.job.is_some() {
             self.error("busy; wait for the current operation to finish");
@@ -3684,6 +3683,8 @@ impl App {
         }
     }
 
+    /// `r`: the update check on a thread; the report it produces is
+    /// written on the main thread, where the list lives.
     fn start_check(&mut self) {
         if self.job.is_some() {
             self.error("busy; wait for the current lookup to finish");
@@ -4209,8 +4210,8 @@ impl App {
 
     /// `u`/Enter: plan the update against the registry, then ask.
     ///
-    /// Not against the row: that is what the last `r` found, and an
-    /// update is worth planning against what the registry says now. The
+    /// Not against the row: that is the last recorded update check, and
+    /// an update is worth planning against what the registry says now. The
     /// CLI does exactly this — look up, show, ask, apply — and the
     /// interface has no reason to do less. A pinned crate is refused
     /// before the lookup, with the sentence the CLI uses.
