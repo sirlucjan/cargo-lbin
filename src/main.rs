@@ -2661,6 +2661,7 @@ impl std::fmt::Display for AuthorizationRefused {
         let what = match self.purpose {
             privileged::AuthPurpose::Placement => "placement",
             privileged::AuthPurpose::Retirement => "retiring the source installation",
+            privileged::AuthPurpose::Mutation => "changing what is installed",
         };
         write!(f, "{what} could not be authorized: {}", self.reason)
     }

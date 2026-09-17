@@ -212,7 +212,7 @@ enum OnConfirm {
     },
     /// `U`: the plan the person just read, member by member.
     UpdateAll { planned: Vec<crate::PlannedUpdate> },
-    /// `x`: the shape (in place or handoff) is decided fresh at the `y` —
+    /// `x`: the need for a password is decided fresh at the `y` —
     /// the world may move while the prompt is open.
     Remove { name: String },
     /// `migrate --all`: the whole plan frozen at the keypress, one
@@ -561,6 +561,19 @@ impl ActiveControl {
     fn is_batch(&self) -> bool {
         matches!(self, Self::Batch(_))
     }
+}
+
+/// An in-place mutation waiting for the run loop, because it needs a
+/// password and only the run loop owns the terminal to ask for one.
+///
+/// These are not builds: they take a lock, change one line of the
+/// manifest and a file or two, and are over. The handoff they replace
+/// existed for sudo's prompt and nothing else — the work was never the
+/// reason to leave the interface.
+#[derive(Clone, PartialEq, Eq, Debug)]
+enum PendingInPlace {
+    Remove(String),
+    SetPinned { name: String, pinned: bool },
 }
 
 /// What kind of batch a panel is summarising.
@@ -1238,6 +1251,7 @@ pub struct App {
     pending_install_batch: Option<(Vec<String>, bool)>,
     pending_reinstall_sweep: Option<Vec<(String, crate::ReinstallPlan)>>,
     pending_update_sweep: Option<Vec<crate::PlannedUpdate>>,
+    pending_in_place: Option<PendingInPlace>,
     pub search_result: Option<SearchResult>,
     pub downgrade_choice: Option<DowngradeChoice>,
     /// A build's sticky report pinned to the details panel until dismissed.
@@ -1332,6 +1346,7 @@ impl App {
             pending_install_batch: None,
             pending_reinstall_sweep: None,
             pending_update_sweep: None,
+            pending_in_place: None,
             search_result: None,
             downgrade_choice: None,
             build_report: None,
@@ -1452,6 +1467,7 @@ impl App {
             || self.pending_install_batch.is_some()
             || self.pending_reinstall_sweep.is_some()
             || self.pending_update_sweep.is_some()
+            || self.pending_in_place.is_some()
             || self.pending_migrate.is_some()
             || self.pending_build.is_some()
             || self.pending.is_some()
@@ -1581,6 +1597,10 @@ impl App {
 
             if let Some(action) = self.pending.take() {
                 self.run_in_terminal(terminal, &action)?;
+                continue;
+            }
+            if let Some(op) = self.pending_in_place.take() {
+                self.run_in_place(terminal, op)?;
                 continue;
             }
             if let Some(planned) = self.pending_update_sweep.take() {
@@ -3139,9 +3159,10 @@ impl App {
 
     /// `p`: pin or unpin — a manifest write, so the same shape decision
     /// as `x`, made at the keypress (its own `y`). Escalation queues the
-    /// handoff; otherwise in place — the most trivial mutation least
-    /// deserves a screen flip. The running guard is the in-place
-    /// family's.
+    /// mutation for the run loop's door, not a handoff: the most
+    /// trivial mutation least deserves a screen flip, and a password
+    /// prompt is not a reason to leave. The running guard is the
+    /// in-place family's.
     fn pin_selected(&mut self) {
         let Some(row) = self.selected_row() else {
             return;
@@ -3163,11 +3184,54 @@ impl App {
             }
         };
         if escalate {
-            self.queue(PendingAction::SetPinned { name, pinned });
+            // The password is the only reason this cannot happen here
+            // and now; the run loop borrows the screen for it.
+            self.pending_in_place = Some(PendingInPlace::SetPinned { name, pinned });
             return;
         }
+        self.apply_set_pinned(&name, pinned);
+    }
+
+    /// An in-place mutation that needs a password: borrow the screen for
+    /// the prompt, then do the work here.
+    ///
+    /// The same preflight gate every privileged step uses — ask, then
+    /// check again — because the privileged calls downstream run
+    /// `sudo -n`. Its three answers are all meaningful here: ready, and
+    /// the work happens; reported, and nothing is attempted; and a sudo
+    /// that caches nothing, where the terminal is the only place this
+    /// can run at all, so the handoff stays for exactly that case.
+    fn run_in_place(&mut self, terminal: &mut DefaultTerminal, op: PendingInPlace) -> Result<()> {
+        let prefix = self.prefix.clone();
+        match Self::authorize(
+            terminal,
+            &prefix,
+            true,
+            crate::privileged::AuthPurpose::Mutation,
+        )? {
+            Preflight::Ready => match op {
+                PendingInPlace::Remove(name) => self.apply_remove(&name),
+                PendingInPlace::SetPinned { name, pinned } => self.apply_set_pinned(&name, pinned),
+            },
+            Preflight::NoCache => {
+                self.info("sudo does not cache credentials here; handing the terminal over");
+                self.pending = Some(match op {
+                    PendingInPlace::Remove(name) => PendingAction::Remove(name),
+                    PendingInPlace::SetPinned { name, pinned } => {
+                        PendingAction::SetPinned { name, pinned }
+                    }
+                });
+            }
+            Preflight::Reported(message) => self.error(&message),
+        }
+        Ok(())
+    }
+
+    /// The pin flip itself, reached with or without a password: the
+    /// escalating path only puts a prompt in front of it.
+    fn apply_set_pinned(&mut self, name: &str, pinned: bool) {
         let verb = if pinned { "pinned" } else { "unpinned" };
-        match crate::tui_set_pinned(&self.prefix, &name, pinned) {
+        match crate::tui_set_pinned(&self.prefix, name, pinned) {
             Ok(crate::TuiSetPinned::Set { version }) => {
                 match self.reload() {
                     Err(e) => {
@@ -3205,14 +3269,15 @@ impl App {
     }
 
     /// The decision at the `y`: the same escalation test as the build
-    /// preflight. Escalation = terminal handoff (passwords belong on the
-    /// real terminal); none = in place. Nonblocking lock — a busy prefix
-    /// is an answer, not a frozen interface.
+    /// preflight. Escalation means the removal waits for the run loop's
+    /// door and then happens here; only a sudo that caches nothing
+    /// sends it to the terminal, because there it cannot be asked at
+    /// all. Nonblocking lock — a busy prefix is an answer, not a frozen
+    /// interface.
     fn remove_confirmed(&mut self, name: String) {
-        // The handoff inherits queue()'s guard; the in-place path refuses
-        // for the running family itself — the lock is free while cargo
-        // compiles, so a removal could win it and be silently undone by the
-        // worker's placement.
+        // Refused while anything of the running family is in flight: the
+        // lock is free while cargo compiles, so a removal could win it
+        // and be silently undone by the worker's placement.
         if self.anything_running() {
             self.error("an operation is running or queued; finish or cancel it first");
             return;
@@ -3226,10 +3291,15 @@ impl App {
             }
         };
         if escalate {
-            self.queue(PendingAction::Remove(name));
+            self.pending_in_place = Some(PendingInPlace::Remove(name));
             return;
         }
-        match crate::tui_remove_one(&self.prefix, &name) {
+        self.apply_remove(&name);
+    }
+
+    /// The removal itself, reached with or without a password.
+    fn apply_remove(&mut self, name: &str) {
+        match crate::tui_remove_one(&self.prefix, name) {
             Ok(crate::TuiRemove::Removed(bins)) => {
                 match self.reload() {
                     Err(e) => {
@@ -5985,6 +6055,44 @@ mod tests {
             "the confirmed plan travels, not a fresh check"
         );
         assert!(app.pending.is_none(), "and no handoff");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Where no password is needed there is no detour at all: the work
+    /// happens where the key was pressed.
+    ///
+    /// The privileged half cannot be exercised honestly without a
+    /// prefix that needs sudo and a sudo to answer, so what is checked
+    /// there is the shape the run loop receives — an operation, not a
+    /// command line for somewhere else.
+    #[test]
+    fn a_writable_prefix_mutates_without_a_detour() {
+        let root = std::env::temp_dir().join("cargo-lbin-test-tui-inplace-privileged");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("bin")).unwrap();
+        std::fs::create_dir_all(root.join("share/cargo-lbin")).unwrap();
+        manifest(&[("foo", "1.2.0")]).store(&root).unwrap();
+        let mut app = App::new(&root).unwrap();
+
+        // Writable prefix: no password, so no detour at all.
+        app.remove_confirmed("foo".into());
+        assert!(app.pending_in_place.is_none(), "nothing to authorize");
+        assert!(app.pending.is_none(), "and the terminal stays where it is");
+        assert!(
+            Manifest::load(&root).unwrap().crates.is_empty(),
+            "the removal happened in place"
+        );
+
+        // The shape the run loop receives when a password *is* needed:
+        // an operation, not a command line to run elsewhere.
+        let op = PendingInPlace::SetPinned {
+            name: "foo".to_owned(),
+            pinned: true,
+        };
+        assert!(
+            matches!(&op, PendingInPlace::SetPinned { name, pinned } if name == "foo" && *pinned),
+            "the operation travels whole"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

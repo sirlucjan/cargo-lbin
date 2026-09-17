@@ -203,6 +203,12 @@ pub fn credentials_fresh() -> Result<bool> {
 pub enum AuthPurpose {
     Placement,
     Retirement,
+    #[cfg_attr(not(feature = "tui"), allow(dead_code))]
+    /// A removal or a pin flip: the manifest, and for a removal the
+    /// binaries it names. Not an installation, and the sentence above
+    /// sudo's prompt must not say it is — the least a person is owed
+    /// for a password is an accurate reason.
+    Mutation,
 }
 
 /// The sentence printed before sudo's own prompt, wherever the prompt
@@ -216,6 +222,7 @@ pub fn requirement_line(purpose: AuthPurpose, prefix: &Path) -> String {
     let what = match purpose {
         AuthPurpose::Placement => "install under",
         AuthPurpose::Retirement => "retire the source installation from",
+        AuthPurpose::Mutation => "change what is installed under",
     };
     crate::text::sanitize(&format!(
         "administrative privileges are required to {what} {}",
@@ -572,6 +579,17 @@ mod tests {
             requirement_line(AuthPurpose::Retirement, prefix),
             "administrative privileges are required to retire the source installation from \
              /usr/local"
+        );
+        // A removal or a pin flip is not an installation, and the one
+        // sentence a person gets for a password must not say it is.
+        let mutation = requirement_line(AuthPurpose::Mutation, prefix);
+        assert_eq!(
+            mutation,
+            "administrative privileges are required to change what is installed under /usr/local"
+        );
+        assert!(
+            !mutation.contains("install under"),
+            "which would name an operation that is not happening: {mutation}"
         );
         // A prefix can come from the environment: sanitized like every
         // other external string that reaches a terminal.
