@@ -2234,7 +2234,7 @@ fn cmd_verify(prefix: &Path, json: bool) -> Result<()> {
 
 /// The state half of the escalation union: the manifest plus, where
 /// escalation is possible, the lock file. Its own question because it
-/// is its own write set — a pin flip must not force a handoff over a
+/// is its own write set — a pin flip must not be called privileged over a
 /// read-only bin it never touches.
 #[cfg(feature = "tui")]
 fn state_needs_privilege(policy: privileged::Policy, prefix: &Path) -> Result<bool> {
@@ -2673,8 +2673,9 @@ impl std::error::Error for AuthorizationRefused {}
 /// What a batch worker tells the interface as it goes.
 #[cfg(feature = "tui")]
 pub(crate) enum BatchStep<'a> {
-    /// About to build member `index` of the plan (zero-based).
-    Started { index: usize, name: &'a str },
+    /// About to build this member. Which number it is, the caller
+    /// already knows: it counts the starts.
+    Started { name: &'a str },
     /// That member is done, classified where its error was still
     /// typed.
     Finished {
@@ -2728,7 +2729,7 @@ pub(crate) fn tui_install_batch(
         on_line(LineKind::Warning, &w);
     }
     let mut end = InstallBatchEnd::Completed;
-    for (index, spec) in specs.iter().enumerate() {
+    for spec in specs {
         let member = std::sync::Arc::new(BuildControl::new());
         // Asking and publishing as one step: see `try_begin_member`.
         // A refusal here means the batch was stopped with members still
@@ -2737,10 +2738,7 @@ pub(crate) fn tui_install_batch(
             end = InstallBatchEnd::Cancelled;
             break;
         }
-        step(BatchStep::Started {
-            index,
-            name: &spec.name,
-        });
+        step(BatchStep::Started { name: &spec.name });
         let mut frontend = Frontend::Captured {
             on_line,
             before_placement,
@@ -2891,14 +2889,14 @@ pub(crate) fn tui_update_sweep(
     )?;
     let mut manifest = Manifest::load(prefix)?;
     let mut end = InstallBatchEnd::Completed;
-    for (index, planned) in planned.iter().enumerate() {
+    for planned in planned {
         let name = planned.name.as_str();
         let member = std::sync::Arc::new(BuildControl::new());
         if !control.try_begin_member(&member) {
             end = InstallBatchEnd::Cancelled;
             break;
         }
-        step(BatchStep::Started { index, name });
+        step(BatchStep::Started { name });
         let entry = manifest.crates.get(name);
         let unchanged = entry.is_some_and(|e| e.version == planned.current && !e.pinned);
         let Some(locked) = entry.map(|e| e.locked).filter(|_| unchanged) else {
@@ -3000,13 +2998,13 @@ pub(crate) fn tui_reinstall_sweep(
     )?;
     let mut manifest = Manifest::load(prefix)?;
     let mut end = InstallBatchEnd::Completed;
-    for (index, (name, plan)) in planned.iter().enumerate() {
+    for (name, plan) in planned {
         let member = std::sync::Arc::new(BuildControl::new());
         if !control.try_begin_member(&member) {
             end = InstallBatchEnd::Cancelled;
             break;
         }
-        step(BatchStep::Started { index, name });
+        step(BatchStep::Started { name });
         let unchanged = manifest.crates.get(name).is_some_and(|e| {
             e.version == plan.version.to_string()
                 && e.pinned == plan.pinned
@@ -3789,8 +3787,11 @@ fn select_targets(manifest: &Manifest, crates: &[String]) -> Result<BTreeSet<Str
 /// One index request per crate, `should_cancel` consulted between them:
 /// `Ok(None)` is a cancelled run — an answer, distinct from a failure,
 /// and the check happens before each request so a cancel never pays for
-/// one more round-trip than the one already in flight. The CLI passes
-/// `|| false`; the TUI passes its cancel token.
+/// one more round-trip than the one already in flight. Who passes a
+/// real token is a caller's choice: `r` and `U` do, because they ask
+/// about a whole prefix; the CLI and the single-crate lookups pass
+/// `|| false`, where one request is already in flight by the time
+/// anyone could cancel it.
 fn check_versions<'a>(
     entries: impl IntoIterator<Item = (&'a String, &'a Entry)>,
     should_cancel: impl Fn() -> bool,

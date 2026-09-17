@@ -5,17 +5,18 @@
 //! `verify`. Nothing happens unless a key asks for it — no polling, no
 //! refresh or network access on start.
 //!
-//! Two ways of running a command. Some take over the real terminal
-//! (`u`/`U` updates, multi-crate installs, and a downgrade only where
-//! captured placement cannot run): the TUI steps
-//! aside, runs the command as the CLI would, waits for Enter, and comes
-//! back. Others run in place: a single-crate install or migrate builds
-//! behind the framed panel with its cancel door and sudo roundtrip, and
-//! a removal or pin flip that needs no escalation never leaves the
-//! screen. The `Terminal` is created once and kept across handoffs —
+//! Work happens here. Every build — install, update, reinstall,
+//! downgrade, migrate, and the batches and sweeps over them — runs
+//! behind the framed panel, with its cancel door, its warning record
+//! and its sudo roundtrip; a removal or a pin flip mutates in place.
+//! The real terminal is borrowed for one thing, a sudo prompt, and
+//! handed over entirely in one case: a `sudo` that caches nothing,
+//! where a noninteractive privileged step cannot run at all. That
+//! fallback is the exception the architecture keeps, not a way of
+//! working. The `Terminal` is created once and kept across handoffs —
 //! `ratatui::try_init()` stacks a panic hook per call. `checkupdate`,
-//! `search`, `v` and the version lookup behind `D` run on a one-shot
-//! thread while the list stays navigable.
+//! `search`, `v` and the planning behind `D`, `u`, `U` and `T` run on
+//! one-shot threads while the list stays navigable.
 //!
 //! A manifest the validated loader refuses does not keep the TUI out:
 //! the session starts degraded — empty list, mutating actions refused,
@@ -223,15 +224,19 @@ enum OnConfirm {
     },
 }
 
-/// Commands that take over the terminal; queued by key handlers, run
-/// by the event loop after the announcing frame.
+/// Commands that take over the terminal, run by the event loop after
+/// the announcing frame.
+///
+/// Not a way of starting work: every one of these is the fallback
+/// taken when a privileged step cannot run noninteractively, which is
+/// to say when `sudo` caches nothing. The CLI can ask there; a captured
+/// worker cannot.
 #[derive(Clone)]
 enum PendingAction {
     Update(String),
-    /// `install --reinstall --all`: the sweep, always in the terminal.
-    /// It prints a plan and asks before spending a great many builds,
-    /// and that exchange has a better home in the CLI than behind a
-    /// panel — the same judgement `U` makes.
+    /// `install --reinstall --all`: `T`'s fallback. The sweep normally
+    /// plans, asks and builds in the panel; this is where it goes when
+    /// the prefix's first privileged lock cannot be prepared quietly.
     ReinstallAll,
     /// `install --reinstall`: same fallback case as the downgrade below
     /// — where sudo caches nothing, the rebuild leaves as the command
@@ -290,11 +295,7 @@ enum BuildMsg {
     },
     /// A batch worker moving to the next member: the interface's cue to
     /// say `[2/3] bar` and to file what follows under that name.
-    MemberStarted {
-        index: usize,
-        total: usize,
-        name: String,
-    },
+    MemberStarted { name: String },
     /// A batch member is done, classified by the worker where its error
     /// was still typed.
     MemberDone {
@@ -563,8 +564,10 @@ impl ActiveControl {
     }
 }
 
-/// An in-place mutation waiting for the run loop, because it needs a
-/// password and only the run loop owns the terminal to ask for one.
+/// An in-place mutation waiting for the run loop, because it may need
+/// a password and only the run loop owns the terminal to ask for one.
+/// Whether one is actually wanted depends on sudo's timestamp, which
+/// is sudo's business.
 ///
 /// These are not builds: they take a lock, change one line of the
 /// manifest and a file or two, and are over. The handoff they replace
@@ -643,6 +646,17 @@ impl<T, K: Copy + PartialEq + std::fmt::Debug> BatchRunner<T, K> {
     /// only ever read. Keeping them apart means rewording a panel
     /// cannot silently move where a member's lines are filed.
     fn new(queue: std::collections::VecDeque<T>, sections: &[(K, &'static str)]) -> Self {
+        // A key declared twice would make `record` file everything into
+        // the first and leave the second permanently empty — quiet, and
+        // exactly the kind of quiet the panic in `record` exists to
+        // prevent.
+        debug_assert!(
+            sections
+                .iter()
+                .enumerate()
+                .all(|(i, (key, _))| !sections[..i].iter().any(|(seen, _)| seen == key)),
+            "a batch section key was declared twice"
+        );
         Self {
             total: queue.len(),
             queue,
@@ -834,7 +848,11 @@ enum StartOutcome {
 
 /// What the escalation preflight found; see `preflight_escalation`.
 enum Preflight {
-    /// No escalation ahead, or credentials validated and warm.
+    /// Nothing to authorize *before this work starts*: either no
+    /// privileged step precedes it, or credentials are validated and
+    /// warm. Not a promise that no password will be wanted later — a
+    /// build's placement asks at its own door, after the build, which
+    /// is the point of that door.
     Ready,
     /// sudo validated but does not cache credentials: a captured
     /// `sudo -n` would be asked a question it cannot voice.
@@ -980,13 +998,6 @@ enum Job {
         rx: Receiver<Result<Vec<api::Hit>>>,
         cancel: CancelFlag,
     },
-    /// The candidate lookup behind `D`: a read-only question to the
-    /// index, cancellable like every other one-shot. The choice it
-    /// feeds is a value for an action already chosen, not a browser.
-    /// `u`'s lookup: what the registry says now, for one crate. The
-    /// interface's own row is a snapshot of the last `r`, and an update
-    /// is worth planning against the registry rather than against
-    /// whatever was true an hour ago.
     /// `U`'s plan: the registry asked about every unpinned entry. The
     /// longest thing this tool does without building, and cancellable
     /// down to the individual request.
@@ -1000,18 +1011,27 @@ enum Job {
         rx: Receiver<Result<Vec<(String, crate::ReinstallPlan)>>>,
         cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
     },
+    /// `u`'s lookup: what the registry says now, for one crate. The
+    /// interface's own row is a snapshot of the last `r`, and an update
+    /// is worth planning against the registry rather than against
+    /// whatever was true an hour ago.
     UpdatePlan {
         name: String,
         rx: Receiver<Result<crate::UpdatePlan>>,
         cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
     },
+    /// The candidate lookup behind `D`: a read-only question to the
+    /// index, cancellable like every other one-shot. The choice it
+    /// feeds is a value for an action already chosen, not a browser.
     Downgrade {
         name: String,
         current: String,
         rx: Receiver<Result<Vec<Version>>>,
         cancel: CancelFlag,
     },
-    /// A captured single-crate install streaming over `rx`.
+    /// A captured build streaming over `rx`: an install, an update, a
+    /// reinstall, a downgrade, a migration, or one member of a batch or
+    /// sweep. What it is building is in `kind`.
     Build {
         name: String,
         rx: Receiver<BuildMsg>,
@@ -1246,8 +1266,8 @@ pub struct App {
     /// A running `M` batch; `finish_build` feeds it, `c` ends it.
     migrate_batch: Option<MigrateBatch>,
     install_batch: Option<InstallBatch>,
-    /// Asked for, not yet started: starting needs the terminal, which
-    /// only the run loop has.
+    /// Asked for, not yet started: the preflight may need the terminal,
+    /// which only the run loop has.
     pending_install_batch: Option<(Vec<String>, bool)>,
     pending_reinstall_sweep: Option<Vec<(String, crate::ReinstallPlan)>>,
     pending_update_sweep: Option<Vec<crate::PlannedUpdate>>,
@@ -1272,7 +1292,9 @@ pub struct App {
     pub report_scroll_max: std::cell::Cell<u16>,
     pub show_help: bool,
     pending: Option<PendingAction>,
-    /// A captured install waiting for the run loop (sudo preauth first).
+    /// A captured build waiting for the run loop, which owns the
+    /// terminal the preflight may need. Not a preauthorization of the
+    /// placement to come: that asks at its own door, after the build.
     pending_build: Option<PendingBuild>,
     job: Option<Job>,
     /// Frame counter; drives the gauge spinner.
@@ -1440,8 +1462,11 @@ impl App {
         matches!(self.job, Some(Job::Build { .. }))
     }
 
-    /// A one-shot (check, verify, search) holds the slot; the footer
-    /// advertises its cancel door.
+    /// A read-only or planning job — an update check, a verify, a
+    /// search, or the lookups behind `D`, `u`, `U` and `T` — holds the
+    /// slot; the footer advertises its cancel door. Named by what they
+    /// are rather than listed, so the next one does not make this
+    /// sentence false.
     pub fn oneshot_running(&self) -> bool {
         matches!(
             self.job,
@@ -1562,6 +1587,18 @@ impl App {
         };
         let frame = FRAMES[self.ticks % FRAMES.len()];
         let elapsed = format_elapsed(started.elapsed());
+        // Which member of a batch this is, for as long as it is that
+        // member. It used to be written into `status_note`, where the
+        // first line of cargo output replaced it — so the panel said
+        // "3 crates" for the twelve minutes that mattered and named the
+        // crate for about a second.
+        let member = self.install_batch.as_ref().and_then(|batch| {
+            batch
+                .current
+                .as_ref()
+                .map(|name| format!("[{}/{}] {name}", batch.attempted, batch.runner.total))
+        });
+        let name = member.as_deref().unwrap_or(name.as_str());
         // A pipeline notice is the live truth — "waiting for the state
         // lock..." beats a gauge frozen at zero; the clock runs through it.
         if let Some(note) = status_note {
@@ -1693,7 +1730,7 @@ impl App {
             PendingAction::Install { crates, locked } => {
                 // The interface's install line takes a crate spec, not
                 // flags: `--reinstall` is not typed here, it has its own
-                // key (`t`), and `--all` is `T`'s handoff.
+                // key (`t`), and `--all` is `T`'s terminal fallback.
                 crate::cmd_install(&self.prefix, crates, *locked, false)
             }
             PendingAction::Remove(name) => {
@@ -1804,9 +1841,14 @@ impl App {
     /// scheduling a handoff here would make `Refused` a lie for anyone
     /// downstream who believed it.
     ///
-    /// Captured placement runs `sudo -n`; a non-caching sudo would be
-    /// asked a question it cannot voice, so the work falls back to the
-    /// terminal instead of a doomed build. A downgrade hands over *as a
+    /// What is checked here is only what cannot wait: preparing a
+    /// prefix's first lock file, which happens before any build. A
+    /// non-caching sudo found *there* means the whole operation belongs
+    /// in the terminal, since nothing has been built yet. Placement is
+    /// not preauthorized: it asks at its own door after the build, so
+    /// on a non-caching sudo the refusal arrives then — deliberately,
+    /// because the alternative is a password for work that may never
+    /// finish. A downgrade hands over *as a
     /// downgrade*: `install NAME@VERSION` there would place the same
     /// version without the premise check, and the command that owns
     /// that check is the one to run — it asks for a version again,
@@ -1850,7 +1892,7 @@ impl App {
         }
     }
 
-    /// A captured install. The run loop calls this because only it owns
+    /// A captured build. The run loop calls this because only it owns
     /// the terminal: whatever the preflight still has to ask happens
     /// here, on a suspended screen — never inside the alternate one.
     /// Start one build, or say why none started.
@@ -2655,7 +2697,7 @@ impl App {
         }
     }
 
-    /// A finished captured install: reload, then speak in the pipeline's
+    /// A finished captured build: reload, then speak in the pipeline's
     /// own words when it left any.
     fn finish_build(
         &mut self,
@@ -2982,9 +3024,10 @@ impl App {
             }
             KeyCode::Char('i') => self.open_input(InputPurpose::Install),
             KeyCode::Enter | KeyCode::Char('u') => self.start_update(),
-            // No gate at all: `update --all` reads the manifest and asks the
-            // index itself — a stale "0 updates" must not stop a command that
-            // would find two. If there is nothing to do, the command says so.
+            // No gate on the rows: the sweep reads the manifest and asks
+            // the registry itself, so a stale "0 updates" cannot stop a
+            // plan that would find two. If there is nothing to do, it
+            // says which — up to date, or held back by pins.
             KeyCode::Char('U') => self.start_update_sweep(),
             // Toggle from what the row shows; the command re-reads under the
             // lock, so a pin changed elsewhere is reported, not overwritten.
@@ -2993,14 +3036,14 @@ impl App {
             // supply, so the keypress is the whole interaction. The
             // build runs in the panel like any single-crate install.
             KeyCode::Char('t') => self.start_reinstall(),
-            // Every entry under this prefix. A sweep shows a plan and
-            // asks, and that conversation belongs to the terminal — the
-            // same reason `U` hands over.
+            // Every entry under this prefix: the plan is read, shown
+            // and confirmed here, and the rebuilds run in the panel one
+            // at a time.
             KeyCode::Char('T') => self.start_reinstall_sweep(),
             // The version choice happens here: a known action wanting one
             // value, which is what this interface is for. The build that
-            // follows runs in the panel, with `c` and the warning record
-            // the terminal handoff could not give it.
+            // follows runs in the panel, with its cancel door and its
+            // warning record.
             KeyCode::Char('D') => self.start_downgrade(),
             KeyCode::Char('x') => self.remove_selected(),
             KeyCode::Char('B') => self.jump_to_other_prefix(),
@@ -3157,8 +3200,9 @@ impl App {
         }
     }
 
-    /// `p`: pin or unpin — a manifest write, so the same shape decision
-    /// as `x`, made at the keypress (its own `y`). Escalation queues the
+    /// `p`: pin or unpin — a manifest write, so the same privilege
+    /// question as `x`, answered at the keypress (there is no `y`: a
+    /// toggle that is wrong is undone by pressing it again). Escalation queues the
     /// mutation for the run loop's door, not a handoff: the most
     /// trivial mutation least deserves a screen flip, and a password
     /// prompt is not a reason to leave. The running guard is the
@@ -3174,8 +3218,8 @@ impl App {
             return;
         }
         let policy = crate::privileged::Policy::for_prefix(&self.prefix);
-        // The state half only: a pin never touches bin, and a read-only bin
-        // must not force a handoff for it.
+        // The state half only: a pin never touches bin, so a read-only
+        // bin must not make it privileged.
         let escalate = match crate::state_needs_privilege(policy, &self.prefix) {
             Ok(escalate) => escalate,
             Err(e) => {
@@ -3192,8 +3236,8 @@ impl App {
         self.apply_set_pinned(&name, pinned);
     }
 
-    /// An in-place mutation that needs a password: borrow the screen for
-    /// the prompt, then do the work here.
+    /// An in-place mutation that may need a password: borrow the screen
+    /// if one is wanted, then do the work here.
     ///
     /// The same preflight gate every privileged step uses — ask, then
     /// check again — because the privileged calls downstream run
@@ -3495,7 +3539,14 @@ impl App {
                         intent: BuildIntent::Install,
                     });
                 }
-                Ok((crates, locked)) => self.queue(PendingAction::Install { crates, locked }),
+                // Unreachable: `parse_install_input` refuses an empty
+                // line, so the two arms above cover every parse. Said
+                // as an assertion rather than answered with a handoff
+                // that would be neither reachable nor right.
+                Ok((crates, _)) => {
+                    debug_assert!(crates.is_empty(), "a non-empty plan has its own arm");
+                    self.error("no crate name given");
+                }
                 Err(e) => self.error(&format!("{e:#}")),
             },
             InputPurpose::Search => match parse_search_input(buffer) {
@@ -3514,17 +3565,6 @@ impl App {
             purpose,
             buffer: String::new(),
         });
-    }
-
-    /// Queues a terminal-taking command behind a notice, so the notice
-    /// renders before the screen is handed over.
-    fn queue(&mut self, action: PendingAction) {
-        if self.job.is_some() {
-            self.error("busy; wait for the current job to finish");
-            return;
-        }
-        self.info(&format!("running {}…", action_label(&action)));
-        self.pending = Some(action);
     }
 
     /// `r`: `checkupdate` on a thread; the report is written on the main
@@ -3747,7 +3787,6 @@ impl App {
         let (auth_tx, auth_rx) = mpsc::channel();
         let prefix = self.prefix.clone();
         Self::spawn_batch(
-            total,
             std::sync::Arc::clone(&control),
             tx,
             auth_rx,
@@ -3784,7 +3823,6 @@ impl App {
     /// The batch's worker thread: it owns the lock, the manifest and the
     /// order, and speaks only through the channel.
     fn spawn_batch(
-        total: usize,
         control: std::sync::Arc<crate::BatchControl>,
         tx: Sender<BuildMsg>,
         auth_rx: Receiver<AuthAnswer>,
@@ -3826,10 +3864,8 @@ impl App {
                     })
             };
             let mut step = |step: crate::BatchStep| match step {
-                crate::BatchStep::Started { index, name } => {
+                crate::BatchStep::Started { name, .. } => {
                     let _ = step_tx.send(BuildMsg::MemberStarted {
-                        index,
-                        total,
                         name: name.to_owned(),
                     });
                 }
@@ -3903,7 +3939,6 @@ impl App {
         let (auth_tx, auth_rx) = mpsc::channel();
         let prefix = self.prefix.clone();
         Self::spawn_batch(
-            total,
             std::sync::Arc::clone(&control),
             tx,
             auth_rx,
@@ -4035,7 +4070,6 @@ impl App {
         let (auth_tx, auth_rx) = mpsc::channel();
         let prefix = self.prefix.clone();
         Self::spawn_batch(
-            total,
             std::sync::Arc::clone(&control),
             tx,
             auth_rx,
@@ -4521,7 +4555,7 @@ impl App {
                         // what became of the member that just ended.
                         // Only a batch sends them; a single build has
                         // no members to frame.
-                        Ok(BuildMsg::MemberStarted { index, total, name }) => {
+                        Ok(BuildMsg::MemberStarted { name }) => {
                             // A new member's scope: its own warnings and
                             // its own tail. What was said before the
                             // first member belongs to the plan and is
@@ -4530,7 +4564,11 @@ impl App {
                                 batch.begin_member(&name, std::mem::take(&mut warnings));
                             }
                             tail.clear();
-                            status_note = Some(format!("[{}/{total}] {name}", index + 1));
+                            // The member's name lives in the batch now,
+                            // where the label reads it every frame; a
+                            // note here would last until cargo's first
+                            // line and no longer.
+                            status_note = None;
                         }
                         Ok(BuildMsg::MemberDone { name, outcome }) => {
                             let spoken = std::mem::take(&mut warnings);
@@ -6174,6 +6212,55 @@ mod tests {
         assert!(
             !said.contains("not attempted"),
             "and left nobody unattempted: {said}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A batch's label names the member for as long as that member is
+    /// building. It used to be a status note, which cargo's first line
+    /// replaced — so the panel named the crate for about a second and
+    /// said "3 crates" for the twelve minutes that mattered.
+    #[test]
+    fn a_batch_label_names_the_member_it_is_building() {
+        let root = std::env::temp_dir().join("cargo-lbin-test-tui-batch-label");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let mut app = App::new(&root).unwrap();
+        let mut runner: BatchRunner<(), InstallSection> =
+            BatchRunner::new(std::collections::VecDeque::new(), INSTALL_SECTIONS);
+        runner.total = 3;
+        let mut batch = InstallBatch {
+            runner,
+            shape: BatchShape::List,
+            current: None,
+            attempted: 0,
+            plan_warnings: Vec::new(),
+        };
+        batch.begin_member("bar", Vec::new());
+        app.install_batch = Some(batch);
+        let (_tx, rx) = mpsc::channel();
+        let (auth_tx, _auth_rx) = mpsc::channel();
+        app.job = Some(Job::Build {
+            name: "3 crates".to_owned(),
+            rx,
+            auth_tx,
+            units_started: 7,
+            current: Some("serde".to_owned()),
+            tail: VecDeque::new(),
+            status_note: None,
+            warnings: Vec::new(),
+            started: std::time::Instant::now(),
+            needs_auth: None,
+            control: ActiveControl::Single(std::sync::Arc::new(crate::BuildControl::new())),
+            kind: BuildKind::Install,
+            cancel_deadline: None,
+        });
+
+        let label = app.build_progress().expect("a running build has a line");
+        assert!(label.contains("[1/3] bar"), "which member: {label}");
+        assert!(
+            !label.contains("3 crates"),
+            "not the batch's bare size: {label}"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
