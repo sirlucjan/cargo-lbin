@@ -2805,21 +2805,7 @@ pub(crate) struct PlannedUpdate {
     pub latest: Version,
 }
 
-/// What `U`'s check found, and what it did not ask about.
-///
-/// The pinned count is part of the answer, not a detail: a sweep that
-/// asked about nothing because everything was pinned must not report
-/// that everything is up to date. It checked nothing, and "up to date"
-/// is a fact about the registry it never consulted.
-#[cfg(feature = "tui")]
-pub(crate) struct SweepPlan {
-    pub planned: Vec<PlannedUpdate>,
-    /// Entries left out of the plan by their own standing instruction.
-    pub pinned: usize,
-}
-
-/// `U`'s plan: every unpinned entry the registry has something newer
-/// for.
+/// `U`'s check: what the registry says about every entry here.
 ///
 /// Pinned crates are not in the plan at all, as in the CLI: a pin is a
 /// standing instruction, and a sweep that refused once per pinned crate
@@ -2832,7 +2818,7 @@ pub(crate) struct SweepPlan {
 pub(crate) fn tui_update_sweep_plan(
     prefix: &Path,
     should_cancel: &dyn Fn() -> bool,
-) -> Result<Option<SweepPlan>> {
+) -> Result<Option<Vec<Checked>>> {
     let manifest = {
         let _lock = StateLock::acquire_with(
             prefix,
@@ -2842,22 +2828,7 @@ pub(crate) fn tui_update_sweep_plan(
         )?;
         Manifest::load(prefix)?
     };
-    let (unpinned, pinned): (Vec<_>, Vec<_>) = manifest.crates.iter().partition(|(_, e)| !e.pinned);
-    let Some(checked) = check_versions(unpinned, should_cancel)? else {
-        return Ok(None);
-    };
-    Ok(Some(SweepPlan {
-        planned: checked
-            .into_iter()
-            .filter(Checked::is_outdated)
-            .map(|c| PlannedUpdate {
-                name: c.name,
-                current: c.current.to_string(),
-                latest: c.latest,
-            })
-            .collect(),
-        pinned: pinned.len(),
-    }))
+    check_versions(&manifest.crates, should_cancel)
 }
 
 /// `update --all` for the captured frontend: the confirmed plan,

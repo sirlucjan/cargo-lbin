@@ -136,14 +136,13 @@ impl ListCrate {
         // which would be wrong when the installed version was yanked since.
         let (status, latest) = Version::parse(&entry.version)
             .ok()
-            .and_then(|current| report?.checked_for(name, &current))
-            .map_or((ListStatus::Unknown, None), |c| {
-                let status = if c.is_outdated() {
-                    ListStatus::Outdated
-                } else {
-                    ListStatus::UpToDate
+            .and_then(|current| report?.record_for(name, &current))
+            .map_or((ListStatus::Unknown, None), |(checked, status)| {
+                let status = match status {
+                    crate::report::Status::Outdated(_) => ListStatus::Outdated,
+                    crate::report::Status::UpToDate => ListStatus::UpToDate,
                 };
-                (status, Some(c.latest.clone()))
+                (status, Some(checked.latest.clone()))
             });
         Self {
             name: name.to_owned(),
@@ -314,7 +313,11 @@ mod tests {
                     current: v("0.26.0"),
                     latest: v("0.26.1"),
                 },
-                // Checked against an older fd: updated since → unknown.
+                // Checked against an older fd, and updated since to the
+                // very version this report named: the report can answer
+                // that one, and every surface must answer it the same
+                // way — this golden is where a JSON view drifting from
+                // the list and the interface would show up.
                 Checked {
                     name: "fd".to_owned(),
                     current: v("10.2.0"),
@@ -415,6 +418,46 @@ mod tests {
     /// The representation as emitted, byte for byte: editing this test is
     /// expected when a field is added; a schema bump only when an existing
     /// field changes.
+    /// The three surfaces answer the same question the same way. This
+    /// one is easy to forget, because JSON has no screen to notice on:
+    /// after `U` installs the update a report named, a script asking
+    /// `list --json` must see what the list and the interface see.
+    #[test]
+    fn json_reads_the_report_the_way_every_other_surface_does() {
+        let report = Report::new(
+            Path::new("/usr/local"),
+            vec![Checked {
+                name: "fd".to_owned(),
+                current: Version::parse("10.2.0").unwrap(),
+                latest: Version::parse("10.3.0").unwrap(),
+            }],
+        )
+        .unwrap();
+        let entry = crate::manifest::Entry {
+            version: "10.3.0".to_owned(),
+            bins: vec!["fd".to_owned()],
+            locked: false,
+            pinned: false,
+        };
+
+        let updated = ListCrate::annotated("fd", &entry, Some(&report));
+        assert!(matches!(updated.status, ListStatus::UpToDate));
+        assert_eq!(
+            updated.latest.map(|v| v.to_string()),
+            Some("10.3.0".to_owned()),
+            "the version the report named is still what it named"
+        );
+
+        // And past what the report saw, JSON says unknown like the rest.
+        let past = crate::manifest::Entry {
+            version: "10.4.0".to_owned(),
+            ..entry
+        };
+        let beyond = ListCrate::annotated("fd", &past, Some(&report));
+        assert!(matches!(beyond.status, ListStatus::Unknown));
+        assert!(beyond.latest.is_none(), "absent knowledge, not a guess");
+    }
+
     #[test]
     fn list_output_golden() {
         let out = ListOutput::build(
@@ -448,8 +491,8 @@ mod tests {
       ],
       "locked": true,
       "pinned": false,
-      "status": "unknown",
-      "latest": null
+      "status": "up_to_date",
+      "latest": "10.3.0"
     },
     {
       "name": "ripgrep",

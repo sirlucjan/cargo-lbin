@@ -998,11 +998,12 @@ enum Job {
         rx: Receiver<Result<Vec<api::Hit>>>,
         cancel: CancelFlag,
     },
-    /// `U`'s plan: the registry asked about every unpinned entry. The
+    /// `U`'s check: the registry asked about every entry here, pinned
+    /// included — it is an update check and leaves one behind. The
     /// longest thing this tool does without building, and cancellable
     /// down to the individual request.
     UpdateSweepPlan {
-        rx: Receiver<Result<Option<crate::SweepPlan>>>,
+        rx: Receiver<Result<Option<Vec<Checked>>>>,
         cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
     },
     /// `T`'s plan: every managed entry, frozen. No network — the sweep
@@ -3971,8 +3972,8 @@ impl App {
         Ok(())
     }
 
-    /// `U`: ask the registry about every unpinned entry, then ask the
-    /// person about what it found.
+    /// `U`: ask the registry about every entry, leave the answer where
+    /// `r` leaves it, then ask the person about what can be updated.
     ///
     /// The cancel token exists before the worker does, so `c` stops the
     /// remaining index requests rather than only discarding the answers
@@ -4001,19 +4002,43 @@ impl App {
     /// What the check found: nothing to do, or a plan to read and
     /// answer. Shown in full for the same reason `T`'s is — a count is
     /// not a plan.
-    fn finish_update_sweep_plan(&mut self, plan: crate::SweepPlan) {
-        let crate::SweepPlan { planned, pinned } = plan;
+    fn finish_update_sweep_plan(&mut self, result: Result<Option<Vec<Checked>>>) {
+        // It is an update check, so it leaves an update check behind:
+        // the same report `r` writes, applied to the list and persisted
+        // for the next session. Asking the registry about forty crates
+        // and then leaving the list saying "not checked · checked 2d
+        // ago" would be throwing away a fact the tool had in hand.
+        // A cancelled or failed check plans nothing: the rows still hold
+        // the *previous* check, and asking "update these three?" from it
+        // would be asking about a world nobody just looked at.
+        if !self.finish_check(result) {
+            return;
+        }
+        // The plan is what the fresh report says, minus the pins: a
+        // standing instruction, not a gap in knowledge, which is why
+        // they were checked and are reported separately.
+        let planned: Vec<crate::PlannedUpdate> = self
+            .rows
+            .iter()
+            .filter(|row| !row.pinned)
+            .filter_map(|row| match &row.status {
+                RowStatus::Outdated(latest) => Some(crate::PlannedUpdate {
+                    name: row.name.clone(),
+                    current: row.version.clone(),
+                    latest: latest.clone(),
+                }),
+                _ => None,
+            })
+            .collect();
+        let held = self.pinned_outdated();
         if planned.is_empty() {
-            // Pinned crates were never asked about, so "everything is
-            // up to date" would be a claim about a registry this sweep
-            // did not consult for them.
-            if pinned > 0 {
+            if held > 0 {
                 self.info(&format!(
-                    "nothing to update; {pinned} pinned crate(s) held back"
+                    "nothing to update; {held} pinned crate(s) held back"
                 ));
-            } else {
-                self.info("everything under this prefix is up to date");
             }
+            // Otherwise `finish_check`'s own "0 update(s) available"
+            // already said it, and said it with the count.
             return;
         }
         let lines: Vec<String> = planned
@@ -4021,13 +4046,13 @@ impl App {
             .map(|p| crate::text::sanitize(&format!("{} {} -> {}", p.name, p.current, p.latest)))
             .collect();
         let prompt = format!("update {} crate(s)? [y/N]", planned.len());
-        let held = if pinned > 0 {
-            format!(" ({pinned} pinned held back)")
+        let backlog = if held > 0 {
+            format!(" ({held} pinned held back)")
         } else {
             String::new()
         };
         self.pin_report(BuildReport {
-            title: format!("update plan: {} crate(s){held}", planned.len()),
+            title: format!("update plan: {} crate(s){backlog}", planned.len()),
             lines,
             failed: false,
         });
@@ -4357,11 +4382,7 @@ impl App {
                     if cancel.load(std::sync::atomic::Ordering::Relaxed) {
                         self.info("update check cancelled");
                     } else {
-                        match result {
-                            Ok(Some(plan)) => self.finish_update_sweep_plan(plan),
-                            Ok(None) => self.info("update check cancelled"),
-                            Err(e) => self.error(&format!("{e:#}")),
-                        }
+                        self.finish_update_sweep_plan(result);
                     }
                 }
                 Err(TryRecvError::Empty) => {
@@ -4622,37 +4643,41 @@ impl App {
     /// Same semantics as `checkupdate`: reaching the index is success
     /// even if the report could not persist — shown from memory, the
     /// persistence failure a warning.
-    fn finish_check(&mut self, result: Result<Option<Vec<Checked>>>) {
+    /// `true` only when a fresh report was built and applied — a
+    /// cancel, a failure or a degraded manifest all answer `false`,
+    /// because a caller that goes on to plan from `self.rows` would
+    /// otherwise be planning from the *previous* check.
+    fn finish_check(&mut self, result: Result<Option<Vec<Checked>>>) -> bool {
         let checked = match result {
             // `Ok(None)` is the worker honoring the cancel between index
             // requests: no report to build, nothing to persist — the
             // partial answer is discarded, not stored as if complete.
             Ok(None) => {
                 self.info("update check cancelled");
-                return;
+                return false;
             }
             Ok(Some(checked)) => checked,
             Err(e) => {
                 self.error(&format!("update check failed: {e:#}"));
-                return;
+                return false;
             }
         };
         let report = match Report::new(&self.prefix, checked) {
             Ok(report) => report,
             Err(e) => {
                 self.error(&format!("update check failed: {e:#}"));
-                return;
+                return false;
             }
         };
         let persisted = report.store(&self.cache);
         match self.apply_report(Some(&report)) {
             Err(e) => {
                 self.error(&format!("reload failed: {e:#}"));
-                return;
+                return false;
             }
             // "checked: 0 update(s)" over a manifest that refused to load would
             // be an invented number.
-            Ok(ReloadOutcome::Degraded) => return,
+            Ok(ReloadOutcome::Degraded) => return false,
             Ok(ReloadOutcome::Loaded) => {}
         }
         let n = self.updates_available();
@@ -4668,6 +4693,7 @@ impl App {
             Ok(()) => self.info(&format!("checked: {summary}")),
             Err(e) => self.warn(&format!("checked: {summary}; report not saved: {e:#}")),
         }
+        true
     }
 
     /// Installed marks are read from the manifest *now*, not from the
@@ -4889,7 +4915,12 @@ mod tests {
 
     #[test]
     fn rows_carry_three_way_status() {
-        let m = manifest(&[("bat", "0.26.0"), ("fd", "10.3.0"), ("ripgrep", "14.1.1")]);
+        let m = manifest(&[
+            ("bat", "0.26.0"),
+            ("fd", "10.3.0"),
+            ("ripgrep", "14.1.1"),
+            ("sd", "1.2.0"),
+        ]);
         let report = Report::new(
             Path::new("/p"),
             vec![
@@ -4903,11 +4934,20 @@ mod tests {
                     current: v("14.1.1"),
                     latest: v("14.1.1"),
                 },
-                // Checked against an older version: fd was updated since.
+                // Checked against an older version, and updated since to
+                // exactly the version this report named: the report can
+                // answer that one.
                 Checked {
                     name: "fd".to_owned(),
                     current: v("10.2.0"),
                     latest: v("10.3.0"),
+                },
+                // Checked against an older version and updated past it,
+                // to something this report never saw.
+                Checked {
+                    name: "sd".to_owned(),
+                    current: v("1.0.0"),
+                    latest: v("1.1.0"),
                 },
             ],
         )
@@ -4916,8 +4956,13 @@ mod tests {
         let status: Vec<(&str, &RowStatus)> =
             rows.iter().map(|r| (r.name.as_str(), &r.status)).collect();
         assert_eq!(status[0], ("bat", &RowStatus::Outdated(v("0.26.1"))));
-        assert_eq!(status[1], ("fd", &RowStatus::Unknown));
+        // Installed at the version the report named: current, by this
+        // report's own answer — which is what keeps a list from
+        // blanking the moment `U` lands its updates.
+        assert_eq!(status[1], ("fd", &RowStatus::UpToDate));
         assert_eq!(status[2], ("ripgrep", &RowStatus::UpToDate));
+        // Installed past what the report saw: unknown, and says so.
+        assert_eq!(status[3], ("sd", &RowStatus::Unknown));
 
         // No report at all: everything unknown, nothing claimed.
         let rows = rows_from(&m, None, &std::collections::BTreeMap::new());
@@ -6023,76 +6068,57 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// `U` shows what it found and asks about it; nothing to do is an
-    /// answer. The plan panel is the question's own, so it scrolls and
-    /// leaves with it.
+    /// `U` leaves an update check behind and asks about what it found.
+    /// Pinned crates are checked like the rest — the list must not say
+    /// "not checked" about a crate the tool just asked after — and then
+    /// left out of the plan, which is what a pin means.
     #[test]
-    fn an_update_sweep_shows_its_plan_and_asks() {
+    fn an_update_sweep_reports_what_it_checked_and_plans_what_it_may() {
         let root = std::env::temp_dir().join("cargo-lbin-test-tui-update-sweep-plan");
         let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(root.join("bin")).unwrap();
+        std::fs::create_dir_all(root.join("share/cargo-lbin")).unwrap();
+        let mut m = manifest(&[("foo", "1.0.0"), ("bar", "1.0.0"), ("held", "1.0.0")]);
+        m.crates.get_mut("held").unwrap().pinned = true;
+        m.store(&root).unwrap();
         let mut app = App::new(&root).unwrap();
 
-        // Nothing outdated and nothing held back: a fact the check
-        // established for every entry.
-        app.finish_update_sweep_plan(crate::SweepPlan {
-            planned: Vec::new(),
-            pinned: 0,
-        });
-        assert!(app.confirm.is_none(), "nothing to ask about");
-        assert!(
-            app.message
-                .as_ref()
-                .is_some_and(|m| m.text.contains("up to date"))
-        );
-
-        // Nothing outdated because nothing was asked: the sweep says
-        // which, rather than claiming a registry it never consulted.
-        app.finish_update_sweep_plan(crate::SweepPlan {
-            planned: Vec::new(),
-            pinned: 3,
-        });
-        let said = app.message.as_ref().expect("an answer").text.clone();
-        assert!(
-            said.contains("nothing to update") && said.contains("3 pinned"),
-            "{said}"
-        );
-        assert!(
-            !said.contains("up to date"),
-            "which would be a claim about crates it never checked: {said}"
-        );
-
-        let planned: Vec<crate::PlannedUpdate> = ["foo", "bar"]
+        let checked: Vec<Checked> = [("foo", "2.0.0"), ("bar", "1.0.0"), ("held", "2.0.0")]
             .into_iter()
-            .map(|name| crate::PlannedUpdate {
+            .map(|(name, latest)| Checked {
                 name: name.to_owned(),
-                current: "1.0.0".to_owned(),
-                latest: Version::parse("2.0.0").unwrap(),
+                current: Version::parse("1.0.0").unwrap(),
+                latest: Version::parse(latest).unwrap(),
             })
             .collect();
-        app.finish_update_sweep_plan(crate::SweepPlan { planned, pinned: 1 });
+        app.finish_update_sweep_plan(Ok(Some(checked)));
 
-        let shown = app.build_report.as_ref().expect("the plan is on screen");
+        // Every checked crate now has a status, pinned included.
         assert!(
-            shown.lines.iter().any(|l| l.contains("foo 1.0.0 -> 2.0.0")),
-            "with both ends of each member: {:?}",
-            shown.lines
+            app.rows
+                .iter()
+                .all(|r| !matches!(r.status, RowStatus::Unknown)),
+            "the check it just ran is what the list shows"
+        );
+        // And the plan is the unpinned outdated ones.
+        let plan = app.build_report.as_ref().expect("a plan is shown");
+        assert!(
+            plan.lines.iter().any(|l| l.contains("foo 1.0.0 -> 2.0.0")),
+            "{:?}",
+            plan.lines
+        );
+        assert!(
+            !plan.lines.iter().any(|l| l.contains("held")),
+            "a pin is a standing instruction, not a gap: {:?}",
+            plan.lines
+        );
+        assert!(
+            plan.title.contains("1 pinned held back"),
+            "and the backlog is named: {}",
+            plan.title
         );
         let confirm = app.confirm.as_ref().expect("and a question");
         assert!(confirm.owns_report(), "which owns that panel");
-        assert!(
-            confirm.prompt.contains("update 2 crate(s)"),
-            "{}",
-            confirm.prompt
-        );
-
-        app.on_key_confirm(KeyEvent::from(KeyCode::Char('y')));
-        assert_eq!(
-            app.pending_update_sweep.as_ref().map(Vec::len),
-            Some(2),
-            "the confirmed plan travels, not a fresh check"
-        );
-        assert!(app.pending.is_none(), "and no handoff");
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -6130,6 +6156,37 @@ mod tests {
         assert!(
             matches!(&op, PendingInPlace::SetPinned { name, pinned } if name == "foo" && *pinned),
             "the operation travels whole"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A check that did not happen plans nothing. The rows still hold
+    /// the previous check, and asking "update these three?" from them
+    /// would be asking about a world nobody just looked at.
+    #[test]
+    fn a_cancelled_or_failed_check_asks_nothing() {
+        let root = std::env::temp_dir().join("cargo-lbin-test-tui-sweep-nocheck");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("bin")).unwrap();
+        std::fs::create_dir_all(root.join("share/cargo-lbin")).unwrap();
+        manifest(&[("foo", "1.0.0")]).store(&root).unwrap();
+        let mut app = App::new(&root).unwrap();
+        // A previous check left `foo` looking outdated.
+        app.rows = rows_from(&manifest(&[("foo", "1.0.0")]), None, &BTreeMap::new());
+        app.rows[0].status = RowStatus::Outdated(Version::parse("2.0.0").unwrap());
+
+        app.finish_update_sweep_plan(Ok(None));
+        assert!(app.confirm.is_none(), "a cancelled check asks nothing");
+        assert!(app.build_report.is_none(), "and shows no plan");
+
+        app.finish_update_sweep_plan(Err(anyhow::anyhow!("network down")));
+        assert!(app.confirm.is_none(), "nor does a failed one");
+        assert!(app.build_report.is_none());
+        assert!(
+            app.message
+                .as_ref()
+                .is_some_and(|m| m.text.contains("network down")),
+            "which says why"
         );
         let _ = std::fs::remove_dir_all(&root);
     }

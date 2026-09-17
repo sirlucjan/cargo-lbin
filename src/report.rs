@@ -149,15 +149,43 @@ impl Report {
     }
 
     /// What the report says about `name` as installed *now*: `None` when
-    /// unchecked or checked against a different version — nothing is what
-    /// the caller must show, not a stale checkmark.
+    /// unchecked, or installed at a version this report cannot speak
+    /// about — nothing is what the caller must show, not a stale
+    /// checkmark.
+    ///
+    /// It can speak about two versions: the one it checked, and the
+    /// update it named. Installing the update the report itself pointed
+    /// at leaves the crate current *by this report*, which is why an
+    /// update does not blank the list until the next check.
     pub fn status_for(&self, name: &str, current: &Version) -> Option<Status<'_>> {
-        let checked = self.checked_for(name, current)?;
-        Some(if checked.is_outdated() {
-            Status::Outdated(&checked.latest)
-        } else {
-            Status::UpToDate
-        })
+        self.record_for(name, current).map(|(_, status)| status)
+    }
+
+    /// The record behind the status, for callers that need both.
+    ///
+    /// One implementation of the rule, because there are three surfaces
+    /// asking it — the list, the interface and the JSON views — and a
+    /// second copy is how two of them come to disagree about the same
+    /// crate. The rule: a report can speak about the version it checked,
+    /// and about the update it named. Installing the update the report
+    /// itself pointed at leaves the crate current *by this report*,
+    /// which is why an update does not blank the list until the next
+    /// check. A release that arrived mid-build, a downgrade, or a crate
+    /// it never saw are unknown, and say so.
+    pub fn record_for(&self, name: &str, current: &Version) -> Option<(&Checked, Status<'_>)> {
+        if let Some(checked) = self.checked_for(name, current) {
+            let status = if checked.is_outdated() {
+                Status::Outdated(&checked.latest)
+            } else {
+                Status::UpToDate
+            };
+            return Some((checked, status));
+        }
+        let named = self
+            .crates
+            .iter()
+            .find(|c| c.name == name && c.is_outdated() && c.latest == *current)?;
+        Some((named, Status::UpToDate))
     }
 
     /// The record for `name` as installed now, same exact-version rule as
@@ -184,6 +212,48 @@ pub fn describe_age(age: Duration) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// A report speaks about two versions and no others: the one it
+    /// checked, and the update it named. The second is what keeps the
+    /// list from blanking the moment an update lands — and the limit is
+    /// what keeps it from guessing about anything else.
+    #[test]
+    fn a_report_speaks_about_what_it_checked_and_what_it_named() {
+        let prefix = std::env::temp_dir().join("cargo-lbin-test-report-status-for");
+        let _ = std::fs::remove_dir_all(&prefix);
+        std::fs::create_dir_all(&prefix).unwrap();
+        let report = Report::new(
+            &prefix,
+            vec![Checked {
+                name: "foo".to_owned(),
+                current: Version::parse("1.0.0").unwrap(),
+                latest: Version::parse("2.0.0").unwrap(),
+            }],
+        )
+        .unwrap();
+
+        let at = |v: &str| report.status_for("foo", &Version::parse(v).unwrap());
+        assert!(
+            matches!(at("1.0.0"), Some(Status::Outdated(l)) if l.to_string() == "2.0.0"),
+            "the version it checked"
+        );
+        assert!(
+            matches!(at("2.0.0"), Some(Status::UpToDate)),
+            "the update it named, once installed"
+        );
+        assert!(
+            at("2.0.1").is_none(),
+            "a release that arrived after the check is not this report's to describe"
+        );
+        assert!(at("0.9.0").is_none(), "nor a downgrade");
+        assert!(
+            report
+                .status_for("bar", &Version::parse("1.0.0").unwrap())
+                .is_none(),
+            "nor a crate it never saw"
+        );
+        let _ = std::fs::remove_dir_all(&prefix);
+    }
     use super::*;
 
     fn v(s: &str) -> Version {
@@ -292,8 +362,15 @@ mod tests {
             report.status_for("ripgrep", &v("14.1.1")),
             Some(Status::UpToDate)
         );
-        // Updated since the check: the report is stale for it — unknown.
-        assert_eq!(report.status_for("bat", &v("0.26.1")), None);
+        // Updated since the check, to the very version this report
+        // named: the report can answer that one, because it is its own
+        // answer — as of `checked_at`, 0.26.1 was the newest there was.
+        // Any other version it cannot, and does not.
+        assert_eq!(
+            report.status_for("bat", &v("0.26.1")),
+            Some(Status::UpToDate)
+        );
+        assert_eq!(report.status_for("bat", &v("0.26.2")), None);
         // Installed after the check: never covered — unknown.
         assert_eq!(report.status_for("fd", &v("1.0.0")), None);
     }
