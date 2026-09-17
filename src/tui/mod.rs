@@ -182,6 +182,11 @@ enum OnConfirm {
         /// bless a version the person never confirmed.
         snap: crate::MigrationSnapshot,
     },
+    /// `u`: the plan the person just read. What travels to the build is
+    /// the version the entry had when the question was asked, checked
+    /// under the lock before anything is built; the version the
+    /// question showed was for reading.
+    Update { name: String, expected: String },
     /// `x`: the shape (in place or handoff) is decided fresh at the `y` —
     /// the world may move while the prompt is open.
     Remove { name: String },
@@ -295,6 +300,9 @@ enum BuildOutcome {
 /// this — the worker reports outcomes, never prose.
 enum BuildKind {
     Install,
+    /// The newest release, started by `u` against a plan the person
+    /// saw.
+    Update,
     /// A rebuild of the entry as it stands, started by `t`. Same
     /// pipeline as an install, different word — and a record that
     /// called it an install would describe a version choice nobody
@@ -320,6 +328,7 @@ impl BuildKind {
             BuildKind::Install => "install",
             BuildKind::Downgrade => "downgrade",
             BuildKind::Reinstall => "reinstall",
+            BuildKind::Update => "update",
             // Tuple variant, tuple pattern: a pattern should not lie
             // about the shape.
             BuildKind::Migrate(_) => "migrate",
@@ -827,7 +836,7 @@ impl App {
                 Self::request_oneshot_cancel(cancel);
                 self.info(&note);
             }
-            Some(Job::Downgrade { name, cancel, .. }) => {
+            Some(Job::UpdatePlan { name, cancel, .. } | Job::Downgrade { name, cancel, .. }) => {
                 let note = format!("version lookup for `{name}`: cancel requested…");
                 Self::request_oneshot_cancel(cancel);
                 self.info(&note);
@@ -860,6 +869,15 @@ enum Job {
     /// The candidate lookup behind `D`: a read-only question to the
     /// index, cancellable like every other one-shot. The choice it
     /// feeds is a value for an action already chosen, not a browser.
+    /// `u`'s lookup: what the registry says now, for one crate. The
+    /// interface's own row is a snapshot of the last `r`, and an update
+    /// is worth planning against the registry rather than against
+    /// whatever was true an hour ago.
+    UpdatePlan {
+        name: String,
+        rx: Receiver<Result<crate::UpdatePlan>>,
+        cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    },
     Downgrade {
         name: String,
         current: String,
@@ -930,6 +948,13 @@ impl Job {
                     format!("search `{query}`: cancel requested…")
                 } else {
                     format!("searching crates.io for `{query}`…")
+                }
+            }
+            Job::UpdatePlan { name, cancel, .. } => {
+                if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                    format!("version lookup for `{name}`: cancel requested…")
+                } else {
+                    format!("checking crates.io for an update to `{name}`…")
                 }
             }
             Job::Downgrade { name, cancel, .. } => {
@@ -1020,6 +1045,14 @@ enum BuildIntent {
     /// worker's lock.
     Downgrade(String),
     Reinstall,
+    /// The half of `u`'s plan that governs: what the entry said when the
+    /// question was asked. Only this travels. The target the question
+    /// showed does not — the build asks for "the newest" again, as the
+    /// CLI does, so a release landing while the question waited is
+    /// installed rather than skipped.
+    Update {
+        expected: String,
+    },
 }
 
 /// The versions `D` offers for the selected crate, and the version they
@@ -1266,7 +1299,11 @@ impl App {
         matches!(
             self.job,
             Some(
-                Job::Check { .. } | Job::Verify { .. } | Job::Search { .. } | Job::Downgrade { .. }
+                Job::Check { .. }
+                    | Job::Verify { .. }
+                    | Job::Search { .. }
+                    | Job::Downgrade { .. }
+                    | Job::UpdatePlan { .. }
             )
         )
     }
@@ -1627,6 +1664,10 @@ impl App {
                     // NAME` there would resolve a fresh version, which
                     // is the one thing this operation must not do.
                     BuildIntent::Reinstall => PendingAction::Reinstall(name.to_owned()),
+                    // Handed over as an update: `install NAME` there
+                    // would drop the entry's `--locked`, and
+                    // `install NAME@VERSION` would pin it.
+                    BuildIntent::Update { .. } => PendingAction::Update(name.to_owned()),
                     BuildIntent::Install => PendingAction::Install {
                         crates: vec![req.spec.clone()],
                         locked: req.locked,
@@ -1715,6 +1756,14 @@ impl App {
                     &mut before_placement,
                     &control,
                 ),
+                (BuildIntent::Update { expected }, _) => crate::tui_update_one(
+                    &prefix,
+                    &spec.name,
+                    expected,
+                    &mut on_line,
+                    &mut before_placement,
+                    &control,
+                ),
                 (BuildIntent::Reinstall, _) => crate::tui_reinstall_one(
                     &prefix,
                     &spec.name,
@@ -1758,6 +1807,7 @@ impl App {
             kind: match req.intent {
                 BuildIntent::Downgrade(_) => BuildKind::Downgrade,
                 BuildIntent::Reinstall => BuildKind::Reinstall,
+                BuildIntent::Update { .. } => BuildKind::Update,
                 BuildIntent::Install => BuildKind::Install,
             },
             cancel_deadline: None,
@@ -2483,7 +2533,10 @@ impl App {
                 // destination committed (Migrated's payload), never the
                 // frozen plan's.
                 let note = match kind {
-                    BuildKind::Install | BuildKind::Downgrade | BuildKind::Reinstall => tail
+                    BuildKind::Install
+                    | BuildKind::Downgrade
+                    | BuildKind::Reinstall
+                    | BuildKind::Update => tail
                         .iter()
                         .rev()
                         .find(|l| l.starts_with("installed "))
@@ -2781,11 +2834,7 @@ impl App {
                 }
             }
             KeyCode::Char('i') => self.open_input(InputPurpose::Install),
-            KeyCode::Enter | KeyCode::Char('u') => {
-                if let Some(name) = self.selected_name() {
-                    self.queue(PendingAction::Update(name));
-                }
-            }
+            KeyCode::Enter | KeyCode::Char('u') => self.start_update(),
             // No gate at all: `update --all` reads the manifest and asks the
             // index itself — a stale "0 updates" must not stop a command that
             // would find two. If there is nothing to do, the command says so.
@@ -3141,6 +3190,14 @@ impl App {
         };
         if matches!(key.code, KeyCode::Char('y' | 'Y')) {
             match confirm.action {
+                OnConfirm::Update { name, expected } => {
+                    self.info(&format!("updating {name}…"));
+                    self.pending_build = Some(PendingBuild {
+                        spec: name,
+                        locked: false,
+                        intent: BuildIntent::Update { expected },
+                    });
+                }
                 OnConfirm::Remove { name } => self.remove_confirmed(name),
                 OnConfirm::Migrate {
                     name,
@@ -3566,6 +3623,62 @@ impl App {
     /// crate. Read-only and cancellable, like every other one-shot — the
     /// mutation is the build that a chosen version starts, and nothing
     /// is chosen yet.
+    /// `u`/Enter: plan the update against the registry, then ask.
+    ///
+    /// Not against the row: that is what the last `r` found, and an
+    /// update is worth planning against what the registry says now. The
+    /// CLI does exactly this — look up, show, ask, apply — and the
+    /// interface has no reason to do less. A pinned crate is refused
+    /// before the lookup, with the sentence the CLI uses.
+    fn start_update(&mut self) {
+        if self.anything_running() {
+            self.error("busy; wait for the current job to finish");
+            return;
+        }
+        let Some(name) = self.selected_name() else {
+            return;
+        };
+        self.search_result = None;
+        self.downgrade_choice = None;
+        let (tx, rx) = mpsc::channel();
+        let prefix = self.prefix.clone();
+        let lookup = name.clone();
+        thread::spawn(move || {
+            // Everything the plan rests on is read there: the entry, the
+            // pin, and the registry's answer about that entry. The row
+            // that started this is a picture of an earlier moment.
+            let _ = tx.send(crate::tui_update_plan(&prefix, &lookup));
+        });
+        self.job = Some(Job::UpdatePlan {
+            name,
+            rx,
+            cancel: cancel_flag(),
+        });
+        self.message = None;
+    }
+
+    /// The lookup answered: say there is nothing, or show the plan and
+    /// ask. The plan is one line because one crate is one line.
+    fn finish_update_plan(&mut self, name: String, plan: crate::UpdatePlan) {
+        match plan {
+            // The CLI's words: a stable release can be current while a
+            // pre-release exists, and "newest" would overstate it.
+            crate::UpdatePlan::UpToDate { current } => {
+                self.info(&format!("{name} {current} is up to date"));
+            }
+            crate::UpdatePlan::Outdated { current, latest } => {
+                let prompt = format!("update {name} {current} -> {latest}? [y/N]");
+                self.confirm = Some(Confirm::new(
+                    &prompt,
+                    OnConfirm::Update {
+                        name,
+                        expected: current,
+                    },
+                ));
+            }
+        }
+    }
+
     fn start_downgrade(&mut self) {
         if self.anything_running() {
             self.error("busy; wait for the current job to finish");
@@ -3701,6 +3814,24 @@ impl App {
             return Ok(());
         };
         match job {
+            Job::UpdatePlan { name, rx, cancel } => match rx.try_recv() {
+                Ok(result) => {
+                    if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                        self.info(&format!("version lookup for `{name}` cancelled"));
+                    } else {
+                        match result {
+                            Ok(plan) => self.finish_update_plan(name, plan),
+                            Err(e) => self.error(&format!("{e:#}")),
+                        }
+                    }
+                }
+                Err(TryRecvError::Empty) => {
+                    self.job = Some(Job::UpdatePlan { name, rx, cancel });
+                }
+                Err(TryRecvError::Disconnected) => {
+                    bail!("version lookup worker aborted; the terminal was reset by the panic")
+                }
+            },
             Job::Check { rx, cancel } => match rx.try_recv() {
                 Ok(result) => {
                     // The collector is the last cancel boundary: the flag
@@ -5102,6 +5233,90 @@ mod tests {
                 && text.contains("bar is pinned")
                 && text.contains("also in /usr/local"),
             "both belong to the plan: {text}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `u` plans before it asks, and asks before it builds. A pinned
+    /// crate is refused before the lookup; a crate already at the
+    /// newest release is told so; otherwise the plan is a question, and
+    /// answering it starts a build carrying both halves of the premise.
+    #[test]
+    fn an_update_plans_then_asks_then_builds() {
+        let root = std::env::temp_dir().join("cargo-lbin-test-tui-update-plan");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let mut app = App::new(&root).unwrap();
+
+        // Up to date: an answer, not a build — and the CLI's wording,
+        // because a pre-release may exist above a current stable.
+        app.finish_update_plan(
+            "foo".to_owned(),
+            crate::UpdatePlan::UpToDate {
+                current: "1.0.0".to_owned(),
+            },
+        );
+        assert!(app.confirm.is_none(), "nothing to ask about");
+        assert!(
+            app.message
+                .as_ref()
+                .is_some_and(|m| m.text.contains("is up to date")),
+            "not \"newest release\", which would overstate it"
+        );
+
+        // Outdated: the plan is the question, and it shows both ends.
+        app.finish_update_plan(
+            "foo".to_owned(),
+            crate::UpdatePlan::Outdated {
+                current: "1.0.0".to_owned(),
+                latest: Version::parse("2.0.0").unwrap(),
+            },
+        );
+        let confirm = app.confirm.as_ref().expect("the plan is asked about");
+        assert!(
+            confirm.prompt.contains("foo 1.0.0 -> 2.0.0"),
+            "{}",
+            confirm.prompt
+        );
+
+        // Answered: the build carries the premise and nothing else. The
+        // target was for reading — the build asks for "the newest"
+        // again, so a release landing in between is still installed.
+        app.on_key_confirm(KeyEvent::from(KeyCode::Char('y')));
+        let req = app.pending_build.take().expect("a build was requested");
+        assert_eq!(req.spec, "foo");
+        assert_eq!(
+            req.intent,
+            BuildIntent::Update {
+                expected: "1.0.0".to_owned()
+            }
+        );
+        assert!(app.pending.is_none(), "and nothing goes to the terminal");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A lookup is a one-shot, and the interface says so: the bar
+    /// offers `c`, and the keys that would mutate answer "busy" rather
+    /// than sitting there looking available.
+    #[test]
+    fn an_update_lookup_is_a_cancellable_one_shot() {
+        let root = std::env::temp_dir().join("cargo-lbin-test-tui-update-oneshot");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let mut app = App::new(&root).unwrap();
+        let (_tx, rx) = mpsc::channel();
+        app.job = Some(Job::UpdatePlan {
+            name: "foo".to_owned(),
+            rx,
+            cancel: cancel_flag(),
+        });
+
+        assert!(app.oneshot_running(), "the footer offers a cancel door");
+        assert!(app.anything_running(), "and mutations wait");
+        let label = app.job.as_ref().expect("a job").label();
+        assert!(
+            label.contains("update to `foo`"),
+            "which lookup, in its own words: {label}"
         );
         let _ = std::fs::remove_dir_all(&root);
     }

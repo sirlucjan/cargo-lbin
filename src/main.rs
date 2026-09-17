@@ -2793,6 +2793,131 @@ pub(crate) fn tui_install_batch(
     Ok(end)
 }
 
+/// What `u`'s lookup found, planned from the manifest rather than from
+/// a row drawn earlier.
+#[cfg(feature = "tui")]
+#[derive(Debug)]
+pub(crate) enum UpdatePlan {
+    UpToDate { current: String },
+    Outdated { current: String, latest: Version },
+}
+
+/// `u`'s first half: read the entry, then ask the registry about it.
+///
+/// The premise is taken here, not in the interface. A row is whatever
+/// the last check drew; between then and now another process may have
+/// pinned this crate, unpinned it or updated it, and the CLI's update
+/// begins by loading the manifest under a shared lock for exactly that
+/// reason. The lock is released before the network call — nobody waits
+/// on a prefix for the duration of an index request.
+///
+/// The version policy is `check_versions`', not a second copy of it:
+/// yanked releases, pre-releases and "newer than current" are decided
+/// in one place, and a plan that disagreed with `r` about what counts
+/// as an update would be its own kind of untruth.
+#[cfg(feature = "tui")]
+pub(crate) fn tui_update_plan(prefix: &Path, name: &str) -> Result<UpdatePlan> {
+    let entry = {
+        // Screen-owned and silent: this runs on a worker under the
+        // alternate screen, where a notice printed by the lock would
+        // land on a terminal nobody is looking at — and would corrupt
+        // the one they are. The spinner already says the job is alive.
+        let _lock = StateLock::acquire_with(
+            prefix,
+            &Mode::Shared,
+            privileged::Policy::for_prefix(prefix).screen_owned(),
+            &mut |_| {},
+        )?;
+        let manifest = Manifest::load(prefix)?;
+        let entry = manifest
+            .crates
+            .get(name)
+            .cloned()
+            .with_context(|| format!("not installed: {name}"))?;
+        refuse_pinned(&manifest, std::slice::from_ref(&name.to_owned()))?;
+        entry
+    };
+    let current = entry.version.clone();
+    let checked = check_versions([(&name.to_owned(), &entry)], || false)?
+        .and_then(|mut c| c.pop())
+        .with_context(|| format!("no version information for `{name}`"))?;
+    Ok(if checked.is_outdated() {
+        UpdatePlan::Outdated {
+            current,
+            latest: checked.latest,
+        }
+    } else {
+        UpdatePlan::UpToDate { current }
+    })
+}
+
+/// `update NAME` for the captured frontend: the newest release, against
+/// the entry the plan was made about.
+///
+/// The CLI's update is three steps — look up, show, apply — and the
+/// third revalidates what the first two assumed, because a person read
+/// a plan in between. This is that third step. `expected` is what the
+/// entry said when the plan was shown; if the entry has moved since,
+/// the update the person agreed to is not the update that would
+/// happen, and nothing is built.
+///
+/// The pin is re-checked here too, and the entry's `--locked` is
+/// carried: an update changes the version and nothing else about how
+/// this installation is built.
+#[cfg(feature = "tui")]
+pub(crate) fn tui_update_one(
+    prefix: &Path,
+    name: &str,
+    expected: &str,
+    on_line: &mut dyn FnMut(LineKind, &str),
+    before_placement: &mut dyn FnMut(&Path) -> Result<()>,
+    control: &BuildControl,
+) -> Result<()> {
+    let cache = cache_dir()?;
+    let _lock = StateLock::acquire_with(
+        prefix,
+        &Mode::Exclusive,
+        privileged::Policy::for_prefix(prefix).screen_owned(),
+        &mut |s| on_line(LineKind::Notice, s),
+    )?;
+    let mut manifest = Manifest::load(prefix)?;
+    refuse_pinned(&manifest, std::slice::from_ref(&name.to_owned()))?;
+    let entry = manifest
+        .crates
+        .get(name)
+        .with_context(|| format!("not installed: {name}"))?;
+    if entry.version != expected {
+        bail!(
+            "`{name}` is {} now, not {expected}; the plan is out of date",
+            entry.version
+        );
+    }
+    let locked = entry.locked;
+    let mut frontend = Frontend::Captured {
+        on_line,
+        before_placement,
+        control,
+        checkpoint: None,
+    };
+    // No version, exactly as `apply_updates` does it: the plan's target
+    // was what to show the person, not what to pin the build to. If a
+    // newer release landed while the question was on screen, this
+    // installs it — the same answer the CLI gives, and the same one the
+    // person asked for, which was "the newest".
+    install_and_commit(
+        prefix,
+        &cache,
+        &mut manifest,
+        name,
+        None,
+        locked,
+        PinPolicy::Infer,
+        ShadowReport::OnCommit,
+        &mut frontend,
+    )?;
+    Ok(())
+}
+
 /// `install --reinstall` for the captured frontend: the entry, read
 /// under the lock that will commit it.
 ///
@@ -3737,6 +3862,10 @@ fn cmd_downgrade(prefix: &Path, name: &str) -> Result<()> {
     // install re-checks under the exclusive lock: the chosen version will
     // land, but landing must still be a downgrade.
     let entry = {
+        // The CLI's own gate: this runs on a real terminal — directly or
+        // after a handoff — so a wait for someone else's lock should say
+        // so, and a first lock file under a protected prefix may ask for
+        // a password interactively.
         let _lock = StateLock::acquire(prefix, &Mode::Shared)?;
         Manifest::load(prefix)?
             .crates
@@ -8088,6 +8217,83 @@ mod tests {
             matches!(end, InstallBatchEnd::Cancelled),
             "and the batch's own end carries it"
         );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The plan `u` showed is checked where it can be true: under the
+    /// lock, against the entry it was made about. A crate that moved
+    /// while the question was on screen is not the crate the person
+    /// agreed to update.
+    #[cfg(feature = "tui")]
+    #[test]
+    fn a_captured_update_refuses_a_plan_the_manifest_outgrew() {
+        let root = std::env::temp_dir().join("cargo-lbin-test-tui-update-stale");
+        let _ = fs::remove_dir_all(&root);
+        let prefix = seeded_prefix(&root, "prefix", "okcrate", true, false);
+        let _fake = crate::stage::FakeCargo::install(&versioned_fake(&root, "okcrate"));
+        let control = BuildControl::new();
+
+        // The entry says 0.1.0; a plan made about 0.0.9 is out of date.
+        let err = tui_update_one(
+            &prefix,
+            "okcrate",
+            "0.0.9",
+            &mut |_, _| {},
+            &mut |_| Ok(()),
+            &control,
+        )
+        .expect_err("the premise no longer holds");
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("is 0.1.0 now") && text.contains("out of date"),
+            "{text}"
+        );
+        assert_eq!(
+            Manifest::load(&prefix).unwrap().crates["okcrate"].version,
+            "0.1.0",
+            "and nothing was built"
+        );
+
+        // With the premise intact it updates, keeps `--locked` and
+        // acquires no pin.
+        tui_update_one(
+            &prefix,
+            "okcrate",
+            "0.1.0",
+            &mut |_, _| {},
+            &mut |_| Ok(()),
+            &control,
+        )
+        .unwrap();
+        let entry = Manifest::load(&prefix).unwrap().crates["okcrate"].clone();
+        assert_eq!(entry.version, "0.2.0");
+        assert!(entry.locked, "the entry's build policy is carried");
+        assert!(!entry.pinned, "an update is not a pin");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The plan is read from the manifest, not from a row: a pin set
+    /// since the list was drawn still refuses, and a version the list
+    /// has not caught up with is still the one planned against.
+    #[cfg(feature = "tui")]
+    #[test]
+    fn an_update_plan_reads_the_manifest_not_the_screen() {
+        let root = std::env::temp_dir().join("cargo-lbin-test-tui-update-plan-source");
+        let _ = fs::remove_dir_all(&root);
+        let prefix = seeded_prefix(&root, "prefix", "okcrate", false, false);
+
+        // Pinned after the row was drawn: the plan refuses without
+        // asking the registry anything.
+        let mut m = Manifest::load(&prefix).unwrap();
+        m.crates.get_mut("okcrate").unwrap().pinned = true;
+        m.store(&prefix).unwrap();
+        let err = tui_update_plan(&prefix, "okcrate").expect_err("a pin refuses an update");
+        assert!(format!("{err:#}").contains("pinned"), "{err:#}");
+
+        // And a crate this prefix does not manage is named as such,
+        // rather than looked up.
+        let err = tui_update_plan(&prefix, "nosuchcrate").expect_err("nothing to update");
+        assert!(format!("{err:#}").contains("not installed"), "{err:#}");
         let _ = fs::remove_dir_all(&root);
     }
 
