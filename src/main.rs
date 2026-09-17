@@ -2632,6 +2632,10 @@ pub(crate) enum InstallBatchEnd {
 #[cfg(feature = "tui")]
 pub(crate) enum MemberOutcome {
     Installed,
+    /// The plan said one thing about this entry and the manifest now
+    /// says another: not built, and not a failure either — the person
+    /// confirmed something that is no longer there to do.
+    Skipped(String),
     Failed(anyhow::Error),
     Refused(String),
     Cancelled,
@@ -2790,6 +2794,122 @@ pub(crate) fn tui_install_batch(
     // late to stop that member — there was nothing after it to stop,
     // and calling that a cancelled batch would report a stop that
     // changed nothing.
+    Ok(end)
+}
+
+/// `T`'s plan: every managed entry, frozen as it stands.
+///
+/// Read under a shared lock and released — the question that follows
+/// takes as long as a person takes, and no prefix waits on that. What
+/// the apply does with a plan that has since moved is its own business;
+/// see `tui_reinstall_sweep`.
+#[cfg(feature = "tui")]
+pub(crate) fn tui_reinstall_plan(prefix: &Path) -> Result<Vec<(String, ReinstallPlan)>> {
+    let _lock = StateLock::acquire_with(
+        prefix,
+        &Mode::Shared,
+        privileged::Policy::for_prefix(prefix).screen_owned(),
+        &mut |_| {},
+    )?;
+    let manifest = Manifest::load(prefix)?;
+    manifest
+        .crates
+        .keys()
+        .map(|name| reinstall_plan(&manifest, name).map(|plan| (name.clone(), plan)))
+        .collect()
+}
+
+/// `install --reinstall --all` for the captured frontend: the confirmed
+/// plan, applied under one lock.
+///
+/// `apply_reinstalls`' loop, reported instead of printed, and the three
+/// things that make it that operation rather than a similar one. The
+/// exclusive lock is taken before the manifest is read and held to the
+/// last member. Each member is re-checked against the plan the person
+/// confirmed — version, pin and `--locked`, the three facts the plan
+/// showed — and one that has moved since is skipped rather than
+/// rebuilt against a state nobody agreed to. And a failure does not
+/// end the sweep: a sweep answers "how many of these survived", which
+/// requires asking about all of them.
+#[cfg(feature = "tui")]
+pub(crate) fn tui_reinstall_sweep(
+    prefix: &Path,
+    planned: &[(String, ReinstallPlan)],
+    on_line: &mut dyn FnMut(LineKind, &str),
+    before_placement: &mut dyn FnMut(&Path) -> Result<()>,
+    control: &BatchControl,
+    step: &mut dyn FnMut(BatchStep),
+) -> Result<InstallBatchEnd> {
+    let cache = cache_dir()?;
+    let _lock = StateLock::acquire_with(
+        prefix,
+        &Mode::Exclusive,
+        privileged::Policy::for_prefix(prefix).screen_owned(),
+        &mut |s| on_line(LineKind::Notice, s),
+    )?;
+    let mut manifest = Manifest::load(prefix)?;
+    let mut end = InstallBatchEnd::Completed;
+    for (index, (name, plan)) in planned.iter().enumerate() {
+        let member = std::sync::Arc::new(BuildControl::new());
+        if !control.try_begin_member(&member) {
+            end = InstallBatchEnd::Cancelled;
+            break;
+        }
+        step(BatchStep::Started { index, name });
+        let unchanged = manifest.crates.get(name).is_some_and(|e| {
+            e.version == plan.version.to_string()
+                && e.pinned == plan.pinned
+                && e.locked == plan.locked
+        });
+        if !unchanged {
+            control.finish_member();
+            step(BatchStep::Finished {
+                name,
+                outcome: MemberOutcome::Skipped(
+                    "state changed since the reinstall was confirmed".to_owned(),
+                ),
+            });
+            continue;
+        }
+        let mut frontend = Frontend::Captured {
+            on_line,
+            before_placement,
+            control: &member,
+            checkpoint: None,
+        };
+        let result = install_and_commit(
+            prefix,
+            &cache,
+            &mut manifest,
+            name,
+            Some(&plan.version),
+            plan.locked,
+            PinPolicy::Exactly(plan.pinned),
+            ShadowReport::OnCommit,
+            &mut frontend,
+        );
+        control.finish_member();
+        let outcome = match result {
+            Ok(_) => MemberOutcome::Installed,
+            Err(e) if e.downcast_ref::<BuildCancelled>().is_some() => MemberOutcome::Cancelled,
+            Err(e) => match e.downcast::<AuthorizationRefused>() {
+                Ok(refused) if matches!(refused.purpose, privileged::AuthPurpose::Placement) => {
+                    MemberOutcome::Refused(refused.reason)
+                }
+                Ok(other) => MemberOutcome::Failed(anyhow::Error::new(other)),
+                Err(e) => MemberOutcome::Failed(e),
+            },
+        };
+        // A cancel ends the sweep; a failure does not. The person
+        // stopped the work, or one crate stopped building — and only
+        // the first is a statement about the rest.
+        let cancelled = matches!(outcome, MemberOutcome::Cancelled);
+        step(BatchStep::Finished { name, outcome });
+        if cancelled {
+            end = InstallBatchEnd::Cancelled;
+            break;
+        }
+    }
     Ok(end)
 }
 
@@ -8197,6 +8317,7 @@ mod tests {
                 BatchStep::Finished { outcome, .. } => outcomes.push(
                     match outcome {
                         MemberOutcome::Installed => "installed",
+                        MemberOutcome::Skipped(_) => "skipped",
                         MemberOutcome::Failed(_) => "failed",
                         MemberOutcome::Refused(_) => "refused",
                         MemberOutcome::Cancelled => "cancelled",
@@ -8294,6 +8415,80 @@ mod tests {
         // rather than looked up.
         let err = tui_update_plan(&prefix, "nosuchcrate").expect_err("nothing to update");
         assert!(format!("{err:#}").contains("not installed"), "{err:#}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The sweep re-checks each member against the plan the person
+    /// confirmed, and a failure does not end it — a sweep answers "how
+    /// many of these survived", which needs asking about all of them.
+    #[cfg(feature = "tui")]
+    #[test]
+    fn a_reinstall_sweep_skips_what_moved_and_carries_on_past_failure() {
+        let root = std::env::temp_dir().join("cargo-lbin-test-sweep-apply");
+        let _ = fs::remove_dir_all(&root);
+        let prefix = seeded_prefix(&root, "prefix", "okcrate", false, false);
+        {
+            let mut m = Manifest::load(&prefix).unwrap();
+            for (name, version) in [("movedcrate", "0.1.0"), ("brokencrate", "0.1.0")] {
+                m.crates.insert(
+                    name.to_owned(),
+                    Entry {
+                        version: version.to_owned(),
+                        bins: vec![name.to_owned()],
+                        locked: false,
+                        pinned: false,
+                    },
+                );
+            }
+            m.store(&prefix).unwrap();
+        }
+        let planned = tui_reinstall_plan(&prefix).unwrap();
+        assert_eq!(planned.len(), 3, "the plan is the prefix");
+
+        // Between the plan and the apply, one entry moves.
+        let mut m = Manifest::load(&prefix).unwrap();
+        m.crates.get_mut("movedcrate").unwrap().pinned = true;
+        m.store(&prefix).unwrap();
+
+        let _fake = crate::stage::FakeCargo::install(&failing_fake(&root, "brokencrate"));
+        let control = BatchControl::new();
+        let mut seen: Vec<String> = Vec::new();
+        tui_reinstall_sweep(
+            &prefix,
+            &planned,
+            &mut |_, _| {},
+            &mut |_| Ok(()),
+            &control,
+            &mut |step| {
+                if let BatchStep::Finished { name, outcome } = step {
+                    seen.push(format!(
+                        "{name} {}",
+                        match outcome {
+                            MemberOutcome::Installed => "installed",
+                            MemberOutcome::Skipped(_) => "skipped",
+                            MemberOutcome::Failed(_) => "failed",
+                            MemberOutcome::Refused(_) => "refused",
+                            MemberOutcome::Cancelled => "cancelled",
+                        }
+                    ));
+                }
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            seen,
+            vec![
+                "brokencrate failed".to_owned(),
+                "movedcrate skipped".to_owned(),
+                "okcrate installed".to_owned(),
+            ],
+            "every member was asked about, in the plan's order"
+        );
+        assert!(
+            Manifest::load(&prefix).unwrap().crates["movedcrate"].pinned,
+            "and the entry that moved was left exactly as it was found"
+        );
         let _ = fs::remove_dir_all(&root);
     }
 

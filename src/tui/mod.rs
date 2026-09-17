@@ -159,6 +159,17 @@ pub struct Confirm {
 }
 
 impl Confirm {
+    /// Does the panel above this question belong to it?
+    ///
+    /// A `build_report` is sticky: a failed build's log can still be on
+    /// screen when an unrelated question opens. Reading "report plus
+    /// question" as "the question's plan" made every confirmation
+    /// borrow the arrows and, on a no, throw away a panel it never
+    /// owned. The question says which panel is its own.
+    pub fn owns_report(&self) -> bool {
+        self.action.owns_report()
+    }
+
     /// The one funnel: the prompt is Span-bound, and both builders
     /// interpolate strings the TUI does not control.
     fn new(prompt: &str, action: OnConfirm) -> Self {
@@ -171,6 +182,13 @@ impl Confirm {
 
 /// What a confirmed `y` triggers. A removal decides its shape only at
 /// the `y`: privilege is a property of the world, checked fresh.
+impl OnConfirm {
+    /// The questions that pin a plan of their own above themselves.
+    fn owns_report(&self) -> bool {
+        matches!(self, Self::ReinstallAll { .. })
+    }
+}
+
 enum OnConfirm {
     Migrate {
         name: String,
@@ -187,6 +205,11 @@ enum OnConfirm {
     /// under the lock before anything is built; the version the
     /// question showed was for reading.
     Update { name: String, expected: String },
+    /// `T`: the snapshot the person just agreed to rebuild. The apply
+    /// re-checks each member against it — see `tui_reinstall_sweep`.
+    ReinstallAll {
+        planned: Vec<(String, crate::ReinstallPlan)>,
+    },
     /// `x`: the shape (in place or handoff) is decided fresh at the `y` —
     /// the world may move while the prompt is open.
     Remove { name: String },
@@ -351,6 +374,9 @@ struct PendingMigrate {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum InstallSection {
     Failed,
+    /// A sweep's own outcome: the plan was confirmed about an entry
+    /// that has since moved. Neither built nor broken.
+    Skipped,
     /// Built, and then the placement door could not be opened. Not a
     /// failure to build, and the panel must not imply one.
     Refused,
@@ -358,6 +384,18 @@ enum InstallSection {
 }
 
 /// The headings those sections carry, in panel order.
+/// `T`'s sections. A sweep can skip; it cannot refuse a plan, because
+/// its plan is its own snapshot rather than a list somebody typed.
+const SWEEP_SECTIONS: &[(InstallSection, &str)] = &[
+    (InstallSection::Failed, "failed:"),
+    (InstallSection::Refused, "built, but not placed:"),
+    (
+        InstallSection::Skipped,
+        "skipped, changed since the plan was confirmed:",
+    ),
+    (InstallSection::Noticed, "rebuilt, with build warnings:"),
+];
+
 const INSTALL_SECTIONS: &[(InstallSection, &str)] = &[
     (InstallSection::Failed, "failed:"),
     (InstallSection::Refused, "built, but not placed:"),
@@ -374,6 +412,12 @@ const INSTALL_SECTIONS: &[(InstallSection, &str)] = &[
 /// member is running, what each had to say, and the summary.
 struct InstallBatch {
     runner: BatchRunner<(), InstallSection>,
+    /// Which shape of batch this is. Not decoration: a list stops at
+    /// the first member it cannot deliver, a sweep asks about all of
+    /// them, and a summary that borrowed the wrong one would contradict
+    /// its own counts — "rebuilt 2 of 3 (stopped at a failure; 0 not
+    /// attempted)" is a sentence that cannot be true.
+    shape: BatchShape,
     /// The member whose lines are arriving now, if one is building.
     /// `None` before the first and between members — which is exactly
     /// when a failure belongs to the plan rather than to anyone.
@@ -427,6 +471,13 @@ impl InstallBatch {
             crate::MemberOutcome::Refused(reason) => {
                 self.runner.record(
                     InstallSection::Refused,
+                    name,
+                    vec![crate::text::sanitize(reason)],
+                );
+            }
+            crate::MemberOutcome::Skipped(reason) => {
+                self.runner.record(
+                    InstallSection::Skipped,
                     name,
                     vec![crate::text::sanitize(reason)],
                 );
@@ -496,6 +547,33 @@ impl ActiveControl {
     /// A batch outlives the member `c` was too late for.
     fn is_batch(&self) -> bool {
         matches!(self, Self::Batch(_))
+    }
+}
+
+/// What kind of batch a panel is summarising.
+///
+/// The worker decides whether to carry on past a failure; this decides
+/// how the summary reads about it, and the two must agree. A list of
+/// crates somebody typed stops where it cannot deliver; a sweep over
+/// what is already installed asks about every member, so a failure
+/// among them is a shortfall rather than a stop.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BatchShape {
+    List,
+    Sweep,
+}
+
+impl BatchShape {
+    fn verb(self) -> &'static str {
+        match self {
+            Self::List => "installed",
+            Self::Sweep => "rebuilt",
+        }
+    }
+
+    /// Does a member that did not install end the run?
+    fn stops_at_a_member(self) -> bool {
+        matches!(self, Self::List)
     }
 }
 
@@ -836,6 +914,10 @@ impl App {
                 Self::request_oneshot_cancel(cancel);
                 self.info(&note);
             }
+            Some(Job::ReinstallPlan { cancel, .. }) => {
+                Self::request_oneshot_cancel(cancel);
+                self.info("reading the prefix: cancel requested…");
+            }
             Some(Job::UpdatePlan { name, cancel, .. } | Job::Downgrade { name, cancel, .. }) => {
                 let note = format!("version lookup for `{name}`: cancel requested…");
                 Self::request_oneshot_cancel(cancel);
@@ -873,6 +955,12 @@ enum Job {
     /// interface's own row is a snapshot of the last `r`, and an update
     /// is worth planning against the registry rather than against
     /// whatever was true an hour ago.
+    /// `T`'s plan: every managed entry, frozen. No network — the sweep
+    /// asks the registry nothing, which is the whole point of it.
+    ReinstallPlan {
+        rx: Receiver<Result<Vec<(String, crate::ReinstallPlan)>>>,
+        cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    },
     UpdatePlan {
         name: String,
         rx: Receiver<Result<crate::UpdatePlan>>,
@@ -948,6 +1036,13 @@ impl Job {
                     format!("search `{query}`: cancel requested…")
                 } else {
                     format!("searching crates.io for `{query}`…")
+                }
+            }
+            Job::ReinstallPlan { cancel, .. } => {
+                if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                    "reading the prefix: cancel requested…".to_owned()
+                } else {
+                    "reading what is installed here…".to_owned()
                 }
             }
             Job::UpdatePlan { name, cancel, .. } => {
@@ -1108,6 +1203,7 @@ pub struct App {
     /// Asked for, not yet started: starting needs the terminal, which
     /// only the run loop has.
     pending_install_batch: Option<(Vec<String>, bool)>,
+    pending_reinstall_sweep: Option<Vec<(String, crate::ReinstallPlan)>>,
     pub search_result: Option<SearchResult>,
     pub downgrade_choice: Option<DowngradeChoice>,
     /// A build's sticky report pinned to the details panel until dismissed.
@@ -1200,6 +1296,7 @@ impl App {
             migrate_batch: None,
             install_batch: None,
             pending_install_batch: None,
+            pending_reinstall_sweep: None,
             search_result: None,
             downgrade_choice: None,
             build_report: None,
@@ -1304,6 +1401,7 @@ impl App {
                     | Job::Search { .. }
                     | Job::Downgrade { .. }
                     | Job::UpdatePlan { .. }
+                    | Job::ReinstallPlan { .. }
             )
         )
     }
@@ -1316,6 +1414,7 @@ impl App {
             || self.migrate_batch.is_some()
             || self.install_batch.is_some()
             || self.pending_install_batch.is_some()
+            || self.pending_reinstall_sweep.is_some()
             || self.pending_migrate.is_some()
             || self.pending_build.is_some()
             || self.pending.is_some()
@@ -1445,6 +1544,10 @@ impl App {
 
             if let Some(action) = self.pending.take() {
                 self.run_in_terminal(terminal, &action)?;
+                continue;
+            }
+            if let Some(planned) = self.pending_reinstall_sweep.take() {
+                self.start_confirmed_sweep(terminal, planned)?;
                 continue;
             }
             if let Some((crates, locked)) = self.pending_install_batch.take() {
@@ -2275,10 +2378,10 @@ impl App {
         };
         let InstallBatch {
             mut runner,
+            shape,
             current,
             attempted,
             plan_warnings,
-            ..
         } = batch;
         // A failure with no member in flight is the operation's, not
         // anyone's: the lock, the manifest, the whole-plan pin refusal.
@@ -2337,6 +2440,7 @@ impl App {
         let refused = runner.recorded(InstallSection::Refused);
         let failed = runner.recorded(InstallSection::Failed);
         let cancelled = matches!(outcome, BuildOutcome::Cancelled);
+        let verb = shape.verb();
         let stopped = if cancelled {
             Some("cancelled".to_owned())
         } else if plan_failure.is_some() {
@@ -2344,6 +2448,10 @@ impl App {
             // not load simply fails, and the summary cannot tell which
             // from here. What is true of both is where it happened.
             Some("stopped before the first member".to_owned())
+        } else if !shape.stops_at_a_member() {
+            // A sweep asked about every member; what did not install is
+            // counted, not a place where the run stopped.
+            None
         } else if refused > 0 {
             Some("stopped: a member was built but could not be placed".to_owned())
         } else if failed > 0 {
@@ -2355,7 +2463,7 @@ impl App {
         // is the rest of the plan. A plan refused before the first
         // build attempted nobody.
         let left = total.saturating_sub(attempted);
-        let mut summary = format!("installed {installed} of {total}");
+        let mut summary = format!("{verb} {installed} of {total}");
         if let Some(how) = &stopped {
             let _ = std::fmt::Write::write_fmt(
                 &mut summary,
@@ -2372,7 +2480,7 @@ impl App {
             return;
         }
         self.pin_report(BuildReport {
-            title: format!("install: {installed} of {total} installed"),
+            title: format!("{verb} {installed} of {total}"),
             lines,
             // A plan that could not run is a failure of the operation,
             // and the panel is red for it: only a refusal at the
@@ -2675,47 +2783,25 @@ impl App {
             self.show_help = false;
             return;
         }
+        // Scrolling belongs to whoever owns the panel, and a pinned plan
+        // is owned by the question underneath it: a plan longer than the
+        // panel that cannot be scrolled while the question is open is a
+        // plan the person was asked to confirm without reading. So the
+        // scroll keys are answered first, whether or not a confirmation
+        // is waiting.
+        let question_owns_the_panel = self.confirm.as_ref().is_some_and(Confirm::owns_report);
+        if self.build_report.is_some()
+            && self.input.is_none()
+            && (self.confirm.is_none() || question_owns_the_panel)
+            && self.scrolled_report(key.code)
+        {
+            return;
+        }
         if self.build_report.is_some() && self.input.is_none() && self.confirm.is_none() {
             match key.code {
                 KeyCode::Esc | KeyCode::Enter => {
                     self.build_report = None;
                     self.message = None;
-                    return;
-                }
-                // While the report owns the panel the arrows scroll it — its
-                // tail must be reachable. Down-moves clamp against the bound
-                // the renderer wrote back last frame (not a guessed cap — the
-                // old guess once hid the tail of a line that wrapped fifteen
-                // ways), so the offset never runs past the tail and Up answers
-                // on the first press.
-                KeyCode::Up => {
-                    self.report_scroll = self.report_scroll.saturating_sub(1);
-                    return;
-                }
-                KeyCode::Down => {
-                    self.report_scroll = self
-                        .report_scroll
-                        .saturating_add(1)
-                        .min(self.report_scroll_max.get());
-                    return;
-                }
-                KeyCode::PageUp => {
-                    self.report_scroll = self.report_scroll.saturating_sub(5);
-                    return;
-                }
-                KeyCode::PageDown => {
-                    self.report_scroll = self
-                        .report_scroll
-                        .saturating_add(5)
-                        .min(self.report_scroll_max.get());
-                    return;
-                }
-                KeyCode::Home => {
-                    self.report_scroll = 0;
-                    return;
-                }
-                KeyCode::End => {
-                    self.report_scroll = self.report_scroll_max.get();
                     return;
                 }
                 _ => {}
@@ -2849,7 +2935,7 @@ impl App {
             // Every entry under this prefix. A sweep shows a plan and
             // asks, and that conversation belongs to the terminal — the
             // same reason `U` hands over.
-            KeyCode::Char('T') => self.queue(PendingAction::ReinstallAll),
+            KeyCode::Char('T') => self.start_reinstall_sweep(),
             // The version choice happens here: a known action wanting one
             // value, which is what this interface is for. The build that
             // follows runs in the panel, with `c` and the warning record
@@ -3184,12 +3270,41 @@ impl App {
         }
     }
 
+    /// The panel's own keys. `true` when this key was one of them.
+    ///
+    /// Down-moves clamp against the bound the renderer wrote back last
+    /// frame (not a guessed cap — the old guess once hid the tail of a
+    /// line that wrapped fifteen ways), so the offset never runs past
+    /// the tail and Up answers on the first press.
+    fn scrolled_report(&mut self, code: KeyCode) -> bool {
+        let max = self.report_scroll_max.get();
+        match code {
+            KeyCode::Up => self.report_scroll = self.report_scroll.saturating_sub(1),
+            KeyCode::Down => self.report_scroll = self.report_scroll.saturating_add(1).min(max),
+            KeyCode::PageUp => self.report_scroll = self.report_scroll.saturating_sub(5),
+            KeyCode::PageDown => self.report_scroll = self.report_scroll.saturating_add(5).min(max),
+            KeyCode::Home => self.report_scroll = 0,
+            KeyCode::End => self.report_scroll = max,
+            _ => return false,
+        }
+        true
+    }
+
     fn on_key_confirm(&mut self, key: KeyEvent) {
         let Some(confirm) = self.confirm.take() else {
             return;
         };
+        // A plan shown *for this question* goes with the question,
+        // whichever way it is answered. A report that was already there
+        // belongs to whatever put it there and stays.
+        if confirm.owns_report() {
+            self.build_report = None;
+        }
         if matches!(key.code, KeyCode::Char('y' | 'Y')) {
             match confirm.action {
+                OnConfirm::ReinstallAll { planned } => {
+                    self.pending_reinstall_sweep = Some(planned);
+                }
                 OnConfirm::Update { name, expected } => {
                     self.info(&format!("updating {name}…"));
                     self.pending_build = Some(PendingBuild {
@@ -3509,20 +3624,30 @@ impl App {
         runner.total = total;
         self.install_batch = Some(InstallBatch {
             runner,
+            shape: BatchShape::List,
             current: None,
             attempted: 0,
             plan_warnings: Vec::new(),
         });
         let (tx, rx) = mpsc::channel();
         let (auth_tx, auth_rx) = mpsc::channel();
-        Self::spawn_install_batch(
-            self.prefix.clone(),
-            specs,
-            locked,
+        let prefix = self.prefix.clone();
+        Self::spawn_batch(
             total,
             std::sync::Arc::clone(&control),
             tx,
             auth_rx,
+            move |on_line, before_placement, control, step| {
+                crate::tui_install_batch(
+                    &prefix,
+                    &specs,
+                    locked,
+                    on_line,
+                    before_placement,
+                    control,
+                    step,
+                )
+            },
         );
         self.job = Some(Job::Build {
             name: format!("{total} crates"),
@@ -3544,14 +3669,19 @@ impl App {
 
     /// The batch's worker thread: it owns the lock, the manifest and the
     /// order, and speaks only through the channel.
-    fn spawn_install_batch(
-        prefix: PathBuf,
-        specs: Vec<InstallSpec>,
-        locked: bool,
+    fn spawn_batch(
         total: usize,
         control: std::sync::Arc<crate::BatchControl>,
         tx: Sender<BuildMsg>,
         auth_rx: Receiver<AuthAnswer>,
+        run: impl FnOnce(
+            &mut dyn FnMut(crate::LineKind, &str),
+            &mut dyn FnMut(&Path) -> Result<()>,
+            &crate::BatchControl,
+            &mut dyn FnMut(crate::BatchStep),
+        ) -> Result<crate::InstallBatchEnd>
+        + Send
+        + 'static,
     ) {
         let line_tx = tx.clone();
         let worker_tx = tx.clone();
@@ -3596,15 +3726,11 @@ impl App {
                     });
                 }
             };
-            let result = crate::tui_install_batch(
-                &prefix,
-                &specs,
-                locked,
-                &mut on_line,
-                &mut before_placement,
-                &control,
-                &mut step,
-            );
+            // What differs between batches is one call; everything
+            // around it — the lines, the auth door, the member framing,
+            // the closing classification — is the same plumbing, and
+            // there is no reason for two copies of it.
+            let result = run(&mut on_line, &mut before_placement, &control, &mut step);
             let outcome = match result {
                 Ok(crate::InstallBatchEnd::Completed) => BuildOutcome::Success,
                 // The batch's own end, not a member's: a member's fate
@@ -3623,6 +3749,143 @@ impl App {
     /// crate. Read-only and cancellable, like every other one-shot — the
     /// mutation is the build that a chosen version starts, and nothing
     /// is chosen yet.
+    /// The sweep, confirmed: one worker, one lock, every member.
+    ///
+    /// The same preflight the batch install does, and for the same
+    /// reason: the only privilege that cannot wait is a prefix's first
+    /// lock file, and a sudo caching nothing there means the whole
+    /// sweep belongs in the terminal, where it can ask.
+    fn start_confirmed_sweep(
+        &mut self,
+        terminal: &mut DefaultTerminal,
+        planned: Vec<(String, crate::ReinstallPlan)>,
+    ) -> Result<()> {
+        match Self::preflight_escalation(terminal, &self.prefix.clone())? {
+            Preflight::Ready => {}
+            Preflight::NoCache => {
+                self.info("sudo does not cache credentials here; handing the terminal over");
+                self.pending = Some(PendingAction::ReinstallAll);
+                return Ok(());
+            }
+            Preflight::Reported(message) => {
+                self.error(&message);
+                return Ok(());
+            }
+        }
+        self.build_report = None;
+        let total = planned.len();
+        let control = std::sync::Arc::new(crate::BatchControl::new());
+        let mut runner: BatchRunner<(), InstallSection> =
+            BatchRunner::new(std::collections::VecDeque::new(), SWEEP_SECTIONS);
+        runner.total = total;
+        self.install_batch = Some(InstallBatch {
+            runner,
+            shape: BatchShape::Sweep,
+            current: None,
+            attempted: 0,
+            plan_warnings: Vec::new(),
+        });
+        let (tx, rx) = mpsc::channel();
+        let (auth_tx, auth_rx) = mpsc::channel();
+        let prefix = self.prefix.clone();
+        Self::spawn_batch(
+            total,
+            std::sync::Arc::clone(&control),
+            tx,
+            auth_rx,
+            move |on_line, before_placement, control, step| {
+                crate::tui_reinstall_sweep(
+                    &prefix,
+                    &planned,
+                    on_line,
+                    before_placement,
+                    control,
+                    step,
+                )
+            },
+        );
+        self.job = Some(Job::Build {
+            name: format!("{total} crates"),
+            rx,
+            auth_tx,
+            units_started: 0,
+            current: None,
+            tail: VecDeque::new(),
+            status_note: None,
+            warnings: Vec::new(),
+            started: std::time::Instant::now(),
+            needs_auth: None,
+            control: ActiveControl::Batch(std::sync::Arc::clone(&control)),
+            kind: BuildKind::Reinstall,
+            cancel_deadline: None,
+        });
+        Ok(())
+    }
+
+    /// `T`: read what is installed here, then ask about rebuilding it.
+    ///
+    /// The plan is the prefix's own entries, frozen under a shared lock
+    /// and nothing more — a sweep that rebuilds what is there asks the
+    /// registry nothing. The question names the count and the prefix
+    /// rather than "the listed crates": a filter or a search may be
+    /// narrowing what is on screen, and the sweep is not narrowed by
+    /// either.
+    fn start_reinstall_sweep(&mut self) {
+        if self.anything_running() {
+            self.error("busy; wait for the current job to finish");
+            return;
+        }
+        self.search_result = None;
+        self.downgrade_choice = None;
+        let (tx, rx) = mpsc::channel();
+        let prefix = self.prefix.clone();
+        thread::spawn(move || {
+            let _ = tx.send(crate::tui_reinstall_plan(&prefix));
+        });
+        self.job = Some(Job::ReinstallPlan {
+            rx,
+            cancel: cancel_flag(),
+        });
+        self.message = None;
+    }
+
+    /// The prefix read: nothing to do, or a question naming the whole
+    /// set the sweep will touch.
+    fn finish_reinstall_plan(&mut self, planned: Vec<(String, crate::ReinstallPlan)>) {
+        if planned.is_empty() {
+            self.info(&format!(
+                "nothing installed under {}",
+                self.prefix.display()
+            ));
+            return;
+        }
+        // The plan is shown, not summarised. The rows on screen are the
+        // last thing this interface drew and the snapshot is what the
+        // sweep will act on; between them another process may have
+        // updated a crate, installed one or pinned one. Confirming a
+        // count would be confirming a set nobody saw — the objection
+        // that kept `clean` out of this interface entirely.
+        let lines: Vec<String> = planned
+            .iter()
+            .map(|(name, plan)| {
+                let pinned = if plan.pinned { " [pinned]" } else { "" };
+                let locked = if plan.locked { " [locked]" } else { "" };
+                crate::text::sanitize(&format!("{name} {}{pinned}{locked}", plan.version))
+            })
+            .collect();
+        let prompt = format!(
+            "rebuild all {} managed crate(s) under {}? [y/N]",
+            planned.len(),
+            self.prefix.display()
+        );
+        self.pin_report(BuildReport {
+            title: format!("rebuild plan: {} crate(s)", planned.len()),
+            lines,
+            failed: false,
+        });
+        self.confirm = Some(Confirm::new(&prompt, OnConfirm::ReinstallAll { planned }));
+    }
+
     /// `u`/Enter: plan the update against the registry, then ask.
     ///
     /// Not against the row: that is what the last `r` found, and an
@@ -3814,6 +4077,24 @@ impl App {
             return Ok(());
         };
         match job {
+            Job::ReinstallPlan { rx, cancel } => match rx.try_recv() {
+                Ok(result) => {
+                    if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                        self.info("rebuild cancelled");
+                    } else {
+                        match result {
+                            Ok(plan) => self.finish_reinstall_plan(plan),
+                            Err(e) => self.error(&format!("{e:#}")),
+                        }
+                    }
+                }
+                Err(TryRecvError::Empty) => {
+                    self.job = Some(Job::ReinstallPlan { rx, cancel });
+                }
+                Err(TryRecvError::Disconnected) => {
+                    bail!("prefix reader aborted; the terminal was reset by the panic")
+                }
+            },
             Job::UpdatePlan { name, rx, cancel } => match rx.try_recv() {
                 Ok(result) => {
                     if cancel.load(std::sync::atomic::Ordering::Relaxed) {
@@ -5046,6 +5327,7 @@ mod tests {
         );
         app.install_batch = Some(InstallBatch {
             runner,
+            shape: BatchShape::List,
             current: Some("bar".to_owned()),
             attempted: 2,
             plan_warnings: Vec::new(),
@@ -5094,6 +5376,7 @@ mod tests {
         runner.total = 3;
         let mut batch = InstallBatch {
             runner,
+            shape: BatchShape::List,
             current: None,
             attempted: 0,
             plan_warnings: Vec::new(),
@@ -5170,6 +5453,7 @@ mod tests {
         runner.succeeded();
         app.install_batch = Some(InstallBatch {
             runner,
+            shape: BatchShape::List,
             current: None,
             attempted: 1,
             plan_warnings: Vec::new(),
@@ -5202,6 +5486,7 @@ mod tests {
         runner.total = 2;
         app.install_batch = Some(InstallBatch {
             runner,
+            shape: BatchShape::List,
             current: None,
             attempted: 0,
             plan_warnings: Vec::new(),
@@ -5317,6 +5602,207 @@ mod tests {
         assert!(
             label.contains("update to `foo`"),
             "which lookup, in its own words: {label}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `T` reads the prefix, asks about the whole of it, and only then
+    /// sweeps. The question names the set by what it is — every managed
+    /// crate — not by what happens to be on screen, because a filter or
+    /// a search narrows the view and not the sweep.
+    #[test]
+    fn a_sweep_asks_about_the_prefix_not_the_view() {
+        let root = std::env::temp_dir().join("cargo-lbin-test-tui-sweep-ask");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let mut app = App::new(&root).unwrap();
+
+        // An empty prefix is an answer, not a question.
+        app.finish_reinstall_plan(Vec::new());
+        assert!(app.confirm.is_none());
+        assert!(
+            app.message
+                .as_ref()
+                .is_some_and(|m| m.text.contains("nothing installed"))
+        );
+
+        let planned: Vec<(String, crate::ReinstallPlan)> = ["foo", "bar"]
+            .into_iter()
+            .map(|name| {
+                (
+                    name.to_owned(),
+                    crate::ReinstallPlan {
+                        version: Version::parse("1.0.0").unwrap(),
+                        pinned: false,
+                        locked: false,
+                    },
+                )
+            })
+            .collect();
+        app.finish_reinstall_plan(planned);
+        // The plan is shown, not summarised: the rows on screen may be
+        // older than the snapshot, and a count would be a question
+        // about a set nobody saw.
+        let shown = app.build_report.as_ref().expect("the plan is on screen");
+        assert_eq!(
+            shown.lines.len(),
+            2,
+            "one line per member: {:?}",
+            shown.lines
+        );
+        assert!(
+            shown.lines.iter().any(|l| l.contains("foo 1.0.0")),
+            "with what will be rebuilt: {:?}",
+            shown.lines
+        );
+        let confirm = app.confirm.as_ref().expect("the sweep asks first");
+        assert!(
+            confirm.prompt.contains("all 2 managed crate(s)"),
+            "the set is named by what it is: {}",
+            confirm.prompt
+        );
+        assert!(
+            !confirm.prompt.contains("listed"),
+            "not by what the view shows: {}",
+            confirm.prompt
+        );
+
+        // Answered: queued for the run loop, which owns the terminal the
+        // preflight may need.
+        app.on_key_confirm(KeyEvent::from(KeyCode::Char('y')));
+        assert_eq!(
+            app.pending_reinstall_sweep.as_ref().map(Vec::len),
+            Some(2),
+            "the confirmed snapshot travels, not a fresh one"
+        );
+        assert!(app.pending.is_none(), "and no handoff");
+        assert!(
+            app.build_report.is_none(),
+            "and the question's panel goes with the question"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A plan longer than the panel must be readable before it is
+    /// answered: the scroll keys reach the panel while the question
+    /// waits, and the question survives them. Otherwise "the plan is
+    /// shown" is true only of its first screenful.
+    #[test]
+    fn a_pinned_plan_can_be_read_before_it_is_answered() {
+        let root = std::env::temp_dir().join("cargo-lbin-test-tui-plan-scroll");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let mut app = App::new(&root).unwrap();
+        let planned: Vec<(String, crate::ReinstallPlan)> = (0..30)
+            .map(|i| {
+                (
+                    format!("crate{i}"),
+                    crate::ReinstallPlan {
+                        version: Version::parse("1.0.0").unwrap(),
+                        pinned: false,
+                        locked: false,
+                    },
+                )
+            })
+            .collect();
+        app.finish_reinstall_plan(planned);
+        // The renderer writes the bound back each frame; stand in for it.
+        app.report_scroll_max.set(20);
+
+        app.on_key(KeyEvent::from(KeyCode::Down));
+        assert_eq!(app.report_scroll, 1, "the arrows reach the plan");
+        assert!(app.confirm.is_some(), "and the question is still waiting");
+        assert!(
+            app.pending_reinstall_sweep.is_none(),
+            "scrolling is not answering"
+        );
+        app.on_key(KeyEvent::from(KeyCode::End));
+        assert_eq!(app.report_scroll, 20, "the tail is reachable");
+
+        // And the answer still carries the snapshot that was shown.
+        app.on_key(KeyEvent::from(KeyCode::Char('y')));
+        assert_eq!(app.pending_reinstall_sweep.as_ref().map(Vec::len), Some(30));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A panel belongs to whoever pinned it. A question that did not
+    /// bring its own plan neither borrows the arrows nor throws the
+    /// panel away when it is answered — a report left by an earlier
+    /// build is not the plan for the next question.
+    #[test]
+    fn an_unrelated_question_does_not_own_the_panel() {
+        let root = std::env::temp_dir().join("cargo-lbin-test-tui-panel-owner");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("bin")).unwrap();
+        std::fs::create_dir_all(root.join("share/cargo-lbin")).unwrap();
+        manifest(&[("foo", "1.0.0")]).store(&root).unwrap();
+        let mut app = App::new(&root).unwrap();
+        app.rows = rows_from(&manifest(&[("foo", "1.0.0")]), None, &BTreeMap::new());
+
+        // An earlier build's report, still on screen.
+        app.pin_report(BuildReport {
+            title: "install: foo failed".to_owned(),
+            lines: vec!["boom".to_owned()],
+            failed: true,
+        });
+        app.report_scroll_max.set(10);
+        // …and an unrelated question on top of it.
+        app.confirm = Some(Confirm::new(
+            "remove foo? [y/N]",
+            OnConfirm::Remove {
+                name: "foo".to_owned(),
+            },
+        ));
+
+        app.on_key(KeyEvent::from(KeyCode::Down));
+        assert_eq!(app.report_scroll, 0, "the arrows belong to the question");
+        assert!(
+            app.confirm.is_none(),
+            "which read the key as an answer, as it always has"
+        );
+        assert!(
+            app.build_report.is_some(),
+            "and the panel it never owned is still there"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A sweep asked about every member, so a member that failed is a
+    /// shortfall in the count — not a place where the run stopped. The
+    /// summary must not claim otherwise while reporting nothing left.
+    #[test]
+    fn a_sweep_counts_a_failure_it_did_not_stop_for() {
+        let root = std::env::temp_dir().join("cargo-lbin-test-tui-sweep-summary");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("bin")).unwrap();
+        std::fs::create_dir_all(root.join("share/cargo-lbin")).unwrap();
+        Manifest::default().store(&root).unwrap();
+        let mut app = App::new(&root).unwrap();
+        let mut runner: BatchRunner<(), InstallSection> =
+            BatchRunner::new(std::collections::VecDeque::new(), SWEEP_SECTIONS);
+        runner.total = 3;
+        runner.succeeded();
+        runner.succeeded();
+        runner.record(InstallSection::Failed, "bar", vec!["boom".to_owned()]);
+        app.install_batch = Some(InstallBatch {
+            runner,
+            shape: BatchShape::Sweep,
+            current: None,
+            attempted: 3,
+            plan_warnings: Vec::new(),
+        });
+
+        app.finish_install_batch(&BuildOutcome::Success, &VecDeque::new(), Vec::new());
+
+        let said = &app.message.as_ref().expect("a summary").text;
+        assert!(said.contains("rebuilt 2 of 3"), "{said}");
+        assert!(
+            !said.contains("stopped"),
+            "a sweep that asked about all three did not stop: {said}"
+        );
+        assert!(
+            !said.contains("not attempted"),
+            "and left nobody unattempted: {said}"
         );
         let _ = std::fs::remove_dir_all(&root);
     }

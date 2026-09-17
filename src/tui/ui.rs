@@ -443,7 +443,19 @@ fn detail_lines(row: &super::Row) -> Vec<Line<'static>> {
 /// instructions for nothing.
 fn key_bar(app: &App) -> &'static str {
     if app.confirm.is_some() {
-        " y confirm · any other key cancel"
+        // With a plan pinned above it the arrows belong to the plan, and
+        // the bar says so: a question about a list nobody can scroll is
+        // a question about a list nobody has read.
+        if app.build_report.is_some()
+            && app
+                .confirm
+                .as_ref()
+                .is_some_and(super::Confirm::owns_report)
+        {
+            " ↑/↓ scroll · PgUp/PgDn page · Home/End jump · y confirm · any other cancels"
+        } else {
+            " y confirm · any other key cancel"
+        }
     } else if app.input.is_some() {
         " Enter run · Esc cancel"
     } else if app.manifest_error.is_some() {
@@ -707,8 +719,9 @@ fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
         "t           reinstall selected crate: rebuild exactly as installed —",
         "            same version, same pin, same --locked, new artifacts",
         "            (for a new toolchain or system library)",
-        "T           reinstall all crates under this prefix; the plan and its",
-        "            confirmation happen in the terminal",
+        "T           rebuild every crate under this prefix: the prefix is",
+        "            read, the whole set confirmed, and the builds run here",
+        "            one at a time; a failure does not stop the rest",
         "v           verify: the manifest's claims checked against the disk,",
         "            read-only; violations and warnings land in a panel,",
         "            naming the repair where one is unambiguous",
@@ -722,9 +735,9 @@ fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
         "(the first lock in a prefix is the exception — that one is asked",
         "before the build); a failed build",
         "keeps its last lines and the log path in the details panel.",
-        "the two sweeps (U, T) hand the terminal to the CLI for their",
-        "plan and confirmation, and return when you press Enter; a batch",
-        "install builds here.",
+        "U still hands the whole sweep — plan, confirmation and builds —",
+        "to the CLI, and returns when you press Enter. Every other build",
+        "happens here.",
         "",
         "q / Esc     quit (from the list); during a build, Ctrl-C",
         "            cancels it and quits once the worker stops",
@@ -1001,6 +1014,41 @@ mod tests {
         assert!(
             prompt.contains("NAME"),
             "along with what else the line takes: {prompt}"
+        );
+        let _ = std::fs::remove_dir_all(&prefix);
+    }
+
+    /// Every key the plan's gate answers appears in the plan's bar. The
+    /// gate takes five kinds; a bar naming two of them and calling the
+    /// rest "any other key cancel" would be false about three.
+    #[test]
+    fn the_plan_bar_names_the_keys_the_plan_answers() {
+        let prefix = std::env::temp_dir().join("cargo-lbin-test-tui-plan-bar");
+        let _ = std::fs::remove_dir_all(&prefix);
+        std::fs::create_dir_all(&prefix).unwrap();
+        let mut app = crate::tui::App::new(&prefix).unwrap();
+        app.pin_report(crate::tui::BuildReport {
+            title: "rebuild plan: 30 crate(s)".to_owned(),
+            lines: vec!["crate0 1.0.0".to_owned()],
+            failed: false,
+        });
+        app.confirm = Some(crate::tui::Confirm::new(
+            "rebuild all 30 managed crate(s)? [y/N]",
+            crate::tui::OnConfirm::ReinstallAll {
+                planned: Vec::new(),
+            },
+        ));
+
+        let bar = key_bar(&app);
+        for named in ["↑/↓", "PgUp/PgDn", "Home/End", "y confirm"] {
+            assert!(
+                bar.contains(named),
+                "{named} is answered but unnamed: {bar}"
+            );
+        }
+        assert!(
+            !bar.contains("any other key cancel"),
+            "which would be false of the four above: {bar}"
         );
         let _ = std::fs::remove_dir_all(&prefix);
     }
