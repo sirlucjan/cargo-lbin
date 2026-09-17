@@ -185,7 +185,7 @@ impl Confirm {
 impl OnConfirm {
     /// The questions that pin a plan of their own above themselves.
     fn owns_report(&self) -> bool {
-        matches!(self, Self::ReinstallAll { .. })
+        matches!(self, Self::ReinstallAll { .. } | Self::UpdateAll { .. })
     }
 }
 
@@ -210,6 +210,8 @@ enum OnConfirm {
     ReinstallAll {
         planned: Vec<(String, crate::ReinstallPlan)>,
     },
+    /// `U`: the plan the person just read, member by member.
+    UpdateAll { planned: Vec<crate::PlannedUpdate> },
     /// `x`: the shape (in place or handoff) is decided fresh at the `y` —
     /// the world may move while the prompt is open.
     Remove { name: String },
@@ -396,6 +398,17 @@ const SWEEP_SECTIONS: &[(InstallSection, &str)] = &[
     (InstallSection::Noticed, "rebuilt, with build warnings:"),
 ];
 
+/// `U`'s sections.
+const UPDATE_SECTIONS: &[(InstallSection, &str)] = &[
+    (InstallSection::Failed, "failed:"),
+    (InstallSection::Refused, "built, but not placed:"),
+    (
+        InstallSection::Skipped,
+        "skipped, changed since the plan was confirmed:",
+    ),
+    (InstallSection::Noticed, "updated, with build warnings:"),
+];
+
 const INSTALL_SECTIONS: &[(InstallSection, &str)] = &[
     (InstallSection::Failed, "failed:"),
     (InstallSection::Refused, "built, but not placed:"),
@@ -560,14 +573,16 @@ impl ActiveControl {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum BatchShape {
     List,
-    Sweep,
+    Rebuild,
+    Update,
 }
 
 impl BatchShape {
     fn verb(self) -> &'static str {
         match self {
             Self::List => "installed",
-            Self::Sweep => "rebuilt",
+            Self::Rebuild => "rebuilt",
+            Self::Update => "updated",
         }
     }
 
@@ -914,6 +929,10 @@ impl App {
                 Self::request_oneshot_cancel(cancel);
                 self.info(&note);
             }
+            Some(Job::UpdateSweepPlan { cancel, .. }) => {
+                Self::request_oneshot_cancel(cancel);
+                self.info("update check: cancel requested…");
+            }
             Some(Job::ReinstallPlan { cancel, .. }) => {
                 Self::request_oneshot_cancel(cancel);
                 self.info("reading the prefix: cancel requested…");
@@ -955,6 +974,13 @@ enum Job {
     /// interface's own row is a snapshot of the last `r`, and an update
     /// is worth planning against the registry rather than against
     /// whatever was true an hour ago.
+    /// `U`'s plan: the registry asked about every unpinned entry. The
+    /// longest thing this tool does without building, and cancellable
+    /// down to the individual request.
+    UpdateSweepPlan {
+        rx: Receiver<Result<Option<crate::SweepPlan>>>,
+        cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    },
     /// `T`'s plan: every managed entry, frozen. No network — the sweep
     /// asks the registry nothing, which is the whole point of it.
     ReinstallPlan {
@@ -1036,6 +1062,13 @@ impl Job {
                     format!("search `{query}`: cancel requested…")
                 } else {
                     format!("searching crates.io for `{query}`…")
+                }
+            }
+            Job::UpdateSweepPlan { cancel, .. } => {
+                if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                    "update check: cancel requested…".to_owned()
+                } else {
+                    "checking crates.io for updates…".to_owned()
                 }
             }
             Job::ReinstallPlan { cancel, .. } => {
@@ -1204,6 +1237,7 @@ pub struct App {
     /// only the run loop has.
     pending_install_batch: Option<(Vec<String>, bool)>,
     pending_reinstall_sweep: Option<Vec<(String, crate::ReinstallPlan)>>,
+    pending_update_sweep: Option<Vec<crate::PlannedUpdate>>,
     pub search_result: Option<SearchResult>,
     pub downgrade_choice: Option<DowngradeChoice>,
     /// A build's sticky report pinned to the details panel until dismissed.
@@ -1297,6 +1331,7 @@ impl App {
             install_batch: None,
             pending_install_batch: None,
             pending_reinstall_sweep: None,
+            pending_update_sweep: None,
             search_result: None,
             downgrade_choice: None,
             build_report: None,
@@ -1402,6 +1437,7 @@ impl App {
                     | Job::Downgrade { .. }
                     | Job::UpdatePlan { .. }
                     | Job::ReinstallPlan { .. }
+                    | Job::UpdateSweepPlan { .. }
             )
         )
     }
@@ -1415,6 +1451,7 @@ impl App {
             || self.install_batch.is_some()
             || self.pending_install_batch.is_some()
             || self.pending_reinstall_sweep.is_some()
+            || self.pending_update_sweep.is_some()
             || self.pending_migrate.is_some()
             || self.pending_build.is_some()
             || self.pending.is_some()
@@ -1544,6 +1581,10 @@ impl App {
 
             if let Some(action) = self.pending.take() {
                 self.run_in_terminal(terminal, &action)?;
+                continue;
+            }
+            if let Some(planned) = self.pending_update_sweep.take() {
+                self.start_confirmed_update_sweep(terminal, planned)?;
                 continue;
             }
             if let Some(planned) = self.pending_reinstall_sweep.take() {
@@ -2924,7 +2965,7 @@ impl App {
             // No gate at all: `update --all` reads the manifest and asks the
             // index itself — a stale "0 updates" must not stop a command that
             // would find two. If there is nothing to do, the command says so.
-            KeyCode::Char('U') => self.queue(PendingAction::UpdateAll),
+            KeyCode::Char('U') => self.start_update_sweep(),
             // Toggle from what the row shows; the command re-reads under the
             // lock, so a pin changed elsewhere is reported, not overwritten.
             KeyCode::Char('p') => self.pin_selected(),
@@ -3304,6 +3345,9 @@ impl App {
             match confirm.action {
                 OnConfirm::ReinstallAll { planned } => {
                     self.pending_reinstall_sweep = Some(planned);
+                }
+                OnConfirm::UpdateAll { planned } => {
+                    self.pending_update_sweep = Some(planned);
                 }
                 OnConfirm::Update { name, expected } => {
                     self.info(&format!("updating {name}…"));
@@ -3780,7 +3824,7 @@ impl App {
         runner.total = total;
         self.install_batch = Some(InstallBatch {
             runner,
-            shape: BatchShape::Sweep,
+            shape: BatchShape::Rebuild,
             current: None,
             attempted: 0,
             plan_warnings: Vec::new(),
@@ -3817,6 +3861,131 @@ impl App {
             needs_auth: None,
             control: ActiveControl::Batch(std::sync::Arc::clone(&control)),
             kind: BuildKind::Reinstall,
+            cancel_deadline: None,
+        });
+        Ok(())
+    }
+
+    /// `U`: ask the registry about every unpinned entry, then ask the
+    /// person about what it found.
+    ///
+    /// The cancel token exists before the worker does, so `c` stops the
+    /// remaining index requests rather than only discarding the answers
+    /// — a check over a whole prefix is the one place where that
+    /// difference is measured in minutes.
+    fn start_update_sweep(&mut self) {
+        if self.anything_running() {
+            self.error("busy; wait for the current job to finish");
+            return;
+        }
+        self.search_result = None;
+        self.downgrade_choice = None;
+        let cancel = cancel_flag();
+        let (tx, rx) = mpsc::channel();
+        let prefix = self.prefix.clone();
+        let token = std::sync::Arc::clone(&cancel);
+        thread::spawn(move || {
+            let _ = tx.send(crate::tui_update_sweep_plan(&prefix, &|| {
+                token.load(std::sync::atomic::Ordering::Relaxed)
+            }));
+        });
+        self.job = Some(Job::UpdateSweepPlan { rx, cancel });
+        self.message = None;
+    }
+
+    /// What the check found: nothing to do, or a plan to read and
+    /// answer. Shown in full for the same reason `T`'s is — a count is
+    /// not a plan.
+    fn finish_update_sweep_plan(&mut self, plan: crate::SweepPlan) {
+        let crate::SweepPlan { planned, pinned } = plan;
+        if planned.is_empty() {
+            // Pinned crates were never asked about, so "everything is
+            // up to date" would be a claim about a registry this sweep
+            // did not consult for them.
+            if pinned > 0 {
+                self.info(&format!(
+                    "nothing to update; {pinned} pinned crate(s) held back"
+                ));
+            } else {
+                self.info("everything under this prefix is up to date");
+            }
+            return;
+        }
+        let lines: Vec<String> = planned
+            .iter()
+            .map(|p| crate::text::sanitize(&format!("{} {} -> {}", p.name, p.current, p.latest)))
+            .collect();
+        let prompt = format!("update {} crate(s)? [y/N]", planned.len());
+        let held = if pinned > 0 {
+            format!(" ({pinned} pinned held back)")
+        } else {
+            String::new()
+        };
+        self.pin_report(BuildReport {
+            title: format!("update plan: {} crate(s){held}", planned.len()),
+            lines,
+            failed: false,
+        });
+        self.confirm = Some(Confirm::new(&prompt, OnConfirm::UpdateAll { planned }));
+    }
+
+    /// The update sweep, confirmed: one worker, one lock, every member
+    /// of the plan the person read.
+    fn start_confirmed_update_sweep(
+        &mut self,
+        terminal: &mut DefaultTerminal,
+        planned: Vec<crate::PlannedUpdate>,
+    ) -> Result<()> {
+        match Self::preflight_escalation(terminal, &self.prefix.clone())? {
+            Preflight::Ready => {}
+            Preflight::NoCache => {
+                self.info("sudo does not cache credentials here; handing the terminal over");
+                self.pending = Some(PendingAction::UpdateAll);
+                return Ok(());
+            }
+            Preflight::Reported(message) => {
+                self.error(&message);
+                return Ok(());
+            }
+        }
+        self.build_report = None;
+        let total = planned.len();
+        let control = std::sync::Arc::new(crate::BatchControl::new());
+        let mut runner: BatchRunner<(), InstallSection> =
+            BatchRunner::new(std::collections::VecDeque::new(), UPDATE_SECTIONS);
+        runner.total = total;
+        self.install_batch = Some(InstallBatch {
+            runner,
+            shape: BatchShape::Update,
+            current: None,
+            attempted: 0,
+            plan_warnings: Vec::new(),
+        });
+        let (tx, rx) = mpsc::channel();
+        let (auth_tx, auth_rx) = mpsc::channel();
+        let prefix = self.prefix.clone();
+        Self::spawn_batch(
+            total,
+            std::sync::Arc::clone(&control),
+            tx,
+            auth_rx,
+            move |on_line, before_placement, control, step| {
+                crate::tui_update_sweep(&prefix, &planned, on_line, before_placement, control, step)
+            },
+        );
+        self.job = Some(Job::Build {
+            name: format!("{total} crates"),
+            rx,
+            auth_tx,
+            units_started: 0,
+            current: None,
+            tail: VecDeque::new(),
+            status_note: None,
+            warnings: Vec::new(),
+            started: std::time::Instant::now(),
+            needs_auth: None,
+            control: ActiveControl::Batch(std::sync::Arc::clone(&control)),
+            kind: BuildKind::Update,
             cancel_deadline: None,
         });
         Ok(())
@@ -4077,6 +4246,27 @@ impl App {
             return Ok(());
         };
         match job {
+            Job::UpdateSweepPlan { rx, cancel } => match rx.try_recv() {
+                Ok(result) => {
+                    // A cancelled check discards its answer, whether the
+                    // worker noticed the flag or finished first.
+                    if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                        self.info("update check cancelled");
+                    } else {
+                        match result {
+                            Ok(Some(plan)) => self.finish_update_sweep_plan(plan),
+                            Ok(None) => self.info("update check cancelled"),
+                            Err(e) => self.error(&format!("{e:#}")),
+                        }
+                    }
+                }
+                Err(TryRecvError::Empty) => {
+                    self.job = Some(Job::UpdateSweepPlan { rx, cancel });
+                }
+                Err(TryRecvError::Disconnected) => {
+                    bail!("update check worker aborted; the terminal was reset by the panic")
+                }
+            },
             Job::ReinstallPlan { rx, cancel } => match rx.try_recv() {
                 Ok(result) => {
                     if cancel.load(std::sync::atomic::Ordering::Relaxed) {
@@ -5725,6 +5915,79 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// `U` shows what it found and asks about it; nothing to do is an
+    /// answer. The plan panel is the question's own, so it scrolls and
+    /// leaves with it.
+    #[test]
+    fn an_update_sweep_shows_its_plan_and_asks() {
+        let root = std::env::temp_dir().join("cargo-lbin-test-tui-update-sweep-plan");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let mut app = App::new(&root).unwrap();
+
+        // Nothing outdated and nothing held back: a fact the check
+        // established for every entry.
+        app.finish_update_sweep_plan(crate::SweepPlan {
+            planned: Vec::new(),
+            pinned: 0,
+        });
+        assert!(app.confirm.is_none(), "nothing to ask about");
+        assert!(
+            app.message
+                .as_ref()
+                .is_some_and(|m| m.text.contains("up to date"))
+        );
+
+        // Nothing outdated because nothing was asked: the sweep says
+        // which, rather than claiming a registry it never consulted.
+        app.finish_update_sweep_plan(crate::SweepPlan {
+            planned: Vec::new(),
+            pinned: 3,
+        });
+        let said = app.message.as_ref().expect("an answer").text.clone();
+        assert!(
+            said.contains("nothing to update") && said.contains("3 pinned"),
+            "{said}"
+        );
+        assert!(
+            !said.contains("up to date"),
+            "which would be a claim about crates it never checked: {said}"
+        );
+
+        let planned: Vec<crate::PlannedUpdate> = ["foo", "bar"]
+            .into_iter()
+            .map(|name| crate::PlannedUpdate {
+                name: name.to_owned(),
+                current: "1.0.0".to_owned(),
+                latest: Version::parse("2.0.0").unwrap(),
+            })
+            .collect();
+        app.finish_update_sweep_plan(crate::SweepPlan { planned, pinned: 1 });
+
+        let shown = app.build_report.as_ref().expect("the plan is on screen");
+        assert!(
+            shown.lines.iter().any(|l| l.contains("foo 1.0.0 -> 2.0.0")),
+            "with both ends of each member: {:?}",
+            shown.lines
+        );
+        let confirm = app.confirm.as_ref().expect("and a question");
+        assert!(confirm.owns_report(), "which owns that panel");
+        assert!(
+            confirm.prompt.contains("update 2 crate(s)"),
+            "{}",
+            confirm.prompt
+        );
+
+        app.on_key_confirm(KeyEvent::from(KeyCode::Char('y')));
+        assert_eq!(
+            app.pending_update_sweep.as_ref().map(Vec::len),
+            Some(2),
+            "the confirmed plan travels, not a fresh check"
+        );
+        assert!(app.pending.is_none(), "and no handoff");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// A panel belongs to whoever pinned it. A question that did not
     /// bring its own plan neither borrows the arrows nor throws the
     /// panel away when it is answered — a report left by an earlier
@@ -5786,7 +6049,7 @@ mod tests {
         runner.record(InstallSection::Failed, "bar", vec!["boom".to_owned()]);
         app.install_batch = Some(InstallBatch {
             runner,
-            shape: BatchShape::Sweep,
+            shape: BatchShape::Rebuild,
             current: None,
             attempted: 3,
             plan_warnings: Vec::new(),

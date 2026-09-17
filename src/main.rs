@@ -2797,6 +2797,156 @@ pub(crate) fn tui_install_batch(
     Ok(end)
 }
 
+/// One member of `U`'s plan: the entry as it was read, and what the
+/// registry said about it.
+#[cfg(feature = "tui")]
+pub(crate) struct PlannedUpdate {
+    pub name: String,
+    pub current: String,
+    pub latest: Version,
+}
+
+/// What `U`'s check found, and what it did not ask about.
+///
+/// The pinned count is part of the answer, not a detail: a sweep that
+/// asked about nothing because everything was pinned must not report
+/// that everything is up to date. It checked nothing, and "up to date"
+/// is a fact about the registry it never consulted.
+#[cfg(feature = "tui")]
+pub(crate) struct SweepPlan {
+    pub planned: Vec<PlannedUpdate>,
+    /// Entries left out of the plan by their own standing instruction.
+    pub pinned: usize,
+}
+
+/// `U`'s plan: every unpinned entry the registry has something newer
+/// for.
+///
+/// Pinned crates are not in the plan at all, as in the CLI: a pin is a
+/// standing instruction, and a sweep that refused once per pinned crate
+/// would be reporting a dozen refusals nobody asked for. The shared
+/// lock is released before the network work — a check over a whole
+/// prefix is the longest thing this tool does without building — and
+/// the cancel token reaches `check_versions`, so a `c` stops the
+/// remaining requests rather than only discarding their answers.
+#[cfg(feature = "tui")]
+pub(crate) fn tui_update_sweep_plan(
+    prefix: &Path,
+    should_cancel: &dyn Fn() -> bool,
+) -> Result<Option<SweepPlan>> {
+    let manifest = {
+        let _lock = StateLock::acquire_with(
+            prefix,
+            &Mode::Shared,
+            privileged::Policy::for_prefix(prefix).screen_owned(),
+            &mut |_| {},
+        )?;
+        Manifest::load(prefix)?
+    };
+    let (unpinned, pinned): (Vec<_>, Vec<_>) = manifest.crates.iter().partition(|(_, e)| !e.pinned);
+    let Some(checked) = check_versions(unpinned, should_cancel)? else {
+        return Ok(None);
+    };
+    Ok(Some(SweepPlan {
+        planned: checked
+            .into_iter()
+            .filter(Checked::is_outdated)
+            .map(|c| PlannedUpdate {
+                name: c.name,
+                current: c.current.to_string(),
+                latest: c.latest,
+            })
+            .collect(),
+        pinned: pinned.len(),
+    }))
+}
+
+/// `update --all` for the captured frontend: the confirmed plan,
+/// applied under one lock.
+///
+/// `apply_updates`' loop, reported instead of printed. Each member is
+/// revalidated against the plan the person read — the version it had
+/// then, and that it is still unpinned — because a plan about an entry
+/// that has moved is a plan about something else. What is installed is
+/// the newest, not the plan's `latest`: the plan said what the
+/// registry held when it was read, and the person asked for the newest.
+///
+/// A failure does not end the sweep; a cancel does.
+#[cfg(feature = "tui")]
+pub(crate) fn tui_update_sweep(
+    prefix: &Path,
+    planned: &[PlannedUpdate],
+    on_line: &mut dyn FnMut(LineKind, &str),
+    before_placement: &mut dyn FnMut(&Path) -> Result<()>,
+    control: &BatchControl,
+    step: &mut dyn FnMut(BatchStep),
+) -> Result<InstallBatchEnd> {
+    let cache = cache_dir()?;
+    let _lock = StateLock::acquire_with(
+        prefix,
+        &Mode::Exclusive,
+        privileged::Policy::for_prefix(prefix).screen_owned(),
+        &mut |s| on_line(LineKind::Notice, s),
+    )?;
+    let mut manifest = Manifest::load(prefix)?;
+    let mut end = InstallBatchEnd::Completed;
+    for (index, planned) in planned.iter().enumerate() {
+        let name = planned.name.as_str();
+        let member = std::sync::Arc::new(BuildControl::new());
+        if !control.try_begin_member(&member) {
+            end = InstallBatchEnd::Cancelled;
+            break;
+        }
+        step(BatchStep::Started { index, name });
+        let entry = manifest.crates.get(name);
+        let unchanged = entry.is_some_and(|e| e.version == planned.current && !e.pinned);
+        let Some(locked) = entry.map(|e| e.locked).filter(|_| unchanged) else {
+            control.finish_member();
+            step(BatchStep::Finished {
+                name,
+                outcome: MemberOutcome::Skipped("changed since the plan was confirmed".to_owned()),
+            });
+            continue;
+        };
+        let mut frontend = Frontend::Captured {
+            on_line,
+            before_placement,
+            control: &member,
+            checkpoint: None,
+        };
+        let result = install_and_commit(
+            prefix,
+            &cache,
+            &mut manifest,
+            name,
+            None,
+            locked,
+            PinPolicy::Infer,
+            ShadowReport::OnCommit,
+            &mut frontend,
+        );
+        control.finish_member();
+        let outcome = match result {
+            Ok(_) => MemberOutcome::Installed,
+            Err(e) if e.downcast_ref::<BuildCancelled>().is_some() => MemberOutcome::Cancelled,
+            Err(e) => match e.downcast::<AuthorizationRefused>() {
+                Ok(refused) if matches!(refused.purpose, privileged::AuthPurpose::Placement) => {
+                    MemberOutcome::Refused(refused.reason)
+                }
+                Ok(other) => MemberOutcome::Failed(anyhow::Error::new(other)),
+                Err(e) => MemberOutcome::Failed(e),
+            },
+        };
+        let cancelled = matches!(outcome, MemberOutcome::Cancelled);
+        step(BatchStep::Finished { name, outcome });
+        if cancelled {
+            end = InstallBatchEnd::Cancelled;
+            break;
+        }
+    }
+    Ok(end)
+}
+
 /// `T`'s plan: every managed entry, frozen as it stands.
 ///
 /// Read under a shared lock and released — the question that follows
@@ -8488,6 +8638,94 @@ mod tests {
         assert!(
             Manifest::load(&prefix).unwrap().crates["movedcrate"].pinned,
             "and the entry that moved was left exactly as it was found"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The sweep's apply re-checks each member against the plan the
+    /// person read: an entry updated elsewhere, or pinned since, is
+    /// skipped rather than updated against a premise that no longer
+    /// holds. And a failure does not end it.
+    #[cfg(feature = "tui")]
+    #[test]
+    fn an_update_sweep_skips_what_moved_and_carries_on() {
+        let root = std::env::temp_dir().join("cargo-lbin-test-update-sweep");
+        let _ = fs::remove_dir_all(&root);
+        let prefix = seeded_prefix(&root, "prefix", "okcrate", false, false);
+        {
+            let mut m = Manifest::load(&prefix).unwrap();
+            for name in ["pinnedsince", "movedcrate"] {
+                m.crates.insert(
+                    name.to_owned(),
+                    Entry {
+                        version: "0.1.0".to_owned(),
+                        bins: vec![name.to_owned()],
+                        locked: false,
+                        pinned: false,
+                    },
+                );
+            }
+            m.store(&prefix).unwrap();
+        }
+        // The plan, as the person would have read it.
+        let planned: Vec<PlannedUpdate> = ["okcrate", "pinnedsince", "movedcrate"]
+            .into_iter()
+            .map(|name| PlannedUpdate {
+                name: name.to_owned(),
+                current: "0.1.0".to_owned(),
+                latest: Version::parse("0.2.0").unwrap(),
+            })
+            .collect();
+        // Between the plan and the apply: one pinned, one updated.
+        let mut m = Manifest::load(&prefix).unwrap();
+        m.crates.get_mut("pinnedsince").unwrap().pinned = true;
+        m.crates.get_mut("movedcrate").unwrap().version = "0.3.0".to_owned();
+        m.store(&prefix).unwrap();
+
+        let _fake = crate::stage::FakeCargo::install(&any_crate_fake(&root));
+        let control = BatchControl::new();
+        let mut seen: Vec<String> = Vec::new();
+        tui_update_sweep(
+            &prefix,
+            &planned,
+            &mut |_, _| {},
+            &mut |_| Ok(()),
+            &control,
+            &mut |step| {
+                if let BatchStep::Finished { name, outcome } = step {
+                    seen.push(format!(
+                        "{name} {}",
+                        match outcome {
+                            MemberOutcome::Installed => "updated",
+                            MemberOutcome::Skipped(_) => "skipped",
+                            MemberOutcome::Failed(_) => "failed",
+                            MemberOutcome::Refused(_) => "refused",
+                            MemberOutcome::Cancelled => "cancelled",
+                        }
+                    ));
+                }
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            seen,
+            vec![
+                "okcrate updated".to_owned(),
+                "pinnedsince skipped".to_owned(),
+                "movedcrate skipped".to_owned(),
+            ],
+            "every member was asked about, in the plan's order"
+        );
+        let after = Manifest::load(&prefix).unwrap();
+        assert_eq!(
+            after.crates["okcrate"].version, "0.2.0",
+            "the newest, built"
+        );
+        assert!(after.crates["pinnedsince"].pinned, "the pin was honoured");
+        assert_eq!(
+            after.crates["movedcrate"].version, "0.3.0",
+            "and the entry that moved was left as it was found"
         );
         let _ = fs::remove_dir_all(&root);
     }
