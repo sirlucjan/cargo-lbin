@@ -1,0 +1,39 @@
+# .github/dependabot.yml
+version: 2
+updates:
+  # Rust dependencies: Cargo.toml + Cargo.lock
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "07:00"
+      timezone: Europe/Warsaw
+    # One combined PR per week for everything SemVer-compatible.
+    # Majors are deliberately left out of the group: they arrive as
+    # separate PRs, because a major needs its changelog read, not just
+    # a green CI run.
+    groups:
+      dependencies:
+        update-types:
+          - minor
+          - patch
+    open-pull-requests-limit: 3
+    # Matches the repo's commit convention ("Cargo: bump to 0.11.0")
+    commit-message:
+      prefix: "Cargo"
+
+  # Action versions in .github/workflows — the CI supply chain
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "07:00"
+      timezone: Europe/Warsaw
+    groups:
+      actions:
+        patterns:
+          - "*"
+    commit-message:
+      prefix: "CI"
