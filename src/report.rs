@@ -304,6 +304,41 @@ impl Report {
         self.clone().merged_with(current).store(cache)
     }
 
+    /// When this record's fact was learned: its own stamp, or the
+    /// report's baseline for records from a full check. `None` only
+    /// for a baseline-less record in a baseline-less report, which
+    /// `absorb` never produces.
+    pub fn effective_checked_at(&self, checked: &Checked) -> Option<u64> {
+        checked.checked_at.or(self.checked_at)
+    }
+
+    /// The footer's watermark: the age of the oldest knowledge behind
+    /// the crates on display — meaningful only when it covers them
+    /// all. Every displayed crate must have a record this report can
+    /// speak about, by the same `record_for` rule the annotations use;
+    /// one crate it cannot speak about voids the watermark, because
+    /// "everything listed is backed by an answer no older than this"
+    /// is then false at any age. An empty display asserts nothing and
+    /// gets `None` too.
+    pub fn knowledge_watermark<'a, I>(&self, entries: I) -> Option<Duration>
+    where
+        I: IntoIterator<Item = (&'a str, &'a str)>,
+    {
+        let mut oldest: Option<u64> = None;
+        let mut any = false;
+        for (name, version) in entries {
+            any = true;
+            let current = Version::parse(version).ok()?;
+            let (checked, _) = self.record_for(name, &current)?;
+            let at = self.effective_checked_at(checked)?;
+            oldest = Some(oldest.map_or(at, |o| o.min(at)));
+        }
+        if !any {
+            return None;
+        }
+        oldest.map(|at| Duration::from_secs(now_secs().saturating_sub(at)))
+    }
+
     /// Time since the last full check; `None` when none has happened.
     /// Zero if the clock has since moved backwards.
     pub fn age(&self) -> Option<Duration> {
@@ -716,6 +751,59 @@ mod tests {
             (Some(101), "1.1.0"),
             "a fact learned after the sweep's moment survives it, stamp materialized"
         );
+    }
+
+    #[test]
+    fn the_watermark_needs_every_displayed_crate_covered() {
+        let now = now_secs();
+        let report = Report {
+            checked_at: Some(now - 1000),
+            prefix: PathBuf::from("/p"),
+            crates: vec![
+                Checked {
+                    name: "bat".into(),
+                    current: v("0.26.0"),
+                    checked_at: None,
+                    latest: v("0.26.1"),
+                },
+                Checked {
+                    name: "fd".into(),
+                    current: v("10.3.0"),
+                    checked_at: Some(now - 10),
+                    latest: v("10.3.0"),
+                },
+            ],
+        };
+        // Fresh fact alone: its own stamp is the watermark.
+        assert!(
+            report
+                .knowledge_watermark([("fd", "10.3.0")])
+                .unwrap()
+                .as_secs()
+                < 100
+        );
+        // Baseline knowledge joins the display: the older answer wins.
+        assert!(
+            report
+                .knowledge_watermark([("bat", "0.26.0"), ("fd", "10.3.0")])
+                .unwrap()
+                .as_secs()
+                >= 1000
+        );
+        // The update the report itself named still counts as covered —
+        // the same `record_for` rule the annotations use.
+        assert!(report.knowledge_watermark([("bat", "0.26.1")]).is_some());
+        // A crate the report cannot speak about voids the watermark:
+        // moved past what it checked...
+        assert_eq!(report.knowledge_watermark([("bat", "9.9.9")]), None);
+        // ...or never covered at all. "Everything listed is backed" is
+        // then false at any age.
+        assert_eq!(
+            report.knowledge_watermark([("fd", "10.3.0"), ("ghost", "1.0.0")]),
+            None
+        );
+        // An empty display asserts nothing.
+        assert_eq!(report.knowledge_watermark(std::iter::empty()), None);
     }
 
     #[test]

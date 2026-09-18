@@ -269,7 +269,9 @@ update check: 3h ago
 - `(up to date)` means the last check found this version current — either because it checked this exact version, or because this is the update that check named and it has since been installed.
 - No annotation means the report cannot speak about the installed version, for example because the crate was installed afterwards, or updated to something other than the version that check named.
 
-The report age is printed to stderr so stdout remains suitable for simple parsing. Without a saved report, `list` still lists the manifest and tells you that no update check has been recorded.
+The report is not only written by full checks: whenever lbin asks the registry to determine update status for a managed crate — a bare `install` resolving the newest release, `update NAME`, `pinned --check` — that knowledge is recorded under a per-crate timestamp; `info` stays a read-only view of crates.io and records nothing. The footer is the oldest knowledge behind the crates on display, and it is only printed when it covers them all: everything listed is backed by an answer, about the version it currently runs, no older than that. If even one listed crate is something the report cannot speak about, no global age would be true, and the footer says the check does not cover everything listed instead of picking an age that lies.
+
+The freshness age is printed to stderr so stdout remains suitable for simple parsing. Without a saved report, `list` still lists the manifest and tells you that no update check has been recorded.
 
 Run a fresh check with:
 

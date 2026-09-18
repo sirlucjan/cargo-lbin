@@ -578,9 +578,17 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         .collect();
     frame.render_widget(Paragraph::new(keys), keys_area);
 
-    let checked = match app.report_age {
-        Some(age) => format!("checked {}", describe_age(age)),
-        None => "never checked".to_owned(),
+    // An empty listing asserts nothing — the same silence as the CLI
+    // footer; otherwise `None` covers both "no report" and "the report
+    // cannot speak about every row", and the label must be true for
+    // both.
+    let checked = if app.rows.is_empty() {
+        String::new()
+    } else {
+        match app.report_age {
+            Some(age) => format!("checked {}", describe_age(age)),
+            None => "not fully checked".to_owned(),
+        }
     };
     // "0 updates" alone would read as "all current". In the degraded
     // state the whole line is one honest sentence — "0 packages" over a
@@ -611,7 +619,9 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         if app.not_checked() > 0 {
             let _ = write!(status, " · {} not checked", app.not_checked());
         }
-        let _ = write!(status, " · {checked}");
+        if !checked.is_empty() {
+            let _ = write!(status, " · {checked}");
+        }
         (status, Color::DarkGray)
     };
     frame.render_widget(

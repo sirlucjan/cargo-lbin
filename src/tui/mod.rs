@@ -1449,7 +1449,19 @@ impl App {
         // Once per reload, lockless by design (see the prefixes module).
         let also = crate::prefixes::also_installed(&self.prefix);
         self.rows = rows_from(&manifest, report, &also);
-        self.report_age = report.and_then(Report::age);
+        // The same watermark the CLI footer prints: the oldest
+        // knowledge behind everything on display, or nothing when the
+        // report cannot speak about every row. Two surfaces with two
+        // definitions of freshness is how one prefix gets two opinions
+        // about its own state.
+        self.report_age = report.and_then(|r| {
+            r.knowledge_watermark(
+                manifest
+                    .crates
+                    .iter()
+                    .map(|(name, entry)| (name.as_str(), entry.version.as_str())),
+            )
+        });
         self.clamp_selection();
         Ok(ReloadOutcome::Loaded)
     }

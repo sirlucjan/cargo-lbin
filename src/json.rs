@@ -27,7 +27,10 @@ pub struct ListOutput {
     pub schema: u32,
     /// The prefix as an absolute, normalized path (see `report::identity`).
     pub prefix: PathBuf,
-    /// Unix seconds of the last recorded update check; `null` if none.
+    /// Unix seconds of the last recorded full check — the report's
+    /// baseline; individual crates may carry newer per-crate stamps
+    /// below. `null` when no full check has happened, even if partial
+    /// knowledge exists.
     pub checked_at: Option<u64>,
     pub crates: Vec<ListCrate>,
 }
@@ -43,6 +46,10 @@ pub struct ListCrate {
     /// The newest version the last check found; `null` when `status` is
     /// `unknown` — absent knowledge, not an empty version.
     pub latest: Option<Version>,
+    /// Unix seconds when this crate's status was learned — the record's
+    /// own stamp, or the report's baseline for records from a full
+    /// check; `null` when `status` is `unknown`. Additive.
+    pub checked_at: Option<u64>,
     /// Other known lbin prefixes carrying this crate; additive, skipped
     /// when empty — schema 1 consumers keep parsing untouched documents.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -134,16 +141,28 @@ impl ListCrate {
     fn annotated(name: &str, entry: &crate::manifest::Entry, report: Option<&Report>) -> Self {
         // `latest` is what the check found — not `current` echoed back,
         // which would be wrong when the installed version was yanked since.
-        let (status, latest) = Version::parse(&entry.version)
+        let (status, latest, checked_at) = Version::parse(&entry.version)
             .ok()
-            .and_then(|current| report?.record_for(name, &current))
-            .map_or((ListStatus::Unknown, None), |(checked, status)| {
-                let status = match status {
-                    crate::report::Status::Outdated(_) => ListStatus::Outdated,
-                    crate::report::Status::UpToDate => ListStatus::UpToDate,
-                };
-                (status, Some(checked.latest.clone()))
-            });
+            .and_then(|current| {
+                let report = report?;
+                report
+                    .record_for(name, &current)
+                    .map(|(checked, status)| (report, checked, status))
+            })
+            .map_or(
+                (ListStatus::Unknown, None, None),
+                |(report, checked, status)| {
+                    let status = match status {
+                        crate::report::Status::Outdated(_) => ListStatus::Outdated,
+                        crate::report::Status::UpToDate => ListStatus::UpToDate,
+                    };
+                    (
+                        status,
+                        Some(checked.latest.clone()),
+                        report.effective_checked_at(checked),
+                    )
+                },
+            );
         Self {
             name: name.to_owned(),
             version: entry.version.clone(),
@@ -152,6 +171,7 @@ impl ListCrate {
             pinned: entry.pinned,
             status,
             latest,
+            checked_at,
             also_in: Vec::new(),
         }
     }
@@ -164,9 +184,11 @@ impl ListCrate {
 pub struct PinnedOutput {
     pub schema: u32,
     pub prefix: PathBuf,
-    /// Unix seconds of the check the statuses come from — the recorded
-    /// one by default, the moment of the query under `--check`; `null`
-    /// if no check is recorded.
+    /// Unix seconds of the prefix's last full check — the report's
+    /// baseline, whichever command produced this JSON; `--check`
+    /// refreshes the pinned records' own stamps below without touching
+    /// it. `null` when no full check has happened, even if partial
+    /// knowledge exists.
     pub checked_at: Option<u64>,
     pub crates: Vec<ListCrate>,
 }
@@ -488,7 +510,8 @@ mod tests {
       "locked": false,
       "pinned": true,
       "status": "outdated",
-      "latest": "0.26.1"
+      "latest": "0.26.1",
+      "checked_at": 1756761600
     },
     {
       "name": "fd",
@@ -499,7 +522,8 @@ mod tests {
       "locked": true,
       "pinned": false,
       "status": "up_to_date",
-      "latest": "10.3.0"
+      "latest": "10.3.0",
+      "checked_at": 1756761600
     },
     {
       "name": "ripgrep",
@@ -510,7 +534,8 @@ mod tests {
       "locked": false,
       "pinned": false,
       "status": "up_to_date",
-      "latest": "14.1.0"
+      "latest": "14.1.0",
+      "checked_at": 1756761600
     }
   ]
 }"#;
@@ -530,6 +555,7 @@ mod tests {
         for c in value["crates"].as_array().unwrap() {
             assert_eq!(c["status"], "unknown");
             assert_eq!(c["latest"], serde_json::Value::Null);
+            assert_eq!(c["checked_at"], serde_json::Value::Null);
         }
         // An empty prefix is still a complete document, not a message.
         let out = ListOutput::build(
@@ -598,7 +624,8 @@ mod tests {
       "locked": false,
       "pinned": true,
       "status": "outdated",
-      "latest": "0.26.1"
+      "latest": "0.26.1",
+      "checked_at": 1756761600
     }
   ]
 }"#;
@@ -643,6 +670,39 @@ mod tests {
         assert_eq!(value["crates"], serde_json::json!([]));
         assert_eq!(value["checked_at"], serde_json::Value::Null);
         assert_eq!(value["schema"], SCHEMA);
+    }
+
+    #[test]
+    fn a_partial_born_report_has_no_baseline_but_stamped_crates() {
+        let mut partial = Report {
+            checked_at: None,
+            prefix: PathBuf::from("/p"),
+            crates: Vec::new(),
+        };
+        partial.absorb(vec![Checked {
+            name: "bat".into(),
+            current: v("0.26.0"),
+            checked_at: Some(1_756_761_700),
+            latest: v("0.26.1"),
+        }]);
+        let out = ListOutput::build(
+            PathBuf::from("/p"),
+            &manifest(),
+            Some(&partial),
+            &std::collections::BTreeMap::new(),
+        );
+        let value = serde_json::to_value(&out).unwrap();
+        assert_eq!(
+            value["checked_at"],
+            serde_json::Value::Null,
+            "no full check has happened and the baseline refuses to invent one"
+        );
+        let bat = &value["crates"][0];
+        assert_eq!(bat["name"], "bat");
+        assert_eq!(bat["checked_at"], 1_756_761_700);
+        assert_eq!(bat["status"], "outdated");
+        // The crates the partial check never touched stay unknown.
+        assert_eq!(value["crates"][1]["checked_at"], serde_json::Value::Null);
     }
 
     #[test]

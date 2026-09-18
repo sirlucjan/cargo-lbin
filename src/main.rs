@@ -3733,6 +3733,46 @@ fn refuse_diagonal(
     refuse_on_diagonal(name, entry.locked, &current, &latest, false, locked, scope)
 }
 
+/// The freshness footer `list` and `pinned` share, on stderr: the
+/// watermark when it covers everything on display, otherwise which
+/// problem prevents one — a check that does not cover the listing, or
+/// no check at all — with the pasteable command that fixes it.
+/// `extra` is the surface's own tail for that hint (`pinned` offers
+/// `--check` too). One copy, because two footers that drift is how
+/// the same prefix gets two opinions about its own freshness.
+fn freshness_footer(
+    prefix: &Path,
+    report: Option<&Report>,
+    watermark: Option<std::time::Duration>,
+    extra: &str,
+) {
+    match (report, watermark) {
+        (Some(_), Some(age)) => {
+            eprintln!("update check: {}", report::describe_age(age));
+        }
+        (Some(_), None) => match pasteable_prefix(prefix) {
+            Some(arg) => eprintln!(
+                "update check does not cover everything listed; \
+                 run `cargo lbin checkupdate {arg}`{extra}"
+            ),
+            None => eprintln!(
+                "update check does not cover everything listed; \
+                 run a `checkupdate` for this installation{extra}"
+            ),
+        },
+        (None, _) => match pasteable_prefix(prefix) {
+            Some(arg) => {
+                eprintln!("no update check recorded; run `cargo lbin checkupdate {arg}`{extra}");
+            }
+            None => {
+                eprintln!(
+                    "no update check recorded; run a `checkupdate` for this installation{extra}"
+                );
+            }
+        },
+    }
+}
+
 /// The registry has just answered about these managed crates; write
 /// that down.
 ///
@@ -3802,6 +3842,38 @@ fn cmd_set_pinned(prefix: &Path, crates: &[String], pinned: bool) -> Result<()> 
     Ok(())
 }
 
+/// The report `pinned --check` displays. The stored report absorbs
+/// the pinned facts, each stamped at its own answer, and is shown as
+/// merged: the top-level baseline stays the prefix's last full check
+/// (or None when none happened), and only the pinned records carry
+/// fresh stamps — both levels keep their meaning regardless of which
+/// command produced the JSON. An empty pinned set asked the registry
+/// nothing and records nothing — the same guard `record_knowledge`
+/// keeps — and when the cache cannot be written, the answer is this
+/// moment's facts alone, partial by construction.
+fn checked_pinned_report(prefix: &Path, manifest: &Manifest) -> Result<Option<Report>> {
+    let learned = check_versions(manifest.crates.iter().filter(|(_, e)| e.pinned), || false)?
+        .expect("a `|| false` token never cancels");
+    if learned.is_empty() {
+        return Ok(
+            match cache_dir().and_then(|cache| Report::load(&cache, prefix)) {
+                Ok(report) => report,
+                Err(e) => {
+                    eprintln!("warning: {e:#}");
+                    None
+                }
+            },
+        );
+    }
+    Ok(match absorb_and_store(prefix, learned.clone()) {
+        Ok(merged) => Some(merged),
+        Err(e) => {
+            eprintln!("warning: could not record the update check: {e:#}");
+            Some(Report::partial(prefix, learned)?)
+        }
+    })
+}
+
 fn cmd_pinned(prefix: &Path, check: bool, json: bool) -> ExitCode {
     // Everything needed for the listing is resolved before writing
     // anything to stdout, so failures cannot leave a partial listing.
@@ -3816,15 +3888,7 @@ fn cmd_pinned(prefix: &Path, check: bool, json: bool) -> ExitCode {
         // saving a partial snapshot guarded a single global timestamp,
         // and every fact now carries its own.
         let report = if check {
-            // Partial by construction: a pinned-only query is not a
-            // full check, and even this moment's throwaway object must
-            // not claim the baseline a `--json` consumer would read.
-            let learned =
-                check_versions(manifest.crates.iter().filter(|(_, e)| e.pinned), || false)?
-                    .expect("a `|| false` token never cancels");
-            let fresh = Report::partial(prefix, learned)?;
-            record_knowledge(prefix, fresh.crates.clone());
-            Some(fresh)
+            checked_pinned_report(prefix, &manifest)?
         } else {
             match cache_dir().and_then(|cache| Report::load(&cache, prefix)) {
                 Ok(report) => report,
@@ -3889,19 +3953,20 @@ fn cmd_pinned(prefix: &Path, check: bool, json: bool) -> ExitCode {
         // parser. Under `--check` the statuses are from this very moment
         // and the line would only state the obvious.
         if !check {
-            if let Some(age) = report.as_ref().and_then(Report::age) {
-                eprintln!("update check: {}", report::describe_age(age));
-            } else {
-                match pasteable_prefix(prefix) {
-                    Some(arg) => eprintln!(
-                        "no update check recorded; run `cargo lbin checkupdate {arg}` \
-                         or use `--check`"
-                    ),
-                    None => eprintln!(
-                        "no update check recorded; run a `checkupdate` for this \
-                         installation, or use `--check`"
-                    ),
-                }
+            // Same watermark as `list`, over the pinned subset on
+            // display; an empty subset asserts nothing.
+            let pinned_entries = || {
+                manifest
+                    .crates
+                    .iter()
+                    .filter(|(_, e)| e.pinned)
+                    .map(|(name, entry)| (name.as_str(), entry.version.as_str()))
+            };
+            if pinned_entries().next().is_some() {
+                let watermark = report
+                    .as_ref()
+                    .and_then(|r| r.knowledge_watermark(pinned_entries()));
+                freshness_footer(prefix, report.as_ref(), watermark, " or use `--check`");
             }
         }
     }
@@ -3986,18 +4051,22 @@ fn cmd_list(prefix: &Path, json: bool) -> Result<()> {
         );
     }
     // Status goes to stderr: it is for the person reading the terminal,
-    // not for whatever may be parsing stdout.
-    if let Some(age) = report.as_ref().and_then(Report::age) {
-        eprintln!("update check: {}", report::describe_age(age));
-    } else {
-        match pasteable_prefix(prefix) {
-            Some(arg) => {
-                eprintln!("no update check recorded; run `cargo lbin checkupdate {arg}`");
-            }
-            None => {
-                eprintln!("no update check recorded; run a `checkupdate` for this installation");
-            }
-        }
+    // not for whatever may be parsing stdout. The footer is the oldest
+    // knowledge behind everything on display — and only that: one
+    // listed crate the report cannot speak about makes any global age
+    // a false sentence, so the footer says which problem it has
+    // instead of picking an age that lies. An empty listing asserts
+    // nothing and gets no footer.
+    if !manifest.crates.is_empty() {
+        let watermark = report.as_ref().and_then(|r| {
+            r.knowledge_watermark(
+                manifest
+                    .crates
+                    .iter()
+                    .map(|(name, entry)| (name.as_str(), entry.version.as_str())),
+            )
+        });
+        freshness_footer(prefix, report.as_ref(), watermark, "");
     }
     Ok(())
 }
