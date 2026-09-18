@@ -339,13 +339,6 @@ impl Report {
         oldest.map(|at| Duration::from_secs(now_secs().saturating_sub(at)))
     }
 
-    /// Time since the last full check; `None` when none has happened.
-    /// Zero if the clock has since moved backwards.
-    pub fn age(&self) -> Option<Duration> {
-        self.checked_at
-            .map(|at| Duration::from_secs(now_secs().saturating_sub(at)))
-    }
-
     /// What the report says about `name` as installed *now*: `None` when
     /// unchecked, or installed at a version this report cannot speak
     /// about — nothing is what the caller must show, not a stale
@@ -530,7 +523,10 @@ mod tests {
             .unwrap();
         assert_eq!(loaded.crates, report.crates);
         assert_eq!(loaded.prefix, Path::new("/usr/local"));
-        assert!(loaded.age().expect("a stored full check has an age") < Duration::from_secs(60));
+        let stored_at = loaded
+            .checked_at
+            .expect("a stored full check has a baseline");
+        assert!(now_secs().saturating_sub(stored_at) < 60);
 
         // Another prefix has no report.
         assert!(Report::load(&tmp, Path::new("/opt")).unwrap().is_none());
@@ -596,7 +592,6 @@ mod tests {
         .unwrap();
         assert_eq!(report.checked_at, None, "a partial check is not a full one");
         assert_eq!(report.crates[0].checked_at, Some(1_756_761_700));
-        assert_eq!(report.age(), None, "no baseline, no age to describe");
     }
 
     #[test]
