@@ -34,7 +34,7 @@ ureq = { version = "2", features = ["tls", "native-certs"] }
 # scroll clamp must count rows the way the wrapper breaks them. "Unstable"
 # is ratatui's API-stability marker; a rename fails this build loudly.
 ratatui = { version = "0.30.2", optional = true, default-features = false, features = ["crossterm", "unstable-rendered-line-info"] }
-clap_mangen = "0.2"
+clap_mangen = "0.3"
 
 [profile.release]
 lto = true
