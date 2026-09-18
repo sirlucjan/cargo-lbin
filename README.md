@@ -131,7 +131,7 @@ cargo lbin install scx_beerland@1.1.2
 ```
 
 ```text
-installed scx_beerland 1.1.2 -> /usr/local/bin (scx_beerland) [pinned; `cargo lbin unpin scx_beerland` to allow updates]
+installed scx_beerland 1.1.2 -> /usr/local/bin (scx_beerland) [pinned; `cargo lbin unpin scx_beerland --prefix=/usr/local` to allow updates]
 ```
 
 A version chosen by name is a version meant to stay, so `@version` pins the crate (see [Pin](#pin)); without the pin, the next `update --all` would rebuild the newest release and leave no trace of the choice. The version must be an exact semver version — `foo@^1` is refused, since "any matching version" is what plain `install foo` already means. Cargo refuses yanked versions; `info` shows which ones those are. Any plain `install` of a pinned crate is refused, versioned or not: a bare `install foo` would build the newest release, and `install foo@VERSION` would re-pin to another choice — both re-interpret the standing pin instead of preserving it, so the pin comes off explicitly (`unpin`) first. A crate may appear only once per `install` command, with or without a version: `install foo@1.2.3 foo` would otherwise end with the newest release pinned, and two builds of one crate in one command is never what was meant.
@@ -420,7 +420,7 @@ scx_beerland 1.1.3 is installed; older versions on crates.io:
 select a version to install (1-3), or Enter/q to abort: 1
 downgrading scx_beerland 1.1.3 -> 1.1.2
 ...
-installed scx_beerland 1.1.2 -> /usr/local/bin (scx_beerland) [pinned; `cargo lbin unpin scx_beerland` to allow updates]
+installed scx_beerland 1.1.2 -> /usr/local/bin (scx_beerland) [pinned; `cargo lbin unpin scx_beerland --prefix=/usr/local` to allow updates]
 ```
 
 The list is crates.io's, filtered by the same release-relevance policy `update` uses — published, not yanked, pre-releases only when the installed version is one — applied to versions older than the installed one. If the crate is removed or its installed version changes while the prompt is open, the command stops rather than applying a choice made against stale state. Newest first, at most ten; if there are more, `install NAME@VERSION` takes any of them. The chosen version is built like any install, with the crate's `--locked` setting carried over, and pinned for the same reason `install NAME@VERSION` pins: a downgrade the next `update --all` would undo is not a downgrade.

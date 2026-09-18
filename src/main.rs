@@ -1161,7 +1161,10 @@ fn place_and_commit(
     // could be followed by its own undoing — and keyed off the committed
     // state, which is what `unpin` would change.
     let pin_note = if pinned {
-        format!(" [pinned; `cargo lbin unpin {name}` to allow updates]")
+        match pasteable_prefix(prefix) {
+            Some(arg) => format!(" [pinned; `cargo lbin unpin {name} {arg}` to allow updates]"),
+            None => " [pinned; unpin to allow updates]".to_owned(),
+        }
     } else {
         String::new()
     };
@@ -1621,6 +1624,20 @@ fn pasteable_path_arg(flag: &str, path: &Path) -> Option<String> {
 /// [`pasteable_path_arg`] for the flag every hint so far has needed.
 fn pasteable_prefix(prefix: &Path) -> Option<String> {
     pasteable_path_arg("--prefix", prefix)
+}
+
+/// The parenthetical an "it is pinned" refusal carries: a pasteable
+/// `unpin` command scoped to the prefix the operation runs against —
+/// `--user` and the default alike spell out as `--prefix=…`, which is
+/// what they resolve to, so the hint stays true wherever it was
+/// copied from. When the prefix has no honest spelling, the hint
+/// names the verb instead of offering a command that is safe to
+/// paste and wrong to run.
+fn unpin_hint(prefix: &Path, names: &str) -> String {
+    match pasteable_prefix(prefix) {
+        Some(arg) => format!("(run `cargo lbin unpin {names} {arg}` first)"),
+        None => "(unpin first)".to_owned(),
+    }
 }
 
 /// The repair a disk finding may name — `None` when the prefix has no
@@ -2749,9 +2766,9 @@ pub(crate) fn tui_install_batch(
     // artifact specification does not change is redirected to
     // `--reinstall`.
     let names: Vec<String> = specs.iter().map(|s| s.name.clone()).collect();
-    refuse_pinned(&manifest, &names)?;
+    refuse_pinned(prefix, &manifest, &names)?;
     for spec in specs {
-        refuse_diagonal(&manifest, spec, locked)?;
+        refuse_diagonal(prefix, &manifest, spec, locked)?;
     }
     for w in duplicate_install_warnings(prefix, &manifest, specs.iter().map(|s| s.name.as_str())) {
         on_line(LineKind::Warning, &w);
@@ -3104,7 +3121,7 @@ pub(crate) fn tui_update_plan(prefix: &Path, name: &str) -> Result<UpdatePlan> {
             .get(name)
             .cloned()
             .with_context(|| format!("not installed: {name}"))?;
-        refuse_pinned(&manifest, std::slice::from_ref(&name.to_owned()))?;
+        refuse_pinned(prefix, &manifest, std::slice::from_ref(&name.to_owned()))?;
         entry
     };
     let current = entry.version.clone();
@@ -3151,7 +3168,7 @@ pub(crate) fn tui_update_one(
         &mut |s| on_line(LineKind::Notice, s),
     )?;
     let mut manifest = Manifest::load(prefix)?;
-    refuse_pinned(&manifest, std::slice::from_ref(&name.to_owned()))?;
+    refuse_pinned(prefix, &manifest, std::slice::from_ref(&name.to_owned()))?;
     let entry = manifest
         .crates
         .get(name)
@@ -3258,8 +3275,8 @@ pub(crate) fn tui_install_one(
     )?;
     let mut manifest = Manifest::load(prefix)?;
     // Same gates as `cmd_install`, single-member edition.
-    refuse_pinned(&manifest, std::slice::from_ref(&spec.name))?;
-    refuse_diagonal(&manifest, spec, locked)?;
+    refuse_pinned(prefix, &manifest, std::slice::from_ref(&spec.name))?;
+    refuse_diagonal(prefix, &manifest, spec, locked)?;
     let mut frontend = Frontend::Captured {
         on_line,
         before_placement,
@@ -3313,9 +3330,9 @@ fn cmd_install(prefix: &Path, crates: &[String], locked: bool, reinstall: bool) 
     // `refuse_diagonal`).
     if !reinstall {
         let names: Vec<String> = specs.iter().map(|s| s.name.clone()).collect();
-        refuse_pinned(&manifest, &names)?;
+        refuse_pinned(prefix, &manifest, &names)?;
         for spec in &specs {
-            refuse_diagonal(&manifest, spec, locked)?;
+            refuse_diagonal(prefix, &manifest, spec, locked)?;
         }
     }
     // Every plan is resolved before the first build: "not installed" is
@@ -3543,8 +3560,8 @@ fn reinstall_plan(manifest: &Manifest, name: &str) -> Result<ReinstallPlan> {
 
 /// Error if any of `crates` is pinned: a pin is the more deliberate
 /// and durable statement, so it wins; the message says how to change
-/// that.
-fn refuse_pinned(manifest: &Manifest, crates: &[String]) -> Result<()> {
+/// that, scoped to the prefix the refusal is about.
+fn refuse_pinned(prefix: &Path, manifest: &Manifest, crates: &[String]) -> Result<()> {
     let pinned: Vec<&str> = crates
         .iter()
         .filter(|n| manifest.crates.get(n.as_str()).is_some_and(|e| e.pinned))
@@ -3553,8 +3570,9 @@ fn refuse_pinned(manifest: &Manifest, crates: &[String]) -> Result<()> {
     if !pinned.is_empty() {
         let names = pinned.join(" ");
         bail!(
-            "pinned: {} (run `cargo lbin unpin {names}` first)",
-            pinned.join(", ")
+            "pinned: {} {}",
+            pinned.join(", "),
+            unpin_hint(prefix, &names)
         );
     }
     Ok(())
@@ -3593,20 +3611,36 @@ fn refuse_on_diagonal(
     target: &Version,
     named: bool,
     locked: bool,
+    scope: Option<&str>,
 ) -> Result<()> {
     if !is_install_diagonal(entry_locked, current, target, locked) {
         return Ok(());
     }
+    // The redirect is a command meant for pasting, so it carries the
+    // operation's scope; without an honest spelling it names the verbs
+    // instead.
+    let Some(arg) = scope else {
+        if named {
+            bail!(
+                "{name} {target} is already installed with this policy; \
+                 `pin` keeps it, `install --reinstall` rebuilds it"
+            );
+        }
+        bail!(
+            "{name} {target} is already the newest release with this policy; \
+             `install --reinstall` rebuilds it"
+        );
+    };
     if named {
         bail!(
             "{name} {target} is already installed with this policy\n  \
-             to pin the current installation:  cargo lbin pin {name}\n  \
-             to rebuild it:                    cargo lbin install --reinstall {name}"
+             to pin the current installation:  cargo lbin pin {name} {arg}\n  \
+             to rebuild it:                    cargo lbin install --reinstall {name} {arg}"
         );
     }
     bail!(
         "{name} {target} is already the newest release with this policy\n  \
-         to rebuild it: cargo lbin install --reinstall {name}"
+         to rebuild it: cargo lbin install --reinstall {name} {arg}"
     );
 }
 
@@ -3623,15 +3657,22 @@ fn refuse_on_diagonal(
 /// capability. Build if and only if the artifact specification changes
 /// or `--reinstall` asks; a pin is never the cause of a build, and
 /// never removed as a side effect.
-fn refuse_diagonal(manifest: &Manifest, spec: &InstallSpec, locked: bool) -> Result<()> {
+fn refuse_diagonal(
+    prefix: &Path,
+    manifest: &Manifest,
+    spec: &InstallSpec,
+    locked: bool,
+) -> Result<()> {
     let Some(entry) = manifest.crates.get(&spec.name) else {
         return Ok(());
     };
     let name = &spec.name;
+    let scope = pasteable_prefix(prefix);
+    let scope = scope.as_deref();
     let current = Version::parse(&entry.version)
         .with_context(|| format!("manifest holds unparsable version for `{name}`"))?;
     if let Some(v) = &spec.version {
-        return refuse_on_diagonal(name, entry.locked, &current, v, true, locked);
+        return refuse_on_diagonal(name, entry.locked, &current, v, true, locked, scope);
     }
     // A `--locked` flip is decidable locally and is the point of the
     // bare re-declaration — the project's one "unlock": no index
@@ -3641,7 +3682,7 @@ fn refuse_diagonal(manifest: &Manifest, spec: &InstallSpec, locked: bool) -> Res
     }
     let versions = index::published_versions(name)?;
     index::latest_relevant(&versions, &current).map_or(Ok(()), |latest| {
-        refuse_on_diagonal(name, entry.locked, &current, &latest, false, locked)
+        refuse_on_diagonal(name, entry.locked, &current, &latest, false, locked, scope)
     })
 }
 
@@ -3760,9 +3801,16 @@ fn cmd_pinned(prefix: &Path, check: bool, json: bool) -> ExitCode {
             if let Some(r) = &report {
                 eprintln!("update check: {}", report::describe_age(r.age()));
             } else {
-                eprintln!(
-                    "no update check recorded; run `cargo lbin checkupdate` or use `--check`"
-                );
+                match pasteable_prefix(prefix) {
+                    Some(arg) => eprintln!(
+                        "no update check recorded; run `cargo lbin checkupdate {arg}` \
+                         or use `--check`"
+                    ),
+                    None => eprintln!(
+                        "no update check recorded; run a `checkupdate` for this \
+                         installation, or use `--check`"
+                    ),
+                }
             }
         }
     }
@@ -3851,7 +3899,14 @@ fn cmd_list(prefix: &Path, json: bool) -> Result<()> {
     if let Some(r) = report {
         eprintln!("update check: {}", report::describe_age(r.age()));
     } else {
-        eprintln!("no update check recorded; run `cargo lbin checkupdate`");
+        match pasteable_prefix(prefix) {
+            Some(arg) => {
+                eprintln!("no update check recorded; run `cargo lbin checkupdate {arg}`");
+            }
+            None => {
+                eprintln!("no update check recorded; run a `checkupdate` for this installation");
+            }
+        }
     }
     Ok(())
 }
@@ -4238,7 +4293,7 @@ fn cmd_downgrade(prefix: &Path, name: &str) -> Result<()> {
     // it to another version — a re-interpretation of the standing
     // statement, not its preservation. The pin comes off explicitly.
     if entry.pinned {
-        bail!("pinned: {name} (run `cargo lbin unpin {name}` first)");
+        bail!("pinned: {name} {}", unpin_hint(prefix, name));
     }
     let current = Version::parse(&entry.version)
         .with_context(|| format!("manifest holds unparsable version for `{name}`"))?;
@@ -4249,9 +4304,16 @@ fn cmd_downgrade(prefix: &Path, name: &str) -> Result<()> {
         return Ok(());
     }
     if !std::io::stdin().is_terminal() {
-        bail!(
-            "downgrade asks which version to install; without a terminal, use `cargo lbin install {name}@VERSION`"
-        );
+        match pasteable_prefix(prefix) {
+            Some(arg) => bail!(
+                "downgrade asks which version to install; without a terminal, \
+                 use `cargo lbin install {name}@VERSION {arg}`"
+            ),
+            None => bail!(
+                "downgrade asks which version to install; without a terminal, \
+                 use lbin's `install` operation with {name}@VERSION for this installation"
+            ),
+        }
     }
     println!("{name} {current} is installed; older versions on crates.io:");
     let shown = &candidates[..candidates.len().min(DOWNGRADE_CHOICES)];
@@ -4259,10 +4321,16 @@ fn cmd_downgrade(prefix: &Path, name: &str) -> Result<()> {
         println!("  {}) {v}", i + 1);
     }
     if candidates.len() > shown.len() {
-        println!(
-            "  and {} older; use `cargo lbin install {name}@VERSION` for one of those",
-            candidates.len() - shown.len()
-        );
+        match pasteable_prefix(prefix) {
+            Some(arg) => println!(
+                "  and {} older; use `cargo lbin install {name}@VERSION {arg}` for one of those",
+                candidates.len() - shown.len()
+            ),
+            None => println!(
+                "  and {} older; one of those goes by lbin's `install` operation with {name}@VERSION for this installation",
+                candidates.len() - shown.len()
+            ),
+        }
     }
     print!(
         "select a version to install (1-{}), or Enter/q to abort: ",
@@ -4296,9 +4364,13 @@ fn cmd_downgrade(prefix: &Path, name: &str) -> Result<()> {
     if fresh.pinned {
         // A pin set while the prompt was open counts as changed state,
         // exactly as it does for `update`: the newer statement wins.
-        bail!(
-            "`{name}` was pinned while a version was being chosen; run `cargo lbin unpin {name}` first"
-        );
+        match pasteable_prefix(prefix) {
+            Some(arg) => bail!(
+                "`{name}` was pinned while a version was being chosen; \
+                 run `cargo lbin unpin {name} {arg}` first"
+            ),
+            None => bail!("`{name}` was pinned while a version was being chosen; unpin it first"),
+        }
     }
     let locked = fresh.locked;
     println!("downgrading {name} {current} -> {version}");
@@ -4405,7 +4477,7 @@ fn cmd_update(prefix: &Path, crates: &[String], all: bool, yes: bool) -> Result<
             .collect()
     } else {
         let targets = select_targets(&snapshot, crates)?;
-        refuse_pinned(&snapshot, crates)?;
+        refuse_pinned(prefix, &snapshot, crates)?;
         targets
     };
     for name in &skipped_pinned {
@@ -5581,16 +5653,31 @@ mod tests {
         let mut m = manifest_with(&["bat", "fd", "ripgrep"]);
         m.crates.get_mut("bat").unwrap().pinned = true;
         m.crates.get_mut("fd").unwrap().pinned = true;
-        let err = refuse_pinned(&m, &["ripgrep".into(), "bat".into(), "fd".into()])
-            .unwrap_err()
-            .to_string();
+        let err = refuse_pinned(
+            Path::new("/usr/local"),
+            &m,
+            &["ripgrep".into(), "bat".into(), "fd".into()],
+        )
+        .unwrap_err()
+        .to_string();
         assert!(err.contains("bat") && err.contains("fd"), "{err}");
         assert!(!err.contains("ripgrep"), "{err}");
-        // The suggested command is complete and runnable as printed.
-        assert!(err.contains("`cargo lbin unpin bat fd`"), "{err}");
+        // The suggested command is complete and runnable as printed —
+        // scope included, so it is true wherever it is pasted.
+        assert!(
+            err.contains("`cargo lbin unpin bat fd --prefix=/usr/local`"),
+            "{err}"
+        );
         // Unpinned selection, and names not in the manifest, pass: the
         // latter are `select_targets`' problem, not this check's.
-        assert!(refuse_pinned(&m, &["ripgrep".into(), "nope".into()]).is_ok());
+        assert!(
+            refuse_pinned(
+                Path::new("/usr/local"),
+                &m,
+                &["ripgrep".into(), "nope".into()]
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -5611,24 +5698,40 @@ mod tests {
         let cur = Version::parse("1.4.2").unwrap();
         // `@current-version`: two intents can hide behind it, and the
         // fork names both verbs.
-        let err = refuse_on_diagonal("foo", false, &cur, &cur, true, false)
+        let scope = Some("--prefix=/usr/local");
+        let err = refuse_on_diagonal("foo", false, &cur, &cur, true, false, scope)
             .unwrap_err()
             .to_string();
-        assert!(err.contains("cargo lbin pin foo"));
-        assert!(err.contains("cargo lbin install --reinstall foo"));
+        assert!(
+            err.contains("cargo lbin pin foo --prefix=/usr/local"),
+            "{err}"
+        );
+        assert!(
+            err.contains("cargo lbin install --reinstall foo --prefix=/usr/local"),
+            "{err}"
+        );
         // Bare on the newest: a rebuild is the only remaining effect.
-        let err = refuse_on_diagonal("foo", false, &cur, &cur, false, false)
+        let err = refuse_on_diagonal("foo", false, &cur, &cur, false, false, scope)
             .unwrap_err()
             .to_string();
         assert!(err.contains("newest release"));
-        assert!(err.contains("cargo lbin install --reinstall foo"));
+        assert!(
+            err.contains("cargo lbin install --reinstall foo --prefix=/usr/local"),
+            "{err}"
+        );
         assert!(!err.contains("cargo lbin pin"));
+        // No honest spelling for the prefix: verbs, not a command that
+        // is safe to paste and wrong to run.
+        let err = refuse_on_diagonal("foo", false, &cur, &cur, false, false, None)
+            .unwrap_err()
+            .to_string();
+        assert!(!err.contains("cargo lbin"), "{err}");
         // `--locked` flipping in either direction is a policy change
         // and builds; so does a different version.
-        assert!(refuse_on_diagonal("foo", true, &cur, &cur, true, false).is_ok());
-        assert!(refuse_on_diagonal("foo", false, &cur, &cur, false, true).is_ok());
+        assert!(refuse_on_diagonal("foo", true, &cur, &cur, true, false, scope).is_ok());
+        assert!(refuse_on_diagonal("foo", false, &cur, &cur, false, true, scope).is_ok());
         let newer = Version::parse("1.5.0").unwrap();
-        assert!(refuse_on_diagonal("foo", false, &cur, &newer, true, false).is_ok());
+        assert!(refuse_on_diagonal("foo", false, &cur, &newer, true, false, scope).is_ok());
     }
 
     #[test]
