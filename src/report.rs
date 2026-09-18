@@ -1,7 +1,14 @@
-//! Persisted result of the last update check — `checkupdate` from the
-//! command line, `r` in the interface, and `U`, which cannot ask the
-//! registry about a whole prefix and then pretend it did not. `list`
-//! and the JSON views annotate from it and refresh nothing. A cache in
+//! Persisted knowledge from update checks. Full sweeps (`checkupdate`
+//! from the command line, `r` in the interface, `U`'s plan) re-stamp
+//! the baseline; every partial question — `update NAME`, a bare
+//! install resolving the newest release, `pinned --check` — absorbs
+//! the facts it learned under their own timestamps. One sentence
+//! covers both: whenever lbin asks the registry to determine update
+//! status for a managed crate, that knowledge is recorded, whatever
+//! the scope of the question. (`info` stays a read-only view of
+//! crates.io and records nothing: browsing the registry is not a
+//! freshness determination about a managed entry.) `list` and the
+//! JSON views annotate from it and refresh nothing. A cache in
 //! the strict sense: losing it costs one check.
 //!
 //! A full snapshot, not just the outdated crates: a reader must tell
@@ -15,7 +22,7 @@
 use anyhow::{Context, Result};
 use semver::Version;
 use serde::{Deserialize, Serialize};
-use std::fs;
+use std::fs::{self, File, OpenOptions, TryLockError};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -23,10 +30,20 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 /// the newest version the index offered for it under the same pre-release
 /// rules `update` applies. `latest == current` means up to date.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+// The field deliberately mirrors `Report::checked_at`: same name, same
+// meaning, one level down — that symmetry is worth more than the lint.
+#[allow(clippy::struct_field_names)]
 pub struct Checked {
     pub name: String,
     pub current: Version,
     pub latest: Version,
+    /// Unix seconds when this one fact was learned — stamped the
+    /// moment its answer arrived. `None` appears only in records
+    /// written before this field existed and means "inherit
+    /// `Report::checked_at`", the baseline of the full check that
+    /// wrote them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checked_at: Option<u64>,
 }
 
 impl Checked {
@@ -42,10 +59,15 @@ pub enum Status<'a> {
     Outdated(&'a Version),
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Report {
-    /// Unix seconds at the time of the check.
-    pub checked_at: u64,
+    /// Unix seconds of the last full check — the baseline every
+    /// `Checked` without its own stamp inherits. `None` for a report
+    /// born from partial knowledge alone: no full check has happened,
+    /// and the field refuses to invent one. Every cache written before
+    /// this was a plain integer from a full check, so old files read
+    /// as `Some`.
+    pub checked_at: Option<u64>,
     /// The prefix the check was run against, as `identity` renders it.
     pub prefix: PathBuf,
     /// Every crate the check covered, outdated or not.
@@ -79,16 +101,75 @@ fn key(identity: &Path) -> String {
     format!("{hash:016x}")
 }
 
+/// Serializes writers of one prefix's report. `record_knowledge`'s
+/// read-modify-write would otherwise let a concurrent full sweep land
+/// between its load and its store and be quietly reverted — the cache
+/// stays a cache either way, but "last full check" must not travel
+/// backwards. Held only across load → absorb → store; the network
+/// queries that produced the facts happen before, outside it. Same
+/// std file-locking as `StateLock`, on the cache's side of the fence.
+pub struct CacheLock {
+    _file: File,
+}
+
+/// Take the write lock for this prefix's report. Blocking without a
+/// notice: the critical section is a file read and a file write, so a
+/// wait here is milliseconds, not someone's build.
+pub fn write_lock(cache: &Path, prefix: &Path) -> Result<CacheLock> {
+    let identity = identity(prefix)?;
+    let dir = cache.join("checkupdate");
+    fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    let path = dir.join(format!("{}.lock", key(&identity)));
+    let file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&path)
+        .with_context(|| format!("opening {}", path.display()))?;
+    match file.try_lock() {
+        Ok(()) => {}
+        Err(TryLockError::WouldBlock) => {
+            file.lock()
+                .with_context(|| format!("locking {}", path.display()))?;
+        }
+        Err(TryLockError::Error(e)) => {
+            return Err(e).with_context(|| format!("locking {}", path.display()));
+        }
+    }
+    Ok(CacheLock { _file: file })
+}
+
+/// Unix seconds now; zero if the clock predates the epoch.
+pub fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
 impl Report {
     pub fn new(prefix: &Path, crates: Vec<Checked>) -> Result<Self> {
-        let checked_at = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs());
         Ok(Self {
-            checked_at,
+            checked_at: Some(now_secs()),
             prefix: identity(prefix)?,
             crates,
         })
+    }
+
+    /// A report born from a partial check: no baseline — a partial
+    /// check is not a full one, and the field will not pretend — with
+    /// every fact carrying the moment it was learned, as absorbed
+    /// facts always do. The shape a `pinned --check` displays and the
+    /// shape `record_knowledge` grows are the same shape on purpose:
+    /// `Some` in the report's `checked_at` means a real full check
+    /// with no exception, temporary objects included.
+    pub fn partial(prefix: &Path, learned: Vec<Checked>) -> Result<Self> {
+        let mut report = Self {
+            checked_at: None,
+            prefix: identity(prefix)?,
+            crates: Vec::new(),
+        };
+        report.absorb(learned);
+        Ok(report)
     }
 
     pub fn path(cache: &Path, prefix: &Path) -> Result<PathBuf> {
@@ -141,12 +222,93 @@ impl Report {
         Ok(())
     }
 
-    /// Time since the check; zero if the clock has since moved backwards.
-    pub fn age(&self) -> Duration {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs());
-        Duration::from_secs(now.saturating_sub(self.checked_at))
+    /// Fold freshly learned facts in, each under the stamp it already
+    /// carries — set the moment its answer arrived, before any wait
+    /// for the lock, because knowledge is ordered by the query, not by
+    /// persistence, per fact and not per command. The baseline
+    /// `checked_at` is untouched: it belongs to the last full check,
+    /// and a partial one has no business re-dating knowledge it did
+    /// not renew. This is what retires the old rule against saving
+    /// partial snapshots — that rule guarded a single global
+    /// timestamp, and the lie it prevented is now unrepresentable.
+    ///
+    /// Monotonic per crate, strictly: a fact replaces only knowledge
+    /// older than itself. On a tie the stored fact stays — at
+    /// one-second resolution a tie is undecidable, and the rule
+    /// guarantees the one thing it can: a late writer never reverts
+    /// existing knowledge.
+    pub fn absorb(&mut self, learned: Vec<Checked>) {
+        let baseline = self.checked_at;
+        for fact in learned {
+            let at = fact
+                .checked_at
+                .expect("a learned fact carries the moment of its query");
+            match self.crates.iter_mut().find(|c| c.name == fact.name) {
+                Some(slot) => {
+                    if slot
+                        .checked_at
+                        .or(baseline)
+                        .is_none_or(|stored| at > stored)
+                    {
+                        *slot = fact;
+                    }
+                }
+                None => self.crates.push(fact),
+            }
+        }
+    }
+
+    /// Merge a completed full check with whatever landed while it ran,
+    /// so the stored report is monotonic in both dimensions: the
+    /// baseline never travels backwards (a newer full check that
+    /// stored first stays the baseline), and a per-crate fact learned
+    /// after this sweep's own moment survives it — a full check may
+    /// only replace knowledge older than itself. Facts folded across
+    /// reports have their stamps materialized first: `None` means
+    /// "inherit *my* report's baseline", and under the other report's
+    /// baseline it would quietly lie.
+    fn merged_with(self, current: Option<Self>) -> Self {
+        let Some(current) = current else {
+            return self;
+        };
+        // On a baseline tie the stored report wins — the same
+        // late-writer rule as `absorb`, one level up.
+        let (mut base, other) = if current.checked_at >= self.checked_at {
+            (current, self)
+        } else {
+            (self, current)
+        };
+        let other_baseline = other.checked_at;
+        for mut fact in other.crates {
+            fact.checked_at = fact.checked_at.or(other_baseline);
+            match base.crates.iter_mut().find(|c| c.name == fact.name) {
+                Some(slot) => {
+                    if fact.checked_at > slot.checked_at.or(base.checked_at) {
+                        *slot = fact;
+                    }
+                }
+                None => base.crates.push(fact),
+            }
+        }
+        base
+    }
+
+    /// Store a completed full check, reconciled under the cache lock
+    /// with anything that landed while the sweep's queries ran: see
+    /// `merged_with` for the two monotonicity guarantees. The caller
+    /// holds no lock across the network; this is where out-of-order
+    /// arrivals meet.
+    pub fn store_full(&self, cache: &Path) -> Result<()> {
+        let _lock = write_lock(cache, &self.prefix)?;
+        let current = Self::load(cache, &self.prefix)?;
+        self.clone().merged_with(current).store(cache)
+    }
+
+    /// Time since the last full check; `None` when none has happened.
+    /// Zero if the clock has since moved backwards.
+    pub fn age(&self) -> Option<Duration> {
+        self.checked_at
+            .map(|at| Duration::from_secs(now_secs().saturating_sub(at)))
     }
 
     /// What the report says about `name` as installed *now*: `None` when
@@ -232,6 +394,8 @@ mod tests {
                 name: "foo".to_owned(),
                 current: Version::parse("1.0.0").unwrap(),
                 latest: Version::parse("2.0.0").unwrap(),
+
+                checked_at: None,
             }],
         )
         .unwrap();
@@ -305,11 +469,13 @@ mod tests {
                 Checked {
                     name: "bat".to_owned(),
                     current: v("0.26.0"),
+                    checked_at: None,
                     latest: v("0.26.1"),
                 },
                 Checked {
                     name: "ripgrep".to_owned(),
                     current: v("14.1.1"),
+                    checked_at: None,
                     latest: v("14.1.1"),
                 },
             ],
@@ -329,7 +495,7 @@ mod tests {
             .unwrap();
         assert_eq!(loaded.crates, report.crates);
         assert_eq!(loaded.prefix, Path::new("/usr/local"));
-        assert!(loaded.age() < Duration::from_secs(60));
+        assert!(loaded.age().expect("a stored full check has an age") < Duration::from_secs(60));
 
         // Another prefix has no report.
         assert!(Report::load(&tmp, Path::new("/opt")).unwrap().is_none());
@@ -347,11 +513,13 @@ mod tests {
                 Checked {
                     name: "bat".to_owned(),
                     current: v("0.26.0"),
+                    checked_at: None,
                     latest: v("0.26.1"),
                 },
                 Checked {
                     name: "ripgrep".to_owned(),
                     current: v("14.1.1"),
+                    checked_at: None,
                     latest: v("14.1.1"),
                 },
             ],
@@ -377,6 +545,244 @@ mod tests {
         assert_eq!(report.status_for("bat", &v("0.26.2")), None);
         // Installed after the check: never covered — unknown.
         assert_eq!(report.status_for("fd", &v("1.0.0")), None);
+    }
+
+    #[test]
+    fn a_partial_report_never_claims_a_baseline() {
+        let report = Report::partial(
+            Path::new("/p"),
+            vec![Checked {
+                name: "bat".into(),
+                current: v("0.26.0"),
+                checked_at: Some(1_756_761_700),
+                latest: v("0.26.1"),
+            }],
+        )
+        .unwrap();
+        assert_eq!(report.checked_at, None, "a partial check is not a full one");
+        assert_eq!(report.crates[0].checked_at, Some(1_756_761_700));
+        assert_eq!(report.age(), None, "no baseline, no age to describe");
+    }
+
+    #[test]
+    fn absorb_is_monotonic_per_crate() {
+        let mut report = Report {
+            checked_at: Some(1000),
+            prefix: PathBuf::from("/p"),
+            crates: vec![Checked {
+                name: "bat".into(),
+                current: v("0.26.1"),
+                checked_at: Some(1500),
+                latest: v("0.26.1"),
+            }],
+        };
+        // An answer older than the knowledge on file arrives late and
+        // changes nothing — ordered by the query, not by persistence.
+        report.absorb(vec![Checked {
+            name: "bat".into(),
+            current: v("0.26.0"),
+            checked_at: Some(1400),
+            latest: v("0.26.0"),
+        }]);
+        let bat = &report.crates[0];
+        assert_eq!(
+            (bat.checked_at, bat.current.to_string().as_str()),
+            (Some(1500), "0.26.1")
+        );
+        // A tie is undecidable at one-second resolution: the stored
+        // fact stays, so a late writer never reverts knowledge.
+        report.absorb(vec![Checked {
+            name: "bat".into(),
+            current: v("0.26.0"),
+            checked_at: Some(1500),
+            latest: v("0.26.0"),
+        }]);
+        assert_eq!(report.crates[0].current, v("0.26.1"), "stored wins the tie");
+        // Strictly newer knowledge replaces baseline knowledge.
+        let mut swept = Report {
+            checked_at: Some(1000),
+            prefix: PathBuf::from("/p"),
+            crates: vec![Checked {
+                name: "fd".into(),
+                current: v("10.2.0"),
+                checked_at: None,
+                latest: v("10.2.0"),
+            }],
+        };
+        swept.absorb(vec![Checked {
+            name: "fd".into(),
+            current: v("10.3.0"),
+            checked_at: Some(1001),
+            latest: v("10.3.0"),
+        }]);
+        assert_eq!(swept.crates[0].checked_at, Some(1001));
+        assert_eq!(swept.crates[0].current, v("10.3.0"));
+    }
+
+    #[test]
+    fn a_full_check_never_travels_backwards() {
+        let older_sweep = Report {
+            checked_at: Some(100),
+            prefix: PathBuf::from("/p"),
+            crates: vec![Checked {
+                name: "bat".into(),
+                current: v("0.25.0"),
+                checked_at: None,
+                latest: v("0.25.0"),
+            }],
+        };
+        let newer_current = Report {
+            checked_at: Some(101),
+            prefix: PathBuf::from("/p"),
+            crates: vec![Checked {
+                name: "bat".into(),
+                current: v("0.26.0"),
+                checked_at: None,
+                latest: v("0.26.1"),
+            }],
+        };
+        let merged = older_sweep.merged_with(Some(newer_current));
+        assert_eq!(
+            merged.checked_at,
+            Some(101),
+            "the baseline never travels backwards"
+        );
+        // Equal baselines: the stored report wins the tie, the same
+        // late-writer rule one level up.
+        let incoming = Report {
+            checked_at: Some(100),
+            prefix: PathBuf::from("/p"),
+            crates: vec![Checked {
+                name: "tied".into(),
+                current: v("0.25.0"),
+                checked_at: None,
+                latest: v("0.25.0"),
+            }],
+        };
+        let stored = Report {
+            checked_at: Some(100),
+            prefix: PathBuf::from("/p"),
+            crates: vec![Checked {
+                name: "tied".into(),
+                current: v("0.25.0"),
+                checked_at: None,
+                latest: v("0.25.1"),
+            }],
+        };
+        let tied = incoming.merged_with(Some(stored));
+        assert_eq!(
+            tied.crates
+                .iter()
+                .find(|c| c.name == "tied")
+                .unwrap()
+                .latest,
+            v("0.25.1"),
+            "stored wins the tie"
+        );
+        assert_eq!(
+            merged.crates[0].latest,
+            v("0.26.1"),
+            "newer knowledge survives an older writer"
+        );
+    }
+
+    #[test]
+    fn a_full_check_keeps_fresher_partial_facts() {
+        let sweep = Report {
+            checked_at: Some(100),
+            prefix: PathBuf::from("/p"),
+            crates: vec![Checked {
+                name: "foo".into(),
+                current: v("1.0.0"),
+                checked_at: None,
+                latest: v("1.0.0"),
+            }],
+        };
+        let with_partial = Report {
+            checked_at: Some(90),
+            prefix: PathBuf::from("/p"),
+            crates: vec![Checked {
+                name: "foo".into(),
+                current: v("1.0.0"),
+                checked_at: Some(101),
+                latest: v("1.1.0"),
+            }],
+        };
+        let merged = sweep.merged_with(Some(with_partial));
+        assert_eq!(merged.checked_at, Some(100), "the sweep's baseline stands");
+        let foo = &merged.crates[0];
+        assert_eq!(
+            (foo.checked_at, foo.latest.to_string().as_str()),
+            (Some(101), "1.1.0"),
+            "a fact learned after the sweep's moment survives it, stamp materialized"
+        );
+    }
+
+    #[test]
+    fn absorb_stamps_facts_without_redating_the_baseline() {
+        let mut report = Report::new(
+            Path::new("/p"),
+            vec![Checked {
+                name: "bat".into(),
+                current: v("0.26.0"),
+                checked_at: None,
+                latest: v("0.26.1"),
+            }],
+        )
+        .unwrap();
+        let baseline = report.checked_at.expect("Report::new stamps a baseline");
+        report.absorb(vec![Checked {
+            name: "bat".into(),
+            current: v("0.26.1"),
+            checked_at: Some(baseline + 100),
+            latest: v("0.26.1"),
+        }]);
+        report.absorb(vec![Checked {
+            name: "fd".into(),
+            current: v("10.3.0"),
+            checked_at: Some(baseline + 200),
+            latest: v("10.3.0"),
+        }]);
+        assert_eq!(
+            report.checked_at,
+            Some(baseline),
+            "a partial check re-dates nothing it did not renew"
+        );
+        let bat = report.crates.iter().find(|c| c.name == "bat").unwrap();
+        assert_eq!(
+            bat.current,
+            v("0.26.1"),
+            "the fact is replaced, not duplicated"
+        );
+        assert_eq!(bat.checked_at, Some(baseline + 100));
+        let fd = report.crates.iter().find(|c| c.name == "fd").unwrap();
+        assert_eq!(
+            fd.checked_at,
+            Some(baseline + 200),
+            "a new fact joins under its own stamp"
+        );
+    }
+
+    #[test]
+    fn a_report_from_before_the_option_reads_its_baseline() {
+        let raw = r#"{"checked_at":123,"prefix":"/usr/local","crates":[{"name":"bat","current":"0.26.0","latest":"0.26.1"}]}"#;
+        let report: Report = serde_json::from_str(raw).unwrap();
+        assert_eq!(
+            report.checked_at,
+            Some(123),
+            "u64 -> Option<u64> reads old caches as Some(old_value)"
+        );
+        assert_eq!(report.crates[0].checked_at, None);
+    }
+
+    #[test]
+    fn a_record_from_before_the_field_reads_as_baseline() {
+        let raw = r#"{"name":"bat","current":"0.26.0","latest":"0.26.1"}"#;
+        let checked: Checked = serde_json::from_str(raw).unwrap();
+        assert_eq!(
+            checked.checked_at, None,
+            "old caches load; None means the report's baseline"
+        );
     }
 
     #[test]

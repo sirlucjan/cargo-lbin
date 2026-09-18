@@ -99,7 +99,7 @@ impl ListOutput {
         Self {
             schema: SCHEMA,
             prefix,
-            checked_at: report.map(|r| r.checked_at),
+            checked_at: report.and_then(|r| r.checked_at),
             crates,
         }
     }
@@ -189,7 +189,7 @@ impl PinnedOutput {
         Self {
             schema: SCHEMA,
             prefix,
-            checked_at: report.map(|r| r.checked_at),
+            checked_at: report.and_then(|r| r.checked_at),
             crates,
         }
     }
@@ -200,7 +200,9 @@ impl CheckOutput {
         Self {
             schema: SCHEMA,
             prefix: report.prefix.clone(),
-            checked_at: report.checked_at,
+            checked_at: report
+                .checked_at
+                .expect("a fresh sweep always carries its baseline"),
             crates: report
                 .crates
                 .iter()
@@ -305,12 +307,13 @@ mod tests {
 
     fn report() -> Report {
         Report {
-            checked_at: 1_756_761_600,
+            checked_at: Some(1_756_761_600),
             prefix: PathBuf::from("/usr/local"),
             crates: vec![
                 Checked {
                     name: "bat".to_owned(),
                     current: v("0.26.0"),
+                    checked_at: None,
                     latest: v("0.26.1"),
                 },
                 // Checked against an older fd, and updated since to the
@@ -321,6 +324,7 @@ mod tests {
                 Checked {
                     name: "fd".to_owned(),
                     current: v("10.2.0"),
+                    checked_at: None,
                     latest: v("10.3.0"),
                 },
                 // Up to date, yet `latest` below `current`: 14.1.1 was
@@ -328,6 +332,7 @@ mod tests {
                 Checked {
                     name: "ripgrep".to_owned(),
                     current: v("14.1.1"),
+                    checked_at: None,
                     latest: v("14.1.0"),
                 },
             ],
@@ -427,6 +432,8 @@ mod tests {
                 name: "fd".to_owned(),
                 current: Version::parse("10.2.0").unwrap(),
                 latest: Version::parse("10.3.0").unwrap(),
+
+                checked_at: None,
             }],
         )
         .unwrap();

@@ -2875,7 +2875,23 @@ pub(crate) fn tui_update_sweep_check(
         )?;
         Manifest::load(prefix)?
     };
-    check_versions(&manifest.crates, should_cancel)
+    let checked = check_versions(&manifest.crates, should_cancel)?;
+    if let Some(checked) = &checked {
+        // The module doc has promised this from the start: `U` cannot
+        // ask the registry about a whole prefix and then pretend it did
+        // not. A completed sweep is a full check and re-stamps the
+        // baseline like `checkupdate`. A cancelled one records nothing
+        // — a deliberate exception to knowledge-at-the-query: the sweep
+        // answers as one statement or not at all. Salvaging the crates
+        // it did ask about would be legal under the model; it is a
+        // future decision, not an accident of this one.
+        let stored = Report::new(prefix, checked.clone())
+            .and_then(|report| cache_dir().and_then(|cache| report.store_full(&cache)));
+        if let Err(e) = stored {
+            eprintln!("warning: could not save update report: {e:#}");
+        }
+    }
+    Ok(checked)
 }
 
 /// `update --all` for the captured frontend: the confirmed plan,
@@ -3128,6 +3144,7 @@ pub(crate) fn tui_update_plan(prefix: &Path, name: &str) -> Result<UpdatePlan> {
     let checked = check_versions([(&name.to_owned(), &entry)], || false)?
         .and_then(|mut c| c.pop())
         .with_context(|| format!("no version information for `{name}`"))?;
+    record_knowledge(prefix, vec![checked.clone()]);
     Ok(if checked.is_outdated() {
         UpdatePlan::Outdated {
             current,
@@ -3674,16 +3691,84 @@ fn refuse_diagonal(
     if let Some(v) = &spec.version {
         return refuse_on_diagonal(name, entry.locked, &current, v, true, locked, scope);
     }
-    // A `--locked` flip is decidable locally and is the point of the
-    // bare re-declaration — the project's one "unlock": no index
-    // question is needed to know the build is real.
-    if entry.locked != locked {
+    // Every bare install resolves the newest release, so every bare
+    // install asks — a deliberate lookup, not a side effect. Whether
+    // the gate then refuses or a build runs, the registry has answered
+    // about this crate and the answer is recorded: knowledge is born
+    // at the query, not at the outcome.
+    //
+    // The `--locked` flip is the one caller that does not need the
+    // answer — the build is real on policy grounds alone, the
+    // project's one "unlock" — so on that path the lookup is
+    // opportunistic: a failure records nothing and blocks nothing,
+    // because the build about to run will ask the registry itself and
+    // fail louder. Off the flip the diagonal cannot be decided without
+    // the answer, and a failed lookup stays the error it is.
+    let flip = entry.locked != locked;
+    let latest = match index::published_versions(name) {
+        Ok(versions) => index::latest_relevant(&versions, &current),
+        Err(_) if flip => None,
+        Err(e) => return Err(e),
+    };
+    if let Some(latest) = &latest {
+        record_knowledge(
+            prefix,
+            vec![Checked {
+                name: name.clone(),
+                current: current.clone(),
+                latest: latest.clone(),
+                // Stamped at the answer, before any wait the write may
+                // incur: knowledge is ordered by the query, not by
+                // persistence.
+                checked_at: Some(report::now_secs()),
+            }],
+        );
+    }
+    if flip {
         return Ok(());
     }
-    let versions = index::published_versions(name)?;
-    index::latest_relevant(&versions, &current).map_or(Ok(()), |latest| {
-        refuse_on_diagonal(name, entry.locked, &current, &latest, false, locked, scope)
-    })
+    let Some(latest) = latest else {
+        return Ok(());
+    };
+    refuse_on_diagonal(name, entry.locked, &current, &latest, false, locked, scope)
+}
+
+/// The registry has just answered about these managed crates; write
+/// that down.
+///
+/// The other half of `report.rs`'s opening sentence, at fact
+/// granularity: whenever a managed-lifecycle operation resolves
+/// update status, the answer is recorded, whether it asked about the
+/// whole prefix or one crate — and only those operations; `info`
+/// browses and records nothing. Best-effort
+/// like every cache write — a failure is a warning, never the
+/// operation's error, because the knowledge was for the report, not
+/// for the operation that happened to acquire it.
+fn record_knowledge(prefix: &Path, learned: Vec<Checked>) {
+    if learned.is_empty() {
+        return;
+    }
+    if let Err(e) = absorb_and_store(prefix, learned) {
+        eprintln!("warning: could not record the update check: {e:#}");
+    }
+}
+
+/// The one read-modify-write of the report cache, serialized by the
+/// cache-side lock so a concurrent full sweep cannot land between the
+/// load and the store and be quietly reverted. Returns the merged
+/// report: `pinned --check` displays exactly what it recorded.
+fn absorb_and_store(prefix: &Path, learned: Vec<Checked>) -> Result<Report> {
+    let cache = cache_dir()?;
+    let _lock = report::write_lock(&cache, prefix)?;
+    let mut report = match Report::load(&cache, prefix)? {
+        Some(report) => report,
+        // First knowledge before any full check: a partial-born
+        // report, with no baseline to invent.
+        None => Report::partial(prefix, Vec::new())?,
+    };
+    report.absorb(learned);
+    report.store(&cache)?;
+    Ok(report)
 }
 
 /// `pin`/`unpin`: one manifest write for the selection. Already in the
@@ -3725,15 +3810,21 @@ fn cmd_pinned(prefix: &Path, check: bool, json: bool) -> ExitCode {
             let _lock = StateLock::acquire(prefix, &Mode::Shared)?;
             Manifest::load(prefix)?
         };
-        // Statuses come from one source, never a blend: the recorded report,
-        // or a fresh pinned-only query that is deliberately not persisted —
-        // a partial snapshot would misinform `list`.
+        // Statuses shown come from one source, never a blend: the
+        // recorded report, or a fresh pinned-only query. The query's
+        // facts are persisted per entry — the rule that once forbade
+        // saving a partial snapshot guarded a single global timestamp,
+        // and every fact now carries its own.
         let report = if check {
-            Some(Report::new(
-                prefix,
+            // Partial by construction: a pinned-only query is not a
+            // full check, and even this moment's throwaway object must
+            // not claim the baseline a `--json` consumer would read.
+            let learned =
                 check_versions(manifest.crates.iter().filter(|(_, e)| e.pinned), || false)?
-                    .expect("a `|| false` token never cancels"),
-            )?)
+                    .expect("a `|| false` token never cancels");
+            let fresh = Report::partial(prefix, learned)?;
+            record_knowledge(prefix, fresh.crates.clone());
+            Some(fresh)
         } else {
             match cache_dir().and_then(|cache| Report::load(&cache, prefix)) {
                 Ok(report) => report,
@@ -3798,8 +3889,8 @@ fn cmd_pinned(prefix: &Path, check: bool, json: bool) -> ExitCode {
         // parser. Under `--check` the statuses are from this very moment
         // and the line would only state the obvious.
         if !check {
-            if let Some(r) = &report {
-                eprintln!("update check: {}", report::describe_age(r.age()));
+            if let Some(age) = report.as_ref().and_then(Report::age) {
+                eprintln!("update check: {}", report::describe_age(age));
             } else {
                 match pasteable_prefix(prefix) {
                     Some(arg) => eprintln!(
@@ -3896,8 +3987,8 @@ fn cmd_list(prefix: &Path, json: bool) -> Result<()> {
     }
     // Status goes to stderr: it is for the person reading the terminal,
     // not for whatever may be parsing stdout.
-    if let Some(r) = report {
-        eprintln!("update check: {}", report::describe_age(r.age()));
+    if let Some(age) = report.as_ref().and_then(Report::age) {
+        eprintln!("update check: {}", report::describe_age(age));
     } else {
         match pasteable_prefix(prefix) {
             Some(arg) => {
@@ -3956,6 +4047,10 @@ fn check_versions<'a>(
             name: name.clone(),
             current,
             latest,
+            // Stamped the moment this crate's answer arrived — not when
+            // the batch, the command, or the store finishes. Knowledge
+            // is ordered by the query, per fact.
+            checked_at: Some(report::now_secs()),
         });
     }
     Ok(Some(checked))
@@ -4407,7 +4502,10 @@ fn cmd_checkupdate(prefix: &Path, json: bool) -> ExitCode {
         Ok(report) => {
             // Persist the snapshot before reporting; a failed write is a warning
             // — the check succeeded and the exit code must say so.
-            if let Err(e) = cache_dir().and_then(|cache| report.store(&cache)) {
+            // Reconciled under the cache lock with anything that landed
+            // while the queries ran: neither the baseline nor a fresher
+            // per-crate fact travels backwards.
+            if let Err(e) = cache_dir().and_then(|cache| report.store_full(&cache)) {
                 eprintln!("warning: could not save update report: {e:#}");
             }
             let any = report.crates.iter().any(Checked::is_outdated);
@@ -4486,17 +4584,18 @@ fn cmd_update(prefix: &Path, crates: &[String], all: bool, yes: bool) -> Result<
             snapshot.crates[*name].version
         );
     }
-    let outdated: Vec<Checked> = check_versions(
+    let checked = check_versions(
         snapshot
             .crates
             .iter()
             .filter(|(name, _)| targets.contains(name.as_str())),
         || false,
     )?
-    .expect("a `|| false` token never cancels")
-    .into_iter()
-    .filter(Checked::is_outdated)
-    .collect();
+    .expect("a `|| false` token never cancels");
+    // What the lookup learned outlives what this run does with it,
+    // each fact stamped at its own answer inside check_versions.
+    record_knowledge(prefix, checked.clone());
+    let outdated: Vec<Checked> = checked.into_iter().filter(Checked::is_outdated).collect();
     // Explicitly named crates that need nothing get a line each: the user
     // asked about them by name and should not have to infer "up to date"
     // from silence.

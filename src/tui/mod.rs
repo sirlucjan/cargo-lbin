@@ -1449,7 +1449,7 @@ impl App {
         // Once per reload, lockless by design (see the prefixes module).
         let also = crate::prefixes::also_installed(&self.prefix);
         self.rows = rows_from(&manifest, report, &also);
-        self.report_age = report.map(Report::age);
+        self.report_age = report.and_then(Report::age);
         self.clamp_selection();
         Ok(ReloadOutcome::Loaded)
     }
@@ -4973,11 +4973,13 @@ mod tests {
                 Checked {
                     name: "bat".to_owned(),
                     current: v("0.26.0"),
+                    checked_at: None,
                     latest: v("0.26.1"),
                 },
                 Checked {
                     name: "ripgrep".to_owned(),
                     current: v("14.1.1"),
+                    checked_at: None,
                     latest: v("14.1.1"),
                 },
                 // Checked against an older version, and updated since to
@@ -4986,6 +4988,7 @@ mod tests {
                 Checked {
                     name: "fd".to_owned(),
                     current: v("10.2.0"),
+                    checked_at: None,
                     latest: v("10.3.0"),
                 },
                 // Checked against an older version and updated past it,
@@ -4993,6 +4996,7 @@ mod tests {
                 Checked {
                     name: "sd".to_owned(),
                     current: v("1.0.0"),
+                    checked_at: None,
                     latest: v("1.1.0"),
                 },
             ],
@@ -6135,6 +6139,7 @@ mod tests {
                 name: name.to_owned(),
                 current: Version::parse("1.0.0").unwrap(),
                 latest: Version::parse(latest).unwrap(),
+                checked_at: None,
             })
             .collect();
         app.finish_update_sweep_check(Ok(Some(checked)));
