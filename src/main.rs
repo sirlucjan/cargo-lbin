@@ -2742,12 +2742,17 @@ pub(crate) fn tui_install_batch(
         &mut |s| on_line(LineKind::Notice, s),
     )?;
     let mut manifest = Manifest::load(prefix)?;
-    // The whole plan, before the first build: a pin refusal or a typo
-    // must not arrive after ten minutes of compiling. Same gate as
-    // `cmd_install`: every plain install of a pinned crate is refused,
-    // versioned or not.
+    // The whole plan, before the first build: a pin refusal, a typo or
+    // a no-change member must not arrive after ten minutes of
+    // compiling. Same gates as `cmd_install`: every plain install of a
+    // pinned crate is refused, versioned or not, and a member whose
+    // artifact specification does not change is redirected to
+    // `--reinstall`.
     let names: Vec<String> = specs.iter().map(|s| s.name.clone()).collect();
     refuse_pinned(&manifest, &names)?;
+    for spec in specs {
+        refuse_diagonal(&manifest, spec, locked)?;
+    }
     for w in duplicate_install_warnings(prefix, &manifest, specs.iter().map(|s| s.name.as_str())) {
         on_line(LineKind::Warning, &w);
     }
@@ -3252,8 +3257,9 @@ pub(crate) fn tui_install_one(
         &mut |s| on_line(LineKind::Notice, s),
     )?;
     let mut manifest = Manifest::load(prefix)?;
-    // Same gate as `cmd_install`, single-member edition.
+    // Same gates as `cmd_install`, single-member edition.
     refuse_pinned(&manifest, std::slice::from_ref(&spec.name))?;
+    refuse_diagonal(&manifest, spec, locked)?;
     let mut frontend = Frontend::Captured {
         on_line,
         before_placement,
@@ -3301,10 +3307,16 @@ fn cmd_install(prefix: &Path, crates: &[String], locked: bool, reinstall: bool) 
     // resolving the newest release, `@VERSION` by re-pinning. Both are
     // refused before the first build; the pin comes off explicitly
     // first. `--reinstall` restates the entry, pin included, so it has
-    // nothing to refuse.
+    // nothing to refuse. And a member whose artifact specification
+    // changes nothing — same effective version, same `--locked` — is
+    // redirected to the verb that says what it does (see
+    // `refuse_diagonal`).
     if !reinstall {
         let names: Vec<String> = specs.iter().map(|s| s.name.clone()).collect();
         refuse_pinned(&manifest, &names)?;
+        for spec in &specs {
+            refuse_diagonal(&manifest, spec, locked)?;
+        }
     }
     // Every plan is resolved before the first build: "not installed" is
     // knowable from the manifest alone, and a batch that discovers it
@@ -3546,6 +3558,91 @@ fn refuse_pinned(manifest: &Manifest, crates: &[String]) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// The install diagonal: does the requested artifact specification
+/// match what is already installed? Only version and `--locked` count
+/// — they are the specification of the artifact. The pin is
+/// deliberately absent: it is a constraint on future operations, not a
+/// parameter of the build, so it is never a reason to build (`pin`
+/// sets it without one), and a pinned entry never reaches this check —
+/// `refuse_pinned` runs first.
+fn is_install_diagonal(
+    entry_locked: bool,
+    current: &Version,
+    target: &Version,
+    locked: bool,
+) -> bool {
+    entry_locked == locked && current == target
+}
+
+/// The diagonal's two refusals, chosen by how the version was stated.
+/// Split from the resolution below so the contract is testable without
+/// a registry.
+///
+/// For a bare install, reaching the diagonal means a rebuild is the
+/// only remaining effect, and `--reinstall` names that intent
+/// directly. For `@current-version`, pinning is an additional,
+/// independent intent: the refusal names both `pin` and
+/// `--reinstall`, and their composition expresses pin+rebuild without
+/// giving it another verb.
+fn refuse_on_diagonal(
+    name: &str,
+    entry_locked: bool,
+    current: &Version,
+    target: &Version,
+    named: bool,
+    locked: bool,
+) -> Result<()> {
+    if !is_install_diagonal(entry_locked, current, target, locked) {
+        return Ok(());
+    }
+    if named {
+        bail!(
+            "{name} {target} is already installed with this policy\n  \
+             to pin the current installation:  cargo lbin pin {name}\n  \
+             to rebuild it:                    cargo lbin install --reinstall {name}"
+        );
+    }
+    bail!(
+        "{name} {target} is already the newest release with this policy\n  \
+         to rebuild it: cargo lbin install --reinstall {name}"
+    );
+}
+
+/// Refuse a plain `install` whose artifact specification changes
+/// nothing.
+///
+/// Version and `--locked` are the artifact specification; the pin is
+/// not part of it. Runs after `refuse_pinned`, so any entry seen here
+/// is unpinned. For a named version the comparison is local; for a
+/// bare install the effective version is the newest eligible release,
+/// by the same rules `update` uses — one index query per
+/// already-managed member, made before the first build under the lock
+/// the builds already hold. The refusal costs a verb, not a
+/// capability. Build if and only if the artifact specification changes
+/// or `--reinstall` asks; a pin is never the cause of a build, and
+/// never removed as a side effect.
+fn refuse_diagonal(manifest: &Manifest, spec: &InstallSpec, locked: bool) -> Result<()> {
+    let Some(entry) = manifest.crates.get(&spec.name) else {
+        return Ok(());
+    };
+    let name = &spec.name;
+    let current = Version::parse(&entry.version)
+        .with_context(|| format!("manifest holds unparsable version for `{name}`"))?;
+    if let Some(v) = &spec.version {
+        return refuse_on_diagonal(name, entry.locked, &current, v, true, locked);
+    }
+    // A `--locked` flip is decidable locally and is the point of the
+    // bare re-declaration — the project's one "unlock": no index
+    // question is needed to know the build is real.
+    if entry.locked != locked {
+        return Ok(());
+    }
+    let versions = index::published_versions(name)?;
+    index::latest_relevant(&versions, &current).map_or(Ok(()), |latest| {
+        refuse_on_diagonal(name, entry.locked, &current, &latest, false, locked)
+    })
 }
 
 /// `pin`/`unpin`: one manifest write for the selection. Already in the
@@ -5494,6 +5591,44 @@ mod tests {
         // Unpinned selection, and names not in the manifest, pass: the
         // latter are `select_targets`' problem, not this check's.
         assert!(refuse_pinned(&m, &["ripgrep".into(), "nope".into()]).is_ok());
+    }
+
+    #[test]
+    fn diagonal_is_version_and_policy_only() {
+        let cur = Version::parse("1.4.2").unwrap();
+        let newer = Version::parse("1.5.0").unwrap();
+        // Same version, same policy: the artifact specification stands.
+        assert!(is_install_diagonal(false, &cur, &cur, false));
+        assert!(is_install_diagonal(true, &cur, &cur, true));
+        // Either axis moving is a real change and builds.
+        assert!(!is_install_diagonal(false, &cur, &cur, true));
+        assert!(!is_install_diagonal(true, &cur, &cur, false));
+        assert!(!is_install_diagonal(false, &cur, &newer, false));
+    }
+
+    #[test]
+    fn diagonal_refusals_name_the_right_verbs() {
+        let cur = Version::parse("1.4.2").unwrap();
+        // `@current-version`: two intents can hide behind it, and the
+        // fork names both verbs.
+        let err = refuse_on_diagonal("foo", false, &cur, &cur, true, false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("cargo lbin pin foo"));
+        assert!(err.contains("cargo lbin install --reinstall foo"));
+        // Bare on the newest: a rebuild is the only remaining effect.
+        let err = refuse_on_diagonal("foo", false, &cur, &cur, false, false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("newest release"));
+        assert!(err.contains("cargo lbin install --reinstall foo"));
+        assert!(!err.contains("cargo lbin pin"));
+        // `--locked` flipping in either direction is a policy change
+        // and builds; so does a different version.
+        assert!(refuse_on_diagonal("foo", true, &cur, &cur, true, false).is_ok());
+        assert!(refuse_on_diagonal("foo", false, &cur, &cur, false, true).is_ok());
+        let newer = Version::parse("1.5.0").unwrap();
+        assert!(refuse_on_diagonal("foo", false, &cur, &newer, true, false).is_ok());
     }
 
     #[test]
@@ -8325,7 +8460,11 @@ mod tests {
         tui_install_batch(
             &prefix,
             &specs,
-            false,
+            // `true` against entries seeded `locked = false`: these
+            // tests are about ordering and cancel windows, not the
+            // diagonal — a declared policy change keeps the gate local
+            // and offline.
+            true,
             &mut |_, _| {},
             &mut |_| Ok(()),
             &control,
@@ -8377,7 +8516,9 @@ mod tests {
         tui_install_batch(
             &prefix,
             &specs,
-            false,
+            // `true`: policy change keeps the diagonal gate local and
+            // offline (see the stop-at-first-failure test).
+            true,
             &mut |_, _| {},
             &mut |_| Ok(()),
             &control,
@@ -8415,7 +8556,9 @@ mod tests {
         let end = tui_install_batch(
             &prefix,
             &specs,
-            false,
+            // `true`: policy change keeps the diagonal gate local and
+            // offline (see the stop-at-first-failure test).
+            true,
             &mut |_, _| {},
             &mut |_| Ok(()),
             &control,
@@ -8457,7 +8600,9 @@ mod tests {
         let end = tui_install_batch(
             &prefix,
             &specs,
-            false,
+            // `true`: policy change keeps the diagonal gate local and
+            // offline (see the stop-at-first-failure test).
+            true,
             // The cancel arrives while this member is building, once:
             // pressing `c` repeatedly is a different test, and would
             // escalate to SIGKILL instead of characterizing the first
