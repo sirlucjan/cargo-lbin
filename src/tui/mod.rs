@@ -2321,14 +2321,14 @@ impl App {
 
     /// Does the pin refuse this request?
     ///
-    /// Only an install, and only an unversioned one. A pin refuses
-    /// `install NAME` because that resolves the newest release and
-    /// moves the crate off the version it declares — but a downgrade
-    /// names its version, and a reinstall *restates the entry*, pin
-    /// included. Applying the refusal to those two would turn the pin
-    /// from a thing to preserve into a reason to refuse preserving it:
-    /// `t` on a pinned crate would be blocked by the very fact it was
-    /// about to keep.
+    /// Every plain install, versioned or not: bare resolves the newest
+    /// release, `@VERSION` re-pins — both re-interpret the standing
+    /// pin instead of preserving it, so both wait for an explicit
+    /// unpin. A reinstall *restates the entry*, pin included; refusing
+    /// it would turn the pin from a thing to preserve into a reason to
+    /// refuse preserving it: `t` on a pinned crate would be blocked by
+    /// the very fact it was about to keep. Downgrade is gated at its
+    /// own entrance, before the version list opens.
     fn refuses_for_pin(&mut self, intent: &BuildIntent, spec: &InstallSpec) -> Option<String> {
         if !matches!(intent, BuildIntent::Install) {
             return None;
@@ -2344,9 +2344,6 @@ impl App {
     /// whoever asked for the build — a person, who wants it in the
     /// footer, or a queue, which must record it as this member's fate.
     fn advisory_pin_refusal(&mut self, spec: &InstallSpec) -> Option<String> {
-        if spec.version.is_some() {
-            return None;
-        }
         let advisory = StateLock::try_acquire_with(
             &self.prefix,
             &Mode::Shared,
@@ -2356,10 +2353,7 @@ impl App {
         if let Ok(Some(_lock)) = advisory {
             match Manifest::load(&self.prefix) {
                 Ok(m) if m.crates.get(&spec.name).is_some_and(|e| e.pinned) => {
-                    return Some(format!(
-                        "{} is pinned; `p` unpins it, or name a version to re-pin",
-                        spec.name
-                    ));
+                    return Some(format!("{} is pinned; `p` unpins it first", spec.name));
                 }
                 Ok(_) => {}
                 Err(e) => return Some(format!("{e:#}")),
@@ -4297,11 +4291,14 @@ impl App {
         let Some(row) = self.selected_row() else {
             return;
         };
-        // A pinned crate is offered the list like any other: the pin is a
-        // standing instruction and an exact version is how it is
-        // restated, which is exactly what a digit supplies — the CLI
-        // command has always allowed this.
-        let (name, current) = (row.name.clone(), row.version.clone());
+        // Same gate as the CLI: a downgrade would re-pin the crate to
+        // another version — a re-interpretation of the standing
+        // statement, not its preservation. `t` preserves; this changes.
+        let (name, current, pinned) = (row.name.clone(), row.version.clone(), row.pinned);
+        if pinned {
+            self.error(&format!("{name} is pinned; `p` unpins it first"));
+            return;
+        }
         let Ok(parsed) = Version::parse(&current) else {
             self.error(&format!(
                 "manifest holds unparsable version for `{name}`; verify says more"
@@ -5517,9 +5514,9 @@ mod tests {
     }
 
     /// A pin is what `t` preserves, so it cannot be what stops `t`.
-    /// The refusal belongs to `install NAME`, which would resolve the
-    /// newest release; a reinstall restates the entry, pin included,
-    /// and a downgrade names its own version.
+    /// The refusal belongs to plain installs; a reinstall restates the
+    /// entry, pin included, and a downgrade is gated at its own
+    /// entrance, before its list opens.
     #[test]
     fn a_pin_refuses_an_install_and_lets_a_rebuild_through() {
         let root = std::env::temp_dir().join("cargo-lbin-test-tui-pin-gate");
@@ -5549,7 +5546,7 @@ mod tests {
         assert!(
             app.refuses_for_pin(&BuildIntent::Downgrade("1.2.0".to_owned()), &bare)
                 .is_none(),
-            "and a downgrade names the version it wants"
+            "a downgrade is gated at its own entrance, not here"
         );
 
         // An unpinned crate refuses nothing, whatever the intent.
@@ -6510,12 +6507,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// A pinned crate is downgraded like any other — the CLI command
-    /// always allowed it, and the digit supplies exactly the "name a
-    /// version" the pin asks for. The pin itself is not touched here:
-    /// `install NAME@VERSION` re-pins, which is the door this takes.
+    /// The pin gate stands before the version list: a downgrade would
+    /// re-pin the crate to another version, re-interpreting the
+    /// standing statement instead of preserving it. `t` preserves and
+    /// passes the gate; `D` waits for an explicit unpin.
     #[test]
-    fn a_pinned_crate_is_offered_the_list_like_any_other() {
+    fn a_pinned_crate_is_refused_the_list_until_unpinned() {
         let root = std::env::temp_dir().join("cargo-lbin-test-tui-downgrade-pinned");
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
@@ -6523,15 +6520,14 @@ mod tests {
         let mut m = manifest(&[("foo", "1.2.0")]);
         m.crates.get_mut("foo").unwrap().pinned = true;
         app.rows = rows_from(&m, None, &BTreeMap::new());
+        app.selected = 0;
 
-        app.finish_downgrade("foo".into(), "1.2.0".into(), vec![v("1.1.0")]);
+        app.start_downgrade();
         assert!(
-            app.downgrade_choice.is_some(),
-            "a pin is restated by naming a version, not a reason to refuse"
+            app.job.is_none(),
+            "no candidate query is spawned over a pin"
         );
-        app.pick_downgrade(0);
-        let req = app.pending_build.as_ref().expect("the build is requested");
-        assert_eq!(req.spec, "foo@1.1.0");
+        assert!(app.downgrade_choice.is_none(), "and no list opens");
         let _ = std::fs::remove_dir_all(&root);
     }
 

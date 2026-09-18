@@ -2498,6 +2498,11 @@ pub(crate) fn tui_downgrade_one(
             fresh.version
         );
     }
+    if fresh.pinned {
+        // A pin set while the list was open counts as changed state,
+        // as it does everywhere else: the newer statement wins.
+        bail!("`{name}` was pinned while a version was being chosen; `p` unpins it first");
+    }
     let locked = fresh.locked;
     let mut frontend = Frontend::Captured {
         on_line,
@@ -2738,13 +2743,11 @@ pub(crate) fn tui_install_batch(
     )?;
     let mut manifest = Manifest::load(prefix)?;
     // The whole plan, before the first build: a pin refusal or a typo
-    // must not arrive after ten minutes of compiling.
-    let unversioned: Vec<String> = specs
-        .iter()
-        .filter(|s| s.version.is_none())
-        .map(|s| s.name.clone())
-        .collect();
-    refuse_pinned(&manifest, &unversioned)?;
+    // must not arrive after ten minutes of compiling. Same gate as
+    // `cmd_install`: every plain install of a pinned crate is refused,
+    // versioned or not.
+    let names: Vec<String> = specs.iter().map(|s| s.name.clone()).collect();
+    refuse_pinned(&manifest, &names)?;
     for w in duplicate_install_warnings(prefix, &manifest, specs.iter().map(|s| s.name.as_str())) {
         on_line(LineKind::Warning, &w);
     }
@@ -3249,9 +3252,8 @@ pub(crate) fn tui_install_one(
         &mut |s| on_line(LineKind::Notice, s),
     )?;
     let mut manifest = Manifest::load(prefix)?;
-    if spec.version.is_none() {
-        refuse_pinned(&manifest, std::slice::from_ref(&spec.name))?;
-    }
+    // Same gate as `cmd_install`, single-member edition.
+    refuse_pinned(&manifest, std::slice::from_ref(&spec.name))?;
     let mut frontend = Frontend::Captured {
         on_line,
         before_placement,
@@ -3294,17 +3296,15 @@ fn cmd_install(prefix: &Path, crates: &[String], locked: bool, reinstall: bool) 
     let cache = cache_dir()?;
     let _lock = StateLock::acquire(prefix, &Mode::Exclusive)?;
     let mut manifest = Manifest::load(prefix)?;
-    // A bare install builds the newest version — exactly what a pin
-    // forbids; refuse before the first build. Naming a version is a
-    // re-pin and is allowed, and `--reinstall` never leaves the version
-    // the pin declares, so it has nothing to refuse.
+    // A pin is the more deliberate and durable statement, and every
+    // plain install re-interprets the entry it lands on — bare by
+    // resolving the newest release, `@VERSION` by re-pinning. Both are
+    // refused before the first build; the pin comes off explicitly
+    // first. `--reinstall` restates the entry, pin included, so it has
+    // nothing to refuse.
     if !reinstall {
-        let unversioned: Vec<String> = specs
-            .iter()
-            .filter(|s| s.version.is_none())
-            .map(|s| s.name.clone())
-            .collect();
-        refuse_pinned(&manifest, &unversioned)?;
+        let names: Vec<String> = specs.iter().map(|s| s.name.clone()).collect();
+        refuse_pinned(&manifest, &names)?;
     }
     // Every plan is resolved before the first build: "not installed" is
     // knowable from the manifest alone, and a batch that discovers it
@@ -4137,6 +4137,12 @@ fn cmd_downgrade(prefix: &Path, name: &str) -> Result<()> {
             .remove(name)
             .with_context(|| format!("`{name}` is not installed under {}", prefix.display()))?
     };
+    // Same gate as install: a downgrade of a pinned crate would re-pin
+    // it to another version — a re-interpretation of the standing
+    // statement, not its preservation. The pin comes off explicitly.
+    if entry.pinned {
+        bail!("pinned: {name} (run `cargo lbin unpin {name}` first)");
+    }
     let current = Version::parse(&entry.version)
         .with_context(|| format!("manifest holds unparsable version for `{name}`"))?;
     let releases = index::releases(name)?.ok_or_else(|| index::not_found(name))?;
@@ -4188,6 +4194,13 @@ fn cmd_downgrade(prefix: &Path, name: &str) -> Result<()> {
         bail!(
             "`{name}` changed from {current} to {fresh_version} while a version was being chosen; \
              run the command again"
+        );
+    }
+    if fresh.pinned {
+        // A pin set while the prompt was open counts as changed state,
+        // exactly as it does for `update`: the newer statement wins.
+        bail!(
+            "`{name}` was pinned while a version was being chosen; run `cargo lbin unpin {name}` first"
         );
     }
     let locked = fresh.locked;
@@ -8781,16 +8794,17 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    /// A pinned crate downgrades and stays pinned: the pin is restated
-    /// at the chosen version, which is what `install NAME@VERSION` does
-    /// and why this path reuses it. `locked` comes from the fresh read,
-    /// not from the row the person was looking at.
+    /// A downgrade lands pinned at the chosen version — what
+    /// `install NAME@VERSION` does, and why this path reuses it. The
+    /// entry starts unpinned, since the gate makes a pinned start
+    /// unreachable. `locked` comes from the fresh read, not from the
+    /// row the person was looking at.
     #[cfg(feature = "tui")]
     #[test]
     fn a_tui_downgrade_repins_at_the_chosen_version() {
         let root = std::env::temp_dir().join("cargo-lbin-test-tui-downgrade-pin");
         let _ = fs::remove_dir_all(&root);
-        let prefix = seeded_prefix(&root, "prefix", "okcrate", true, true);
+        let prefix = seeded_prefix(&root, "prefix", "okcrate", true, false);
         let _fake = crate::stage::FakeCargo::install(&versioned_fake(&root, "okcrate"));
         let target = Version::parse("0.0.9").unwrap();
         let control = BuildControl::new();
@@ -8809,9 +8823,34 @@ mod tests {
         assert_eq!(entry.version, "0.0.9", "the chosen version landed");
         assert!(
             entry.pinned,
-            "a pinned crate stays pinned, at the new version"
+            "the chosen version lands pinned, as `install NAME@VERSION` pins"
         );
         assert!(entry.locked, "and its --locked setting is carried over");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// And the other side of that gate, mid-flight: a pin set while
+    /// the list was open counts as changed state, so the apply refuses
+    /// rather than override the newer statement.
+    #[cfg(feature = "tui")]
+    #[test]
+    fn a_tui_downgrade_refuses_a_pin_set_meanwhile() {
+        let root = std::env::temp_dir().join("cargo-lbin-test-tui-downgrade-pin-race");
+        let _ = fs::remove_dir_all(&root);
+        let prefix = seeded_prefix(&root, "prefix", "okcrate", true, true);
+        let target = Version::parse("0.0.9").unwrap();
+        let control = BuildControl::new();
+        let err = tui_downgrade_one(
+            &prefix,
+            "okcrate",
+            "0.1.0",
+            &target,
+            &mut |_, _| {},
+            &mut |_| Ok(()),
+            &control,
+        )
+        .expect_err("a pin set while choosing is changed state");
+        assert!(format!("{err:#}").contains("pinned"), "{err:#}");
         let _ = fs::remove_dir_all(&root);
     }
 
