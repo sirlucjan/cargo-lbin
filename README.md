@@ -783,7 +783,7 @@ the keypress, confirmed once, and executed as a queue of the very same
 single migrations `m` runs — each crate its own unit of work, so a
 member's failure is tallied and the batch moves on, exactly like the
 CLI. The plan is frozen from a fresh view of the prefix at the
-keypress. The summary reports how many migrated; failures, incomplete
+keypress. The summary reports how many migrated; failures, refusals, incomplete
 migrations and build warnings land in one report panel with their full
 reasons. `c` cancels the current crate and ends the batch — the
 remaining queue is dropped, never silently continued — and the summary

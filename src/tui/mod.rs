@@ -805,6 +805,9 @@ enum MigrateSection {
     /// The same diagnostics a single failure panel gets; the
     /// already-installed refusal counts as a shortfall, as on the CLI.
     Failed,
+    /// Destination built, placement not authorized: the reason, not
+    /// the diagnostics of a failure that did not happen.
+    Refused,
     /// Destination committed, source not retired: the Incomplete reason
     /// plus that member's warnings.
     Incomplete,
@@ -816,6 +819,7 @@ enum MigrateSection {
 /// The headings those sections carry in the panel, in panel order.
 const MIGRATE_SECTIONS: &[(MigrateSection, &str)] = &[
     (MigrateSection::Failed, "failed:"),
+    (MigrateSection::Refused, "built, but not placed:"),
     (
         MigrateSection::Incomplete,
         "destination committed, source not retired:",
@@ -2503,17 +2507,49 @@ impl App {
                     batch.runner.record(MigrateSection::Incomplete, name, lines);
                 }
                 BuildOutcome::Failed(e) => {
-                    batch.runner.record(
-                        MigrateSection::Failed,
-                        name,
-                        Self::failure_lines(&e, tail),
-                    );
+                    // Only a refusal at this member's placement door is
+                    // "built, but not placed" — the install batch's own
+                    // classification, and `MemberOutcome`'s contract: a
+                    // crate whose build succeeded and whose placement
+                    // could not be authorized did not fail to build.
+                    // Everything else stays a failure, and a retirement
+                    // that could not run never reaches this match —
+                    // `migrate_one` already names it Incomplete.
+                    match e.downcast::<crate::AuthorizationRefused>() {
+                        Ok(refused)
+                            if matches!(
+                                refused.purpose,
+                                crate::privileged::AuthPurpose::Placement
+                            ) =>
+                        {
+                            batch.runner.record(
+                                MigrateSection::Refused,
+                                name,
+                                vec![crate::text::sanitize(&refused.reason)],
+                            );
+                        }
+                        Ok(other) => {
+                            batch.runner.record(
+                                MigrateSection::Failed,
+                                name,
+                                Self::failure_lines(&anyhow::Error::new(other), tail),
+                            );
+                        }
+                        Err(e) => {
+                            batch.runner.record(
+                                MigrateSection::Failed,
+                                name,
+                                Self::failure_lines(&e, tail),
+                            );
+                        }
+                    }
                 }
             }
             // A member counted in NOTICED also succeeded, so the tally
-            // is succeeded plus the two sections that are not it.
+            // is succeeded plus the non-success sections.
             (
                 batch.runner.succeeded
+                    + batch.runner.recorded(MigrateSection::Refused)
                     + batch.runner.recorded(MigrateSection::Incomplete)
                     + batch.runner.recorded(MigrateSection::Failed),
                 batch.runner.total,
@@ -2526,7 +2562,8 @@ impl App {
         self.info(&format!("[{done}/{total}] {name}{spoken} processed"));
         // The cancel may have lost at this member's door and won
         // everywhere else: the member is reported as what it became —
-        // migrated, incomplete, failed — and a batch told to stop
+        // migrated, refused, incomplete, failed — and a batch told to
+        // stop
         // starts nobody else; the queue is dropped as promised, never
         // silently continued. With nothing left in the queue there is
         // nothing to stop, and the batch completed at its last member.
@@ -4949,13 +4986,19 @@ impl App {
     }
 }
 
-/// The word for an install gate's unhappy outcome: a contract
-/// refusal reads "refused", anything else "failed". Same red, same
-/// non-zero exit — the word carries the first fact a reader needs:
-/// whether the operation's build or managed state may have been
-/// touched.
+/// The word for a job's unhappy outcome: a typed refusal reads
+/// "refused", anything else "failed". Same red, same non-zero exit —
+/// the word carries the first fact a reader needs. `ContractRefusal`
+/// said no before the build or managed-state mutation began;
+/// `AuthorizationRefused` said no to a later step a successful build
+/// asked for — neither is a failure to go looking for in a log. The
+/// converse is not promised: an untyped refusal still reads "failed",
+/// and the word classifies what is typed, not everything a gate ever
+/// says.
 fn outcome_word(e: &anyhow::Error) -> &'static str {
-    if e.downcast_ref::<crate::ContractRefusal>().is_some() {
+    if e.downcast_ref::<crate::ContractRefusal>().is_some()
+        || e.downcast_ref::<crate::AuthorizationRefused>().is_some()
+    {
         "refused"
     } else {
         "failed"
@@ -6081,6 +6124,19 @@ mod tests {
             "{said}"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The single-job vocabulary matches the batches': a placement that
+    /// could not be authorized is refused, not failed — the build may
+    /// well have succeeded, and the word must not send anyone to a log.
+    #[test]
+    fn an_authorization_refusal_wears_the_refused_word() {
+        let refused = anyhow::Error::new(crate::AuthorizationRefused {
+            purpose: crate::privileged::AuthPurpose::Placement,
+            reason: "no usable credentials".to_owned(),
+        });
+        assert_eq!(outcome_word(&refused), "refused");
+        assert_eq!(outcome_word(&anyhow::anyhow!("boom")), "failed");
     }
 
     /// The other half of `a_batch_cancelled_up_front_attempts_nobody`'s
@@ -7308,6 +7364,92 @@ mod tests {
         assert!(
             said.contains("migrated 2 of 3") && said.contains("cancelled; 1 not attempted"),
             "the member is counted as what it became, the stop as a stop: {said}"
+        );
+        let _ = std::fs::remove_dir_all(&prefix);
+    }
+
+    /// `MemberOutcome`'s contract, honoured by `M` too: a destination
+    /// that built and could not be placed is refused, not failed — the
+    /// panel is not red, the member behind it still runs, and nobody is
+    /// sent looking for a compiler error that does not exist.
+    #[test]
+    fn a_refused_placement_in_m_is_not_a_failed_build() {
+        let prefix = std::env::temp_dir().join("cargo-lbin-test-tui-migrate-refused");
+        let _ = std::fs::remove_dir_all(&prefix);
+        std::fs::create_dir_all(&prefix).unwrap();
+        let mut app = App::new(&prefix).unwrap();
+        let dest = prefix.join("other");
+        let pending = |name: &str| PendingMigrate {
+            name: name.into(),
+            version: "0.1.0".into(),
+            dest: dest.clone(),
+            snap: crate::MigrationSnapshot::from_parts(
+                name,
+                "0.1.0",
+                vec![name.into()],
+                false,
+                false,
+            )
+            .unwrap(),
+        };
+        let target = MigrateTarget {
+            version: "0.1.0".into(),
+            dest: dest.clone(),
+        };
+        app.migrate_batch = Some(MigrateBatch {
+            dest: dest.clone(),
+            runner: batch_runner([pending("baz")].into_iter().collect(), 3, 1),
+            stopping: false,
+        });
+
+        app.finish_batch_step(
+            "bar",
+            &target,
+            BuildOutcome::Failed(anyhow::Error::new(crate::AuthorizationRefused {
+                purpose: crate::privileged::AuthPurpose::Placement,
+                reason: "no usable credentials".to_owned(),
+            })),
+            &VecDeque::new(),
+            Vec::new(),
+        );
+
+        assert!(
+            app.pending_migrate.is_some(),
+            "the refusal stops nobody behind it"
+        );
+        {
+            let batch = app.migrate_batch.as_ref().expect("the batch is still on");
+            assert_eq!(batch.runner.recorded(MigrateSection::Refused), 1);
+            assert_eq!(
+                batch.runner.recorded(MigrateSection::Failed),
+                0,
+                "nothing failed to build"
+            );
+        }
+
+        app.pending_migrate = None;
+        app.finish_batch_step(
+            "baz",
+            &target,
+            BuildOutcome::Migrated(Version::new(0, 2, 0)),
+            &VecDeque::new(),
+            Vec::new(),
+        );
+
+        let report = app.build_report.as_ref().expect("a shortfall has a panel");
+        assert!(
+            !report.failed,
+            "a refusal is a shortfall, not a build that broke"
+        );
+        let text = report.lines.join("\n");
+        assert!(
+            text.contains("built, but not placed:") && text.contains("no usable credentials"),
+            "the refusal has its own section and its reason: {text}"
+        );
+        let said = &app.message.as_ref().expect("a summary").text;
+        assert!(
+            said.contains("migrated 2 of 3") && !said.contains("cancelled"),
+            "{said}"
         );
         let _ = std::fs::remove_dir_all(&prefix);
     }
