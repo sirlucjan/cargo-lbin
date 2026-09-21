@@ -788,6 +788,13 @@ type BatchEntries = Vec<(String, Vec<String>)>;
 struct MigrateBatch {
     dest: PathBuf,
     runner: BatchRunner<PendingMigrate, MigrateSection>,
+    /// `BatchControl::stopping`'s analogue. `M` has no worker-side
+    /// control — its queue lives here in the interface — so the
+    /// batch-level stop intent lives here too. Set the moment `c` is
+    /// pressed, before the member's own door answers, so a cancel that
+    /// loses to placement still speaks for the members not yet
+    /// started.
+    stopping: bool,
 }
 
 /// What a migration's members can end up being, and therefore the
@@ -900,6 +907,19 @@ impl App {
     /// `BuildControl`; one-shots set their flag and nothing more; with no
     /// job, silence — nothing else could be meant.
     fn cancel_pressed(&mut self) {
+        // `c` during `M` speaks for the remainder before it speaks for
+        // the member: the batch is told to stop first, and the answer
+        // at the member's own door — accepted or too late — then
+        // decides that member's fate and nothing else's. The same
+        // order `BatchControl::request_cancel` fixes for the other
+        // batches.
+        let migrate_stopping = match self.migrate_batch.as_mut() {
+            Some(batch) => {
+                batch.stopping = true;
+                true
+            }
+            None => false,
+        };
         match &self.job {
             Some(Job::Build { name, control, .. }) => {
                 let name = name.clone();
@@ -925,7 +945,7 @@ impl App {
                     // True of the member, and only of the member: the
                     // batch behind it has already been told to stop and
                     // will start nobody else.
-                    crate::CancelOutcome::TooLate if batch => {
+                    crate::CancelOutcome::TooLate if batch || migrate_stopping => {
                         self.info(
                             "placement already started for this crate; \
                              the batch stops after it",
@@ -969,6 +989,11 @@ impl App {
                 let note = format!("version lookup for `{name}`: cancel requested…");
                 Self::request_oneshot_cancel(cancel);
                 self.info(&note);
+            }
+            // `M` between members: no build to ask, but the intent is
+            // recorded above and the queue's door will not open again.
+            None if migrate_stopping => {
+                self.info("stopping: no further crate will be started");
             }
             None => {}
         }
@@ -1677,23 +1702,6 @@ impl App {
                 }
                 continue;
             }
-            if let Some(req) = self.pending_migrate.take() {
-                let member = req.name.clone();
-                if let StartOutcome::Refused(reason) = self.start_migrate(terminal, req)? {
-                    match self.migrate_batch.as_mut() {
-                        // A batch cannot wait on a worker that never existed: the refusal is
-                        // recorded as a failure where the summary will not overwrite it.
-                        Some(batch) => {
-                            batch
-                                .runner
-                                .record(MigrateSection::Failed, &member, vec![reason]);
-                            self.finalize_migrate_batch(Some("aborted"));
-                        }
-                        None => self.error(&reason),
-                    }
-                }
-                continue;
-            }
             if matches!(
                 &self.job,
                 Some(Job::Build {
@@ -1709,6 +1717,37 @@ impl App {
                 && key.kind == KeyEventKind::Press
             {
                 self.on_key(key);
+            }
+            // `M`'s queue scheduler shares this thread with the input,
+            // so the loop's order is its `try_begin_member`: consumed
+            // here, after the keyboard was read, the queue gives the
+            // person one look at the keys between a member finishing
+            // and the next one starting — a `c` landing in that gap is
+            // handled before the door opens. Consumed before the read,
+            // the next member could outrun the very cancel the gate
+            // exists to hear. A quit requested in that read starts
+            // nobody either.
+            if !self.should_quit && self.pending_migrate.is_some() {
+                let Some(req) = self.next_migrate_to_start() else {
+                    // Told to stop in the gap between members: the
+                    // batch just finalized; there is nothing to start.
+                    continue;
+                };
+                let member = req.name.clone();
+                if let StartOutcome::Refused(reason) = self.start_migrate(terminal, req)? {
+                    match self.migrate_batch.as_mut() {
+                        // A batch cannot wait on a worker that never existed: the refusal is
+                        // recorded as a failure where the summary will not overwrite it.
+                        Some(batch) => {
+                            batch
+                                .runner
+                                .record(MigrateSection::Failed, &member, vec![reason]);
+                            self.finalize_migrate_batch(Some("aborted"));
+                        }
+                        None => self.error(&reason),
+                    }
+                }
+                continue;
             }
             self.poll_job()?;
         }
@@ -2385,6 +2424,27 @@ impl App {
         Ok(value)
     }
 
+    /// The queue's one door, `try_begin_member`'s analogue for `M`: a
+    /// batch told to stop starts nobody else, however the current
+    /// member's own cancel went. `None` after a stop means the batch
+    /// just finalized — and the popped member goes back into the
+    /// runner's ledger first, because "not attempted" is counted from
+    /// the queue, and a member popped but never started was not
+    /// attempted. Its caller's position in `run` is part of the
+    /// contract: consumed after the input read, so the person gets one
+    /// look at the keyboard between members — see the comment there.
+    fn next_migrate_to_start(&mut self) -> Option<PendingMigrate> {
+        let req = self.pending_migrate.take()?;
+        if !self.migrate_batch.as_ref().is_some_and(|b| b.stopping) {
+            return Some(req);
+        }
+        if let Some(batch) = self.migrate_batch.as_mut() {
+            batch.runner.queue.push_front(req);
+        }
+        self.finalize_migrate_batch(Some("cancelled"));
+        None
+    }
+
     /// One batch member finished; tally, advance or wrap up. A cancel
     /// ends the whole batch — continuing silently would be guessing
     /// intent.
@@ -2464,6 +2524,20 @@ impl App {
             return;
         }
         self.info(&format!("[{done}/{total}] {name}{spoken} processed"));
+        // The cancel may have lost at this member's door and won
+        // everywhere else: the member is reported as what it became —
+        // migrated, incomplete, failed — and a batch told to stop
+        // starts nobody else; the queue is dropped as promised, never
+        // silently continued. With nothing left in the queue there is
+        // nothing to stop, and the batch completed at its last member.
+        if self
+            .migrate_batch
+            .as_ref()
+            .is_some_and(|batch| batch.stopping && batch.runner.remaining() > 0)
+        {
+            self.finalize_migrate_batch(Some("cancelled"));
+            return;
+        }
         let next = self
             .migrate_batch
             .as_mut()
@@ -2639,7 +2713,11 @@ impl App {
         let Some(batch) = self.migrate_batch.take() else {
             return;
         };
-        let MigrateBatch { dest, runner } = batch;
+        let MigrateBatch {
+            dest,
+            runner,
+            stopping: _,
+        } = batch;
         // Tally plus queue must add up to the plan: a refused member
         // sits in a section, so "not attempted" is exactly what is
         // still queued. The head is migration's to word — only it knows
@@ -3522,7 +3600,11 @@ impl App {
                     let Some(first) = runner.next_member() else {
                         return;
                     };
-                    self.migrate_batch = Some(MigrateBatch { dest, runner });
+                    self.migrate_batch = Some(MigrateBatch {
+                        dest,
+                        runner,
+                        stopping: false,
+                    });
                     self.pending_migrate = Some(first);
                 }
             }
@@ -6788,6 +6870,7 @@ mod tests {
         app.migrate_batch = Some(MigrateBatch {
             dest: prefix.join("elsewhere"),
             runner: batch_runner(std::collections::VecDeque::new(), 1, 0),
+            stopping: false,
         });
         app.remove_confirmed("bar".into());
         assert!(
@@ -6968,6 +7051,7 @@ mod tests {
         app.migrate_batch = Some(MigrateBatch {
             dest: dest.clone(),
             runner: batch_runner([pending("bar")].into_iter().collect(), 2, 0),
+            stopping: false,
         });
         let no_tail = VecDeque::new();
         app.finish_batch_step(
@@ -7016,6 +7100,7 @@ mod tests {
         app.migrate_batch = Some(MigrateBatch {
             dest: dest.clone(),
             runner: batch_runner([pending("baz"), pending("qux")].into_iter().collect(), 3, 1),
+            stopping: false,
         });
         app.finish_batch_step(
             "bar",
@@ -7028,6 +7113,215 @@ mod tests {
         assert!(
             app.pending_migrate.is_none(),
             "nothing was silently continued"
+        );
+        let _ = std::fs::remove_dir_all(&prefix);
+    }
+
+    /// A cancel that lost at the member's door still stops the batch:
+    /// the member is reported as what it became — here, migrated — and
+    /// the queue is dropped as promised, never silently continued.
+    /// "not attempted" is counted from the queue, which the stop
+    /// leaves intact.
+    #[test]
+    fn a_cancel_that_lost_at_the_door_still_stops_m() {
+        let prefix = std::env::temp_dir().join("cargo-lbin-test-tui-migrate-toolate");
+        let _ = std::fs::remove_dir_all(&prefix);
+        std::fs::create_dir_all(&prefix).unwrap();
+        let mut app = App::new(&prefix).unwrap();
+        let dest = prefix.join("other");
+        let pending = |name: &str| PendingMigrate {
+            name: name.into(),
+            version: "0.1.0".into(),
+            dest: dest.clone(),
+            snap: crate::MigrationSnapshot::from_parts(
+                name,
+                "0.1.0",
+                vec![name.into()],
+                false,
+                false,
+            )
+            .unwrap(),
+        };
+        let target = MigrateTarget {
+            version: "0.1.0".into(),
+            dest: dest.clone(),
+        };
+        app.migrate_batch = Some(MigrateBatch {
+            dest: dest.clone(),
+            runner: batch_runner([pending("baz")].into_iter().collect(), 3, 1),
+            stopping: true,
+        });
+
+        app.finish_batch_step(
+            "bar",
+            &target,
+            BuildOutcome::Migrated(Version::new(0, 2, 0)),
+            &VecDeque::new(),
+            Vec::new(),
+        );
+
+        assert!(
+            app.migrate_batch.is_none(),
+            "a batch told to stop starts nobody else"
+        );
+        assert!(
+            app.pending_migrate.is_none(),
+            "nothing was silently continued"
+        );
+        let said = &app.message.as_ref().expect("a summary").text;
+        assert!(
+            said.contains("migrated 2 of 3") && said.contains("cancelled; 1 not attempted"),
+            "the member is counted as what it became, the stop as a stop: {said}"
+        );
+        let _ = std::fs::remove_dir_all(&prefix);
+    }
+
+    /// The commit's own thesis, pinned: where the member itself ends
+    /// half-done — destination committed, source still standing — the
+    /// model widens the report's vocabulary, not the transaction. The
+    /// member is filed as Incomplete, the cancel still speaks for the
+    /// remainder, and Incomplete is not a failure.
+    #[test]
+    fn a_cancel_that_lost_to_an_incomplete_member_still_stops_m() {
+        let prefix = std::env::temp_dir().join("cargo-lbin-test-tui-migrate-incomplete");
+        let _ = std::fs::remove_dir_all(&prefix);
+        std::fs::create_dir_all(&prefix).unwrap();
+        let mut app = App::new(&prefix).unwrap();
+        let dest = prefix.join("other");
+        let pending = |name: &str| PendingMigrate {
+            name: name.into(),
+            version: "0.1.0".into(),
+            dest: dest.clone(),
+            snap: crate::MigrationSnapshot::from_parts(
+                name,
+                "0.1.0",
+                vec![name.into()],
+                false,
+                false,
+            )
+            .unwrap(),
+        };
+        let target = MigrateTarget {
+            version: "0.1.0".into(),
+            dest: dest.clone(),
+        };
+        app.migrate_batch = Some(MigrateBatch {
+            dest: dest.clone(),
+            runner: batch_runner([pending("baz")].into_iter().collect(), 3, 1),
+            stopping: true,
+        });
+
+        app.finish_batch_step(
+            "bar",
+            &target,
+            BuildOutcome::CompletedWithWarning("the source is still standing".to_owned()),
+            &VecDeque::new(),
+            Vec::new(),
+        );
+
+        assert!(
+            app.migrate_batch.is_none() && app.pending_migrate.is_none(),
+            "the half-done member stops nobody behind it from being counted, \
+             and the cancel stops everybody behind it from starting"
+        );
+        let report = app.build_report.as_ref().expect("Incomplete has its panel");
+        assert!(
+            !report.failed,
+            "Incomplete is not a failure; the panel must not say so"
+        );
+        assert!(
+            report
+                .lines
+                .iter()
+                .any(|l| l.contains("the source is still standing")),
+            "the member is reported as what it became: {:?}",
+            report.lines
+        );
+        let said = &app.message.as_ref().expect("a summary").text;
+        assert!(
+            said.contains("migrated 1 of 3") && said.contains("cancelled; 1 not attempted"),
+            "{said}"
+        );
+        let _ = std::fs::remove_dir_all(&prefix);
+    }
+
+    /// A cancel in the gap between members closes the queue's door: the
+    /// popped member goes back into the ledger before the summary, so
+    /// "not attempted" counts it.
+    #[test]
+    fn a_cancel_in_the_gap_starts_nobody_and_keeps_the_ledger() {
+        let prefix = std::env::temp_dir().join("cargo-lbin-test-tui-migrate-gap");
+        let _ = std::fs::remove_dir_all(&prefix);
+        std::fs::create_dir_all(&prefix).unwrap();
+        let mut app = App::new(&prefix).unwrap();
+        let dest = prefix.join("other");
+        app.migrate_batch = Some(MigrateBatch {
+            dest: dest.clone(),
+            runner: batch_runner(std::collections::VecDeque::new(), 3, 2),
+            stopping: true,
+        });
+        app.pending_migrate = Some(PendingMigrate {
+            name: "baz".into(),
+            version: "0.1.0".into(),
+            dest: dest.clone(),
+            snap: crate::MigrationSnapshot::from_parts(
+                "baz",
+                "0.1.0",
+                vec!["baz".into()],
+                false,
+                false,
+            )
+            .unwrap(),
+        });
+
+        assert!(
+            app.next_migrate_to_start().is_none(),
+            "the queue's door is closed"
+        );
+
+        assert!(app.migrate_batch.is_none(), "the batch finalized");
+        assert!(app.pending_migrate.is_none());
+        let said = &app.message.as_ref().expect("a summary").text;
+        assert!(
+            said.contains("migrated 2 of 3") && said.contains("cancelled; 1 not attempted"),
+            "the popped member was never attempted and the ledger says so: {said}"
+        );
+        let _ = std::fs::remove_dir_all(&prefix);
+    }
+
+    /// A cancel too late for the last member is a completed batch:
+    /// there was nothing behind it to stop, and "cancelled" would
+    /// report a stop that changed nothing — the install batch's rule.
+    #[test]
+    fn a_cancel_too_late_for_the_last_member_completes_the_batch() {
+        let prefix = std::env::temp_dir().join("cargo-lbin-test-tui-migrate-last");
+        let _ = std::fs::remove_dir_all(&prefix);
+        std::fs::create_dir_all(&prefix).unwrap();
+        let mut app = App::new(&prefix).unwrap();
+        let dest = prefix.join("other");
+        let target = MigrateTarget {
+            version: "0.1.0".into(),
+            dest: dest.clone(),
+        };
+        app.migrate_batch = Some(MigrateBatch {
+            dest: dest.clone(),
+            runner: batch_runner(std::collections::VecDeque::new(), 2, 1),
+            stopping: true,
+        });
+
+        app.finish_batch_step(
+            "bar",
+            &target,
+            BuildOutcome::Migrated(Version::new(0, 2, 0)),
+            &VecDeque::new(),
+            Vec::new(),
+        );
+
+        assert!(app.migrate_batch.is_none(), "the batch is over");
+        let said = &app.message.as_ref().expect("a summary").text;
+        assert!(
+            said.contains("migrated 2 of 2") && !said.contains("cancelled"),
+            "a stop with nothing left to stop is a completed batch: {said}"
         );
         let _ = std::fs::remove_dir_all(&prefix);
     }
