@@ -1290,6 +1290,7 @@ mod tests {
     /// unwinding, its debris lands inside the private root, and the
     /// removal after the reap takes both. The one path the old model
     /// leaked on.
+    #[cfg(feature = "tui")]
     #[test]
     fn a_cancelled_build_contains_and_removes_cargos_debris() {
         let root = std::env::temp_dir().join("cargo-lbin-test-tmpdir-cancel");
