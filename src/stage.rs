@@ -537,9 +537,19 @@ fn cargo_program() -> std::ffi::OsString {
     std::ffi::OsString::from("cargo")
 }
 
-fn command(name: &str, version: Option<&Version>, locked: bool, stage: &Path) -> Command {
+fn command(
+    name: &str,
+    version: Option<&Version>,
+    locked: bool,
+    stage: &Path,
+    tmp: &Path,
+) -> Command {
     let mut cmd = Command::new(cargo_program());
     cmd.arg("install").arg(name).arg("--root").arg(stage);
+    // The private root travels as `TMPDIR` and nothing else: setting
+    // `CARGO_TARGET_DIR` would claim ownership of what may be the
+    // user's persistent, deliberately kept target directory.
+    cmd.env("TMPDIR", tmp);
     if let Some(version) = version {
         cmd.arg("--version").arg(format!("={version}"));
     }
@@ -599,13 +609,216 @@ fn spawn_cargo(cmd: &mut Command) -> std::io::Result<std::process::Child> {
 /// otherwise the newest version cargo picks. The exact form is spelled
 /// (`--version =1.2.3`): the intent belongs in the command line, not a
 /// default.
+/// A private temporary root for one Cargo invocation, handed down
+/// through `TMPDIR`.
+///
+/// Cargo removes its own temporary install target on a normal exit,
+/// but a build terminated by a signal does not unwind its `TempDir`,
+/// and the abandoned `cargo-install*` tree stays wherever `$TMPDIR`
+/// pointed — on a tmpfs `/tmp`, in memory until reboot. Pointing
+/// `TMPDIR` here keeps that debris in a namespace this process
+/// created and owns: a normal build leaves the root empty, a
+/// cancelled one leaves Cargo's tree contained inside it, and after
+/// the child has been reaped one recursive removal covers both.
+/// Build scripts' temporary files inherit the same roof.
+///
+/// `CARGO_TARGET_DIR` is deliberately neither set nor reinterpreted:
+/// a target directory the user provided is persistent user-owned
+/// state, not temporary debris owned by lbin — with it in force
+/// Cargo creates no temporary install target here, and the private
+/// root serves only ordinary `TMPDIR` users such as build scripts.
+///
+/// Removal is not licensed by the reap. The leader's death does not
+/// end the group — the final `SIGKILL` sweep below exists precisely
+/// because a TERM-ignoring descendant survives it — and a descendant
+/// that closed its inherited stderr can outlive the leader with the
+/// read loop none the wiser. So the removal brings its own proof of
+/// writer expiry, the stage lease's protocol reused wholesale: the
+/// creator flocks a `.writers` file inside the root with
+/// `FD_CLOEXEC` cleared, cargo and every descendant of the ordinary
+/// fork/exec chain inherit the description, and removal drops the
+/// creator's copy, re-takes `LOCK_EX | LOCK_NB` on a fresh
+/// descriptor, and deletes only when granted — the lock held through
+/// the removal itself. A descendant that outlives the bounded wait
+/// gets a veto, not a race: the root is left standing and named in a
+/// warning, because refusing to remove is the conservative side and
+/// deleting under a live writer is never cleanup. The residual is
+/// the lease's own: a process that deliberately closed every
+/// inherited descriptor has left the contract and is
+/// indistinguishable from an exited one.
+///
+/// A removal failure is worded, never the build's result: cleanup
+/// must not rewrite the truth about the operation. The outer
+/// boundary is the lease doctrine's own size of guarantee: normal
+/// cancellation contains Cargo's temporary build tree and removes
+/// it once writer expiry can be proven; abnormal termination of
+/// lbin may still leave ordinary `$TMPDIR` residue, and no daemon
+/// chases that.
+struct BuildTmp {
+    root: PathBuf,
+    /// The creator's copy of the writer lock. Taken at creation,
+    /// dropped as the first act of removal — from then on the
+    /// description survives only through inheritors.
+    lock: Option<fs::File>,
+    /// Set once a child was spawned: from then on `Drop` may not
+    /// remove, because an unreaped child may still be writing — a
+    /// tree under a possibly live writer is left, not raced.
+    spawned: bool,
+    /// Set by the removal path: the deliberate exits are done with
+    /// this root, and `Drop` has nothing left to guard.
+    done: bool,
+}
+
+/// The writer-lock file inside a build's private root.
+const WRITERS_FILE: &str = ".writers";
+
+impl BuildTmp {
+    fn create() -> Result<Self> {
+        use std::os::unix::fs::DirBuilderExt;
+        use std::os::unix::io::AsRawFd;
+        let root = std::env::temp_dir().join(format!("cargo-lbin-build-{}", new_run_dir_name()?));
+        // 0700, `mkdtemp`'s manners: build scripts' temporary files
+        // live under this root now, and other users have no business
+        // listing them.
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&root)
+            .with_context(|| format!("creating {}", root.display()))?;
+        // The guard exists from the moment the root does: any error
+        // in the lock ritual below falls through `Drop`, which may
+        // remove — nothing was spawned yet — instead of leaving a
+        // half-initialized root behind.
+        let mut tmp = Self {
+            root,
+            lock: None,
+            spawned: false,
+            done: false,
+        };
+        let lock = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(tmp.root.join(WRITERS_FILE))
+            .with_context(|| format!("creating the writer lock in {}", tmp.root.display()))?;
+        let fd = lock.as_raw_fd();
+        // SAFETY: flock(2) on an owned, open descriptor; no memory is
+        // touched. LOCK_NB even though contention is impossible by
+        // construction — the file was just created in a fresh root.
+        if unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } < 0 {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("locking the writer lock in {}", tmp.root.display()));
+        }
+        // SAFETY: fcntl(2) F_GETFD/F_SETFD on an owned, open
+        // descriptor; read the flags and clear exactly the one bit —
+        // the description must ride through exec into cargo and its
+        // descendants, which is the whole proof.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) } < 0 {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("inheriting the writer lock in {}", tmp.root.display()));
+        }
+        tmp.lock = Some(lock);
+        Ok(tmp)
+    }
+
+    fn path(&self) -> &Path {
+        &self.root
+    }
+
+    /// A child exists from here on: `Drop` stands down and only the
+    /// explicit removal — with its proof — may act.
+    fn spawned(&mut self) {
+        self.spawned = true;
+    }
+
+    /// Drop the creator's copy and try to re-take the writer lock on
+    /// a fresh descriptor, deleting only when granted. `true` means
+    /// the root is gone (or its removal failed and was worded);
+    /// `false` means a live inheritor vetoed within `deadline`, the
+    /// root stands, and the veto was worded.
+    fn try_remove(&mut self, warn: &mut dyn FnMut(&str), deadline: std::time::Duration) -> bool {
+        use std::os::unix::io::AsRawFd;
+        self.done = true;
+        drop(self.lock.take());
+        let end = std::time::Instant::now() + deadline;
+        loop {
+            let fresh = match fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(self.root.join(WRITERS_FILE))
+            {
+                Ok(f) => f,
+                Err(e) => {
+                    warn(&format!(
+                        "warning: could not open the writer lock in {}: {e}",
+                        self.root.display()
+                    ));
+                    return true;
+                }
+            };
+            // SAFETY: flock(2) on an owned, open descriptor; no
+            // memory is touched. Granted means every keeper of the
+            // inherited description has exited.
+            if unsafe { libc::flock(fresh.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+                // Held through the removal itself, `clean`'s own
+                // manner: the lock file dies with the tree.
+                if let Err(e) = fs::remove_dir_all(&self.root) {
+                    warn(&format!(
+                        "warning: could not remove the build's temporary directory {}: {e}",
+                        self.root.display()
+                    ));
+                }
+                drop(fresh);
+                return true;
+            }
+            drop(fresh);
+            if std::time::Instant::now() >= end {
+                warn(&format!(
+                    "warning: a build descendant still holds the temporary directory {}; \
+                     leaving it in place",
+                    self.root.display()
+                ));
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+    }
+
+    /// After the reap and the group sweep: the bounded wait absorbs
+    /// the moment between the `SIGKILL` landing and the descriptors
+    /// closing.
+    fn remove(mut self, warn: &mut dyn FnMut(&str)) {
+        let _ = self.try_remove(warn, std::time::Duration::from_secs(2));
+    }
+}
+
+impl Drop for BuildTmp {
+    /// Backstop for exactly the state it can prove: no child was ever
+    /// spawned, so nothing can be writing. From the spawn on, an
+    /// early error leaves the root rather than racing an unreaped
+    /// child; the deliberate paths go through `remove` and its proof.
+    fn drop(&mut self) {
+        if !self.done && !self.spawned {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+}
+
 pub fn build(name: &str, version: Option<&Version>, locked: bool, stage: &Path) -> Result<Built> {
     fs::create_dir_all(stage).with_context(|| format!("creating {}", stage.display()))?;
     // Compiler output goes straight to the terminal; the user should see the
     // build exactly as cargo presents it.
-    let status = spawn_cargo(&mut command(name, version, locked, stage))
-        .and_then(|mut child| child.wait())
+    let mut tmp = BuildTmp::create()?;
+    let mut child = spawn_cargo(&mut command(name, version, locked, stage, tmp.path()))
         .context("failed to spawn cargo")?;
+    tmp.spawned();
+    let status = child.wait().context("failed to wait for cargo")?;
+    // Reaped either way; the root goes now, before the verdict — a
+    // failed build's debris is as owned as a successful build's, and
+    // the removal's own failure is worded, never the build's result.
+    // A failed wait takes the `?` above instead: the child's state is
+    // unknown, and the guard leaves the root rather than racing it.
+    tmp.remove(&mut |w| eprintln!("{w}"));
     if !status.success() {
         bail!("cargo install {name} failed with {status}");
     }
@@ -718,7 +931,8 @@ pub fn build_captured(
     control: &crate::BuildControl,
 ) -> Result<Built> {
     fs::create_dir_all(stage).with_context(|| format!("creating {}", stage.display()))?;
-    let mut cmd = command(name, version, locked, stage);
+    let mut tmp = BuildTmp::create()?;
+    let mut cmd = command(name, version, locked, stage, tmp.path());
     // A pipe usually drops colors, but term.color=always would still
     // paint ANSI into the capture — and the parser matches plain
     // prefixes. The terminal build stays untouched.
@@ -733,6 +947,7 @@ pub fn build_captured(
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped());
     let mut child = spawn_cargo(&mut cmd).context("failed to spawn cargo")?;
+    tmp.spawned();
     // The leader's pid is the group id. Announced before the first read:
     // a cancel arriving mid-spawn must find something to signal, and
     // `spawned` also delivers one accepted earlier.
@@ -786,6 +1001,12 @@ pub fn build_captured(
     // the sweep, before the post-wait I/O. On a failed wait too: the
     // state is unknown, and "never signal" is the safe direction.
     control.reaped();
+    // Only now — after the reap and the group sweep — and even now
+    // the removal does not take those as proof: `BuildTmp::remove`
+    // re-takes the inherited writer lock on a fresh descriptor and
+    // deletes only when granted. Every return below shares this one
+    // removal.
+    tmp.remove(&mut |w| on_line(w));
     let status = status.context("waiting for cargo")?;
     if let Some(e) = read_error {
         return Err(failure_with_log(
@@ -975,6 +1196,235 @@ fn staged_info(name: &str, stage: &Path) -> Result<Built> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A fake cargo that records the `TMPDIR` it was handed into
+    /// `recorded-tmpdir` beside the stage and litters inside it —
+    /// exactly what a signal-killed cargo leaves, minus the
+    /// gigabytes. `tail` decides how it ends: a stage payload and
+    /// exit 0, a bare `exit 1`, or a long sleep for the cancel to
+    /// interrupt.
+    fn tmpdir_probe_fake(dir: &Path, tail: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let fake_bin = dir.join("fakebin");
+        fs::create_dir_all(&fake_bin).unwrap();
+        let script = fake_bin.join("cargo");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\n\
+                 printf '%s' \"$TMPDIR\" > \"$(dirname \"$4\")/recorded-tmpdir\"\n\
+                 mkdir -p \"$TMPDIR/cargo-installFAKE/release\"\n\
+                 printf junk > \"$TMPDIR/cargo-installFAKE/release/junk\"\n\
+                 {tail}\n"
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        script
+    }
+
+    /// The success tail: a valid stage, so `verified_info` has
+    /// something true to read.
+    fn success_tail() -> String {
+        "mkdir -p \"$4/bin\"\n\
+         printf '#!/bin/sh\\ntrue\\n' > \"$4/bin/okcrate\"\n\
+         chmod 755 \"$4/bin/okcrate\"\n\
+         printf '%s' '{\"installs\":{\"okcrate 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)\":{\"bins\":[\"okcrate\"]}}}' > \"$4/.crates2.json\""
+            .to_owned()
+    }
+
+    /// The recorded private root: read, sanity-checked as ours.
+    fn recorded_root(root: &Path) -> PathBuf {
+        let recorded = PathBuf::from(fs::read_to_string(root.join("recorded-tmpdir")).unwrap());
+        assert!(
+            recorded.starts_with(std::env::temp_dir()),
+            "the private root lives under the system temp: {}",
+            recorded.display()
+        );
+        assert!(
+            recorded
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("cargo-lbin-build-")),
+            "and carries lbin's own name: {}",
+            recorded.display()
+        );
+        recorded
+    }
+
+    /// A normal build leaves no private root behind — even when cargo
+    /// misbehaved and left litter inside it, the removal after the
+    /// reap covers it.
+    #[test]
+    fn a_normal_build_leaves_no_private_tmpdir_behind() {
+        let root = std::env::temp_dir().join("cargo-lbin-test-tmpdir-success");
+        let _ = fs::remove_dir_all(&root);
+        let stage = root.join("stage");
+        let _fake = FakeCargo::install(&tmpdir_probe_fake(&root, &success_tail()));
+
+        build("okcrate", None, false, &stage).expect("the fake stages a valid crate");
+
+        let recorded = recorded_root(&root);
+        assert!(!recorded.exists(), "the private root is gone");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// An ordinary failure is as owned as a success: the root goes
+    /// before the verdict, and the verdict stays the build's.
+    #[test]
+    fn a_failed_build_leaves_no_private_tmpdir_behind() {
+        let root = std::env::temp_dir().join("cargo-lbin-test-tmpdir-failure");
+        let _ = fs::remove_dir_all(&root);
+        let stage = root.join("stage");
+        let _fake = FakeCargo::install(&tmpdir_probe_fake(&root, "exit 1"));
+
+        let err = build("okcrate", None, false, &stage).expect_err("the fake fails");
+        assert!(format!("{err:#}").contains("failed with"), "{err:#}");
+
+        let recorded = recorded_root(&root);
+        assert!(!recorded.exists(), "the private root is gone");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The reproducer, contained: a cancelled cargo dies without
+    /// unwinding, its debris lands inside the private root, and the
+    /// removal after the reap takes both. The one path the old model
+    /// leaked on.
+    #[test]
+    fn a_cancelled_build_contains_and_removes_cargos_debris() {
+        let root = std::env::temp_dir().join("cargo-lbin-test-tmpdir-cancel");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let stage = root.join("stage");
+        let logs = root.join("logs");
+        fs::create_dir_all(&logs).unwrap();
+        let _fake = FakeCargo::install(&tmpdir_probe_fake(&root, "sleep 30"));
+        let control = std::sync::Arc::new(crate::BuildControl::new());
+
+        let worker = {
+            let control = std::sync::Arc::clone(&control);
+            let stage = stage.clone();
+            let logs = logs.clone();
+            std::thread::spawn(move || {
+                build_captured("okcrate", None, false, &stage, &logs, &mut |_| {}, &control)
+            })
+        };
+        assert!(
+            eventually(std::time::Duration::from_secs(10), || root
+                .join("recorded-tmpdir")
+                .exists()),
+            "the fake announced its TMPDIR"
+        );
+        let recorded = recorded_root(&root);
+        assert!(
+            matches!(
+                control.request_cancel(),
+                crate::CancelOutcome::Accepted | crate::CancelOutcome::AlreadyStopping
+            ),
+            "the cancel reaches the running fake"
+        );
+        let outcome = worker.join().expect("the worker returns");
+        assert!(
+            outcome
+                .expect_err("a cancelled build is not a success")
+                .downcast_ref::<crate::BuildCancelled>()
+                .is_some(),
+            "and says so by type"
+        );
+
+        assert!(
+            eventually(std::time::Duration::from_secs(5), || !recorded.exists()),
+            "the private root — cargo's debris included — is gone"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The removal's proof, isolated: an inheritor of the writer
+    /// descriptor vetoes the removal — the leader's reap proves
+    /// nothing — and the veto lifts the moment the last inheritor
+    /// exits. The stage lease's own protocol: drop the creator's
+    /// copy, re-take on a fresh descriptor, remove only when granted.
+    #[test]
+    fn an_inheritor_vetoes_the_removal_until_it_exits() {
+        let mut tmp = BuildTmp::create().unwrap();
+        let root = tmp.path().to_path_buf();
+        // A real inheritor: spawn carries every non-CLOEXEC
+        // descriptor through fork and exec, the writer lock included.
+        let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+        tmp.spawned();
+
+        let mut warned: Vec<String> = Vec::new();
+        assert!(
+            !tmp.try_remove(
+                &mut |w| warned.push(w.to_owned()),
+                std::time::Duration::from_millis(300),
+            ),
+            "a live inheritor vetoes the removal"
+        );
+        assert!(root.exists(), "and the root stands, not raced");
+        assert!(
+            warned.iter().any(|w| w.contains("still holds")),
+            "the refusal speaks: {warned:?}"
+        );
+
+        child.kill().unwrap();
+        let _ = child.wait();
+        assert!(
+            tmp.try_remove(
+                &mut |w| warned.push(w.to_owned()),
+                std::time::Duration::from_secs(5),
+            ),
+            "the veto lifts with the last inheritor"
+        );
+        assert!(!root.exists(), "and the root is gone");
+    }
+
+    /// `Drop` is the backstop for exactly the state it can prove: no
+    /// child was ever spawned. After a spawn it must leave the root —
+    /// an unreaped child may still be writing. And the root is 0700:
+    /// build scripts' temporary files live under it now.
+    #[test]
+    fn drop_removes_only_before_a_spawn() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = BuildTmp::create().unwrap();
+        let root = tmp.path().to_path_buf();
+        assert_eq!(
+            fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+            0o700,
+            "mkdtemp's manners"
+        );
+        drop(tmp);
+        assert!(!root.exists(), "pre-spawn: the backstop removes");
+
+        let mut tmp = BuildTmp::create().unwrap();
+        let root = tmp.path().to_path_buf();
+        tmp.spawned();
+        drop(tmp);
+        assert!(root.exists(), "post-spawn: the tree is left, not raced");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The spawned command sets `TMPDIR` and nothing about
+    /// `CARGO_TARGET_DIR`: a target directory the user provided is
+    /// persistent user-owned state, neither set nor cleared by lbin.
+    #[test]
+    fn a_private_tmpdir_is_set_and_the_users_target_dir_is_untouched() {
+        let tmp = std::env::temp_dir().join("cargo-lbin-test-cmd-env-probe");
+        let cmd = command("foo", None, false, Path::new("/nonexistent-stage"), &tmp);
+        let envs: Vec<_> = cmd
+            .get_envs()
+            .map(|(k, v)| (k.to_os_string(), v.map(std::ffi::OsStr::to_os_string)))
+            .collect();
+        assert!(
+            envs.iter()
+                .any(|(k, v)| k == "TMPDIR" && v.as_deref() == Some(tmp.as_os_str())),
+            "the private root travels as TMPDIR"
+        );
+        assert!(
+            envs.iter().all(|(k, _)| k != "CARGO_TARGET_DIR"),
+            "CARGO_TARGET_DIR is neither set nor cleared"
+        );
+    }
 
     #[test]
     fn staged_info_parses_crates2() {
