@@ -4023,6 +4023,18 @@ impl App {
                 // The batch's own end, not a member's: a member's fate
                 // arrived with its MemberDone.
                 Ok(crate::InstallBatchEnd::Cancelled) => BuildOutcome::Cancelled,
+                // An `Err` out of `run` is the plan's, never a member's:
+                // the backends classify member errors inside their
+                // loops, so what escapes is setup and framework — the
+                // lock, the manifest, the whole-plan gates. An accepted
+                // cancel outranks those, the one-shots' own rule: the
+                // person said stop while nothing had started, and a
+                // plan that then could not start anyway does not
+                // overturn the decision. `Ok` answers are the plan's
+                // own and stay untouched — a plan that reached its last
+                // member completed, and nothing re-reads the flag on
+                // the success path.
+                Err(_) if control.cancelled() => BuildOutcome::Cancelled,
                 Err(e) if e.downcast_ref::<crate::BuildCancelled>().is_some() => {
                     BuildOutcome::Cancelled
                 }
@@ -4751,6 +4763,28 @@ impl App {
                 }
                 match done {
                     Some(outcome) => {
+                        // The collector is the batch's last cancel
+                        // boundary too — the second half of the
+                        // one-shots' rule whose first half the worker
+                        // already applies. The worker-side check covers
+                        // a cancel that lands before `run` returns; one
+                        // accepted while `Done(Failed)` was already
+                        // computed, or already in the channel, would
+                        // still reach the person as "stopped before the
+                        // first member", moments after the interface
+                        // promised that nothing further starts. Only
+                        // `Failed` is overridden: a `Success` is the
+                        // plan's own answer, never reinterpreted — the
+                        // last member that outran its cancel still
+                        // completed.
+                        let outcome = match (&control, outcome) {
+                            (ActiveControl::Batch(batch), BuildOutcome::Failed(_))
+                                if batch.cancelled() =>
+                            {
+                                BuildOutcome::Cancelled
+                            }
+                            (_, outcome) => outcome,
+                        };
                         self.finish_build(&name, &kind, outcome, &tail, warnings);
                         // A Ctrl-C during this build asked to leave once the worker was
                         // collected; that is now.
@@ -6045,6 +6079,108 @@ mod tests {
                 && said.contains("cancelled")
                 && said.contains("2 not attempted"),
             "{said}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The other half of `a_batch_cancelled_up_front_attempts_nobody`'s
+    /// matrix: a cancel accepted before the first member outranks a
+    /// setup that then fails. An `Err` out of the worker is the plan's,
+    /// never a member's — the backends classify member errors inside
+    /// their loops — and the person said stop while nothing had
+    /// started; the one-shots' rule, a result arriving after the flag
+    /// is discarded.
+    #[test]
+    fn a_cancel_accepted_before_the_plan_outranks_its_failure() {
+        let control = std::sync::Arc::new(crate::BatchControl::new());
+        // Accepted with nobody building: `stopping` is recorded and the
+        // interface has already told the person nothing further will
+        // start.
+        assert!(matches!(
+            control.request_cancel(),
+            crate::BatchCancel::BetweenMembers
+        ));
+        let (tx, rx) = mpsc::channel();
+        let (_auth_tx, auth_rx) = mpsc::channel();
+        App::spawn_batch(
+            std::sync::Arc::clone(&control),
+            tx,
+            auth_rx,
+            |_, _, _, _| Err(anyhow::anyhow!("the manifest would not load, say")),
+        );
+
+        let outcome = loop {
+            if let BuildMsg::Done(outcome) = rx.recv().expect("the worker reports") {
+                break outcome;
+            }
+        };
+        assert!(
+            matches!(outcome, BuildOutcome::Cancelled),
+            "an accepted cancel is not overturned by the plan's failure"
+        );
+    }
+
+    /// The race the worker-side check cannot see: `Done(Failed)` is
+    /// already computed — here, already in the channel — when the
+    /// cancel is accepted and the interface promises that nothing
+    /// further starts. The collector is the last cancel boundary, for
+    /// the batch as for the one-shots: an accepted cancel gets the
+    /// last word over the plan's `Failed`, and the summary says
+    /// "cancelled", not "stopped before the first member".
+    #[test]
+    fn a_cancel_accepted_while_failed_sat_in_the_channel_still_wins() {
+        let root = std::env::temp_dir().join("cargo-lbin-test-tui-batch-collector-race");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("bin")).unwrap();
+        std::fs::create_dir_all(root.join("share/cargo-lbin")).unwrap();
+        Manifest::default().store(&root).unwrap();
+        let mut app = App::new(&root).unwrap();
+        let mut runner: BatchRunner<(), InstallSection> =
+            BatchRunner::new(std::collections::VecDeque::new(), INSTALL_SECTIONS);
+        runner.total = 2;
+        app.install_batch = Some(InstallBatch {
+            runner,
+            shape: BatchShape::List,
+            current: None,
+            attempted: 0,
+            plan_warnings: Vec::new(),
+        });
+        let (tx, rx) = mpsc::channel();
+        let (auth_tx, _auth_rx) = mpsc::channel();
+        tx.send(BuildMsg::Done(BuildOutcome::Failed(anyhow::anyhow!(
+            "the manifest would not load, say"
+        ))))
+        .unwrap();
+        let control = std::sync::Arc::new(crate::BatchControl::new());
+        app.job = Some(Job::Build {
+            name: "2 crates".to_owned(),
+            rx,
+            auth_tx,
+            units_started: 0,
+            current: None,
+            tail: VecDeque::new(),
+            status_note: None,
+            warnings: Vec::new(),
+            started: std::time::Instant::now(),
+            needs_auth: None,
+            control: ActiveControl::Batch(std::sync::Arc::clone(&control)),
+            kind: BuildKind::Install,
+            cancel_deadline: None,
+        });
+        // The answer sits in the channel; only now does the person say
+        // stop, and the interface accepts.
+        assert!(matches!(
+            control.request_cancel(),
+            crate::BatchCancel::BetweenMembers
+        ));
+
+        app.poll_job().unwrap();
+
+        assert!(app.install_batch.is_none(), "the batch is over");
+        let said = &app.message.as_ref().expect("a summary").text;
+        assert!(
+            said.contains("cancelled") && !said.contains("stopped before the first member"),
+            "the accepted cancel got the last word: {said}"
         );
         let _ = std::fs::remove_dir_all(&root);
     }

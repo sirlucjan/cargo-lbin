@@ -2623,12 +2623,16 @@ impl BatchControl {
         current.map(|control| f(&control))
     }
 
-    /// `c`: stop the batch, and ask the member in flight to stop too.
+    /// `c`: record the batch-level stop intent, and ask the member in
+    /// flight to stop too.
     ///
-    /// The batch always accepts — there is always a next member not to
-    /// start. What the member says is its own: a build still compiling
-    /// accepts, one already placing is past the point, and the answer
-    /// distinguishes the two so the interface can say which.
+    /// The stop intent is always recorded. What the current member says
+    /// is its own: a build still compiling accepts, one already placing
+    /// is past the point, and the answer distinguishes the two so the
+    /// interface can say which. Whether the intent changes the batch's
+    /// final result depends on whether any member remains to be started
+    /// — a cancel too late for the last member changes nothing, so that
+    /// batch completed.
     pub(crate) fn request_cancel(&self) -> BatchCancel {
         let mut state = self.state();
         state.stopping = true;
