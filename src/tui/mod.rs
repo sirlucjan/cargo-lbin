@@ -1777,7 +1777,11 @@ impl App {
         let _ = self.reload()?;
         match outcome {
             Ok(()) => self.info(&format!("{} finished", action_label(action))),
-            Err(e) => self.error(&format!("{} failed: {e:#}", action_label(action))),
+            Err(e) => self.error(&format!(
+                "{} {}: {e:#}",
+                action_label(action),
+                outcome_word(&e)
+            )),
         }
         Ok(())
     }
@@ -2852,6 +2856,7 @@ impl App {
                 ));
             }
             BuildOutcome::Failed(e) => {
+                let word = outcome_word(&e);
                 // An anyhow chain carries paths too; same boundary rule, shared with
                 // the batch.
                 let mut lines = Self::failure_lines(&e, tail);
@@ -2868,12 +2873,12 @@ impl App {
                     // placement or the manifest commit, so the title must not
                     // narrow it — and not "install" either, which would rename
                     // what the person asked for.
-                    title: format!("{verb} {name} failed"),
+                    title: format!("{verb} {name} {word}"),
                     lines,
                     failed: true,
                 });
                 self.error(&format!(
-                    "{verb} {name} failed — details in the panel; Esc/Enter dismisses"
+                    "{verb} {name} {word} — details in the panel; Esc/Enter dismisses"
                 ));
             }
         }
@@ -4832,6 +4837,19 @@ impl App {
     }
 }
 
+/// The word for an install gate's unhappy outcome: a contract
+/// refusal reads "refused", anything else "failed". Same red, same
+/// non-zero exit — the word carries the first fact a reader needs:
+/// whether the operation's build or managed state may have been
+/// touched.
+fn outcome_word(e: &anyhow::Error) -> &'static str {
+    if e.downcast_ref::<crate::ContractRefusal>().is_some() {
+        "refused"
+    } else {
+        "failed"
+    }
+}
+
 fn action_label(action: &PendingAction) -> String {
     match action {
         PendingAction::Update(name) => format!("update {name}"),
@@ -4969,6 +4987,15 @@ mod tests {
             );
         }
         m
+    }
+
+    #[test]
+    fn the_panel_word_matches_the_error_category() {
+        assert_eq!(
+            outcome_word(&crate::contract_refusal("no".into())),
+            "refused"
+        );
+        assert_eq!(outcome_word(&anyhow::anyhow!("boom")), "failed");
     }
 
     #[test]

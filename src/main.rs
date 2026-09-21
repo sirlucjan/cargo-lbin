@@ -3575,6 +3575,62 @@ fn reinstall_plan(manifest: &Manifest, name: &str) -> Result<ReinstallPlan> {
     })
 }
 
+/// A contract refusal from an install gate.
+///
+/// The requested lifecycle operation was rejected by a deliberate
+/// contract gate **before its build or managed-state mutation
+/// began**: no build ran, no binaries changed, and this operation
+/// wrote no manifest entry. That is the whole guarantee, stated at
+/// exactly the size the code can keep. Bookkeeping outside the
+/// crate's lifecycle may well have happened — acquiring the state
+/// lock can create its file, and a bare install's lookup has already
+/// recorded what the registry answered, refusal or not, because
+/// knowledge is born at the query. And on a moving registry the same
+/// command may stop refusing tomorrow: the decision is a function of
+/// the answered state, not a constant of the command line.
+///
+/// Distinct in kind from the authorization refusal at the placement
+/// door, which can follow a successful build ("built, but not
+/// placed"): that one is about permission to place a result, this
+/// one about the contract of the request itself — the name says
+/// `Contract` so the two never blur. Today the two install gates
+/// emit it (the pin gate and the diagonal); the remaining contract
+/// gates — downgrade's pin check, migrate's same-prefix and
+/// overwrite refusals — still speak plain errors and adopt the type
+/// when they are next touched. The
+/// interface renders the category ("refused" instead of "failed"),
+/// tests assert it instead of matching message text, and exit codes
+/// deliberately stay undistinguished until a real consumer appears.
+pub struct ContractRefusal(String);
+
+impl std::fmt::Debug for ContractRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::fmt::Display for ContractRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ContractRefusal {}
+
+/// The gates' constructor; also what tests hand to helpers that
+/// classify errors.
+pub(crate) fn contract_refusal(message: String) -> anyhow::Error {
+    anyhow::Error::new(ContractRefusal(message))
+}
+
+/// `bail!` for contract gates: the same early return, carrying the
+/// `ContractRefusal` category.
+macro_rules! refuse {
+    ($($arg:tt)*) => {
+        return Err(crate::contract_refusal(format!($($arg)*)))
+    };
+}
+
 /// Error if any of `crates` is pinned: a pin is the more deliberate
 /// and durable statement, so it wins; the message says how to change
 /// that, scoped to the prefix the refusal is about.
@@ -3586,7 +3642,7 @@ fn refuse_pinned(prefix: &Path, manifest: &Manifest, crates: &[String]) -> Resul
         .collect();
     if !pinned.is_empty() {
         let names = pinned.join(" ");
-        bail!(
+        refuse!(
             "pinned: {} {}",
             pinned.join(", "),
             unpin_hint(prefix, &names)
@@ -3638,24 +3694,24 @@ fn refuse_on_diagonal(
     // instead.
     let Some(arg) = scope else {
         if named {
-            bail!(
+            refuse!(
                 "{name} {target} is already installed with this policy; \
                  `pin` keeps it, `install --reinstall` rebuilds it"
             );
         }
-        bail!(
+        refuse!(
             "{name} {target} is already the newest release with this policy; \
              `install --reinstall` rebuilds it"
         );
     };
     if named {
-        bail!(
+        refuse!(
             "{name} {target} is already installed with this policy\n  \
              to pin the current installation:  cargo lbin pin {name} {arg}\n  \
              to rebuild it:                    cargo lbin install --reinstall {name} {arg}"
         );
     }
-    bail!(
+    refuse!(
         "{name} {target} is already the newest release with this policy\n  \
          to rebuild it: cargo lbin install --reinstall {name} {arg}"
     );
@@ -5859,6 +5915,33 @@ mod tests {
         assert!(!is_install_diagonal(false, &cur, &cur, true));
         assert!(!is_install_diagonal(true, &cur, &cur, false));
         assert!(!is_install_diagonal(false, &cur, &newer, false));
+    }
+
+    #[test]
+    fn gates_refuse_with_the_typed_category() {
+        let cur = Version::parse("1.0.0").unwrap();
+        // The diagonal's refusal carries the category...
+        let err = refuse_on_diagonal("foo", false, &cur, &cur, false, false, None).unwrap_err();
+        assert!(err.downcast_ref::<ContractRefusal>().is_some());
+        // ...and survives an anyhow context wrapper, so call sites may
+        // annotate without erasing it.
+        assert!(
+            err.context("while installing")
+                .downcast_ref::<ContractRefusal>()
+                .is_some()
+        );
+        // The pin gate speaks the same type.
+        let mut m = manifest_with(&["bat"]);
+        m.crates.get_mut("bat").unwrap().pinned = true;
+        let err = refuse_pinned(Path::new("/usr/local"), &m, &["bat".into()]).unwrap_err();
+        assert!(err.downcast_ref::<ContractRefusal>().is_some());
+        // An execution error is not a refusal: the category is opt-in
+        // at the gate, never inferred from wording.
+        assert!(
+            anyhow::anyhow!("build exploded")
+                .downcast_ref::<ContractRefusal>()
+                .is_none()
+        );
     }
 
     #[test]
