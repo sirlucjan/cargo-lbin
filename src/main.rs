@@ -2653,11 +2653,11 @@ pub(crate) enum BatchCancel {
 /// How the batch itself ended.
 ///
 /// Separate from any member's outcome, because the two answer
-/// different questions. A member that failed ends the batch without
-/// the batch being cancelled; a cancel stops the plan whether or not
-/// the member in flight noticed in time. And a plan that ran to its
-/// last member completed, even if `c` arrived too late to stop that
-/// member — there was nothing left to stop.
+/// different questions. A member that fails or is refused does not
+/// end the batch; a cancel stops the plan whether or not the member
+/// in flight noticed in time. And a plan that ran to its last member
+/// completed, even if `c` arrived too late to stop that member —
+/// there was nothing left to stop.
 #[cfg(feature = "tui")]
 #[derive(Debug)]
 pub(crate) enum InstallBatchEnd {
@@ -2738,6 +2738,11 @@ pub(crate) enum BatchStep<'a> {
 /// operations wearing one name — a plan checked against a manifest that
 /// could move under it, and a pinned crate discovered ten minutes in.
 ///
+/// A member that does not install is reported and the loop carries on;
+/// only a cancel ends it early. The batch is a plural, not a molecule:
+/// the unit of atomicity is one crate, and a batch chooses an
+/// iteration policy, never the unit.
+///
 /// Members are reported through `step`; the caller classifies, counts
 /// and draws. Each member gets a fresh `BuildControl`, handed to the
 /// batch's control so `c` reaches the build actually running.
@@ -2777,8 +2782,9 @@ pub(crate) fn tui_install_batch(
     for spec in specs {
         let member = std::sync::Arc::new(BuildControl::new());
         // Asking and publishing as one step: see `try_begin_member`.
-        // A refusal here means the batch was stopped with members still
-        // to go — which is a cancelled batch, not a completed one.
+        // If the member cannot begin here, the batch was already
+        // cancelled with members still to go — a cancelled batch, not
+        // a completed one.
         if !control.try_begin_member(&member) {
             end = InstallBatchEnd::Cancelled;
             break;
@@ -2819,7 +2825,6 @@ pub(crate) fn tui_install_batch(
                 Err(e) => MemberOutcome::Failed(e),
             },
         };
-        let carry_on = matches!(outcome, MemberOutcome::Installed);
         if matches!(outcome, MemberOutcome::Cancelled) {
             end = InstallBatchEnd::Cancelled;
         }
@@ -2827,9 +2832,12 @@ pub(crate) fn tui_install_batch(
             name: &spec.name,
             outcome,
         });
-        // `install a b c` stops at the first member that does not
-        // install, whatever the reason.
-        if !carry_on {
+        // A failure or a refusal is about the member; a cancel is
+        // about the remainder. What B's error says about C is nothing,
+        // and the one voice that speaks for the rest of the plan is
+        // the person cancelling it — the policy the sweeps have used
+        // from the start, and the named list follows since 0.17.0.
+        if matches!(end, InstallBatchEnd::Cancelled) {
             break;
         }
     }
@@ -3370,7 +3378,25 @@ fn cmd_install(prefix: &Path, crates: &[String], locked: bool, reinstall: bool) 
     for w in duplicate_install_warnings(prefix, &manifest, specs.iter().map(|s| s.name.as_str())) {
         frontend.warning(&w);
     }
-    for (spec, plan) in specs.iter().zip(&plans) {
+    // From here on the batch is a plural, not a molecule. The whole
+    // plan was refused or admitted above as one request — a contract
+    // refusal mid-loop is structurally impossible — and each member
+    // below is its own unit: build, collision check, placement,
+    // manifest commit, exactly `install_and_commit`'s boundary. A
+    // member's failure is reported where it happened and the loop
+    // carries on, the policy `update --all`, `--reinstall --all` and
+    // `migrate` have always used: an error in one crate says nothing
+    // about the next, and stopping bought no atomicity — the state after a
+    // failure is partial either way, and the only thing a break ever
+    // produced was no answer about the rest. The exit code speaks for
+    // the request as a whole: any shortfall is non-zero.
+    let total = specs.len();
+    let mut installed = 0usize;
+    let mut failed: Vec<&str> = Vec::new();
+    for (i, (spec, plan)) in specs.iter().zip(&plans).enumerate() {
+        if total > 1 {
+            println!("[{}/{total}] {}", i + 1, spec.name);
+        }
         // `--reinstall` reads the entry as the specification — version,
         // pin and `--locked` together — so what it rebuilds is this
         // installation rather than whatever the registry now calls
@@ -3388,7 +3414,7 @@ fn cmd_install(prefix: &Path, crates: &[String], locked: bool, reinstall: bool) 
             // otherwise an existing pin is carried over.
             None => (spec.version.as_ref(), locked, PinPolicy::Infer),
         };
-        install_and_commit(
+        match install_and_commit(
             prefix,
             &cache,
             &mut manifest,
@@ -3398,7 +3424,28 @@ fn cmd_install(prefix: &Path, crates: &[String], locked: bool, reinstall: bool) 
             pin,
             ShadowReport::OnCommit,
             &mut frontend,
-        )?;
+        ) {
+            Ok(_) => installed += 1,
+            // A single named crate keeps its exact error as the exit:
+            // there is no batch to summarise.
+            Err(err) if total == 1 => return Err(err),
+            Err(err) => {
+                eprintln!("error: installing `{}` failed: {err:#}", spec.name);
+                failed.push(spec.name.as_str());
+            }
+        }
+    }
+    if total > 1 {
+        println!("installed {installed} of {total}");
+        if !failed.is_empty() {
+            // Asked for `total` installs; the shortfall is the exit
+            // status, mirrored on `apply_updates`.
+            bail!(
+                "{} of {total} installs not carried out (failed: {})",
+                total - installed,
+                failed.join(", ")
+            );
+        }
     }
     Ok(())
 }
@@ -8333,8 +8380,8 @@ mod tests {
     /// A crate that no longer builds is the reason to hear about the
     /// rest, not to stop asking: the sweep carries on, rebuilds what it
     /// can, and the exit code says the confirmed plan was not carried
-    /// out in full. This is the one place where a batch differs from
-    /// `install`'s named list, which stops at the first failure.
+    /// out in full. Since 0.17.0 this is every batch's policy —
+    /// `install`'s named list iterates the same way.
     #[test]
     fn a_failing_crate_does_not_stop_the_sweep() {
         let root = std::env::temp_dir().join("cargo-lbin-test-reinstall-all-failure");
@@ -8367,6 +8414,55 @@ mod tests {
         assert!(
             prefix.join("bin/okcrate").exists(),
             "the crate after the failing one was still built"
+        );
+        assert!(
+            !prefix.join("bin/brokencrate").exists(),
+            "and the failing one placed nothing"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// `install a b c` follows the sweeps' policy: the failing member
+    /// is reported, the one behind it still builds, and the shortfall
+    /// is in the exit code — an error in B is a statement about B;
+    /// only an explicit cancel is a statement about the rest.
+    #[test]
+    fn a_failing_member_does_not_stop_the_named_list() {
+        let root = std::env::temp_dir().join("cargo-lbin-test-install-batch-carries-on");
+        let _ = fs::remove_dir_all(&root);
+        let prefix = seeded_prefix(&root, "prefix", "brokencrate", false, false);
+        {
+            let mut m = Manifest::load(&prefix).unwrap();
+            m.crates.insert(
+                "okcrate".to_owned(),
+                Entry {
+                    version: "0.1.0".to_owned(),
+                    bins: vec!["okcrate".to_owned()],
+                    locked: false,
+                    pinned: false,
+                },
+            );
+            m.store(&prefix).unwrap();
+        }
+        let _ = fs::remove_file(prefix.join("bin/brokencrate"));
+        let _ = fs::remove_file(prefix.join("bin/okcrate"));
+        let _fake = crate::stage::FakeCargo::install(&failing_fake(&root, "brokencrate"));
+
+        // `--reinstall` keeps the whole run offline: each member's
+        // specification is read from the manifest, no registry asked.
+        let err = cmd_install(
+            &prefix,
+            &["brokencrate".to_owned(), "okcrate".to_owned()],
+            false,
+            true,
+        )
+        .expect_err("a shortfall is not a success");
+        let text = format!("{err:#}");
+        assert!(text.contains("1 of 2 installs not carried out"), "{text}");
+        assert!(text.contains("brokencrate"), "and it names which: {text}");
+        assert!(
+            prefix.join("bin/okcrate").exists(),
+            "the member after the failing one was still built"
         );
         assert!(
             !prefix.join("bin/brokencrate").exists(),
@@ -8793,11 +8889,12 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    /// Members run in order under that one lock, and a failure ends the
-    /// batch where `install a b c` would end it.
+    /// Members run in order under that one lock; a failure is the
+    /// member's, and the members behind it still run — the batch ends
+    /// early only for a cancel.
     #[cfg(feature = "tui")]
     #[test]
-    fn an_install_batch_stops_at_the_first_failure() {
+    fn an_install_batch_carries_past_a_failure() {
         let root = std::env::temp_dir().join("cargo-lbin-test-batch-stop");
         let _ = fs::remove_dir_all(&root);
         let prefix = seeded_prefix(&root, "prefix", "okcrate", false, false);
@@ -8841,13 +8938,15 @@ mod tests {
                 "end okcrate true".to_owned(),
                 "start brokencrate".to_owned(),
                 "end brokencrate false".to_owned(),
+                "start lastcrate".to_owned(),
+                "end lastcrate true".to_owned(),
             ],
-            "lastcrate is never attempted"
+            "brokencrate's failure is brokencrate's; lastcrate still runs"
         );
         assert_eq!(
             Manifest::load(&prefix).unwrap().crates.len(),
-            1,
-            "only the member that succeeded is committed"
+            2,
+            "the members that succeeded are committed; the failure is not"
         );
         let _ = fs::remove_dir_all(&root);
     }
@@ -8871,7 +8970,7 @@ mod tests {
             &prefix,
             &specs,
             // `true`: policy change keeps the diagonal gate local and
-            // offline (see the stop-at-first-failure test).
+            // offline (see the carries-past-a-failure test).
             true,
             &mut |_, _| {},
             &mut |_| Ok(()),
@@ -8911,7 +9010,7 @@ mod tests {
             &prefix,
             &specs,
             // `true`: policy change keeps the diagonal gate local and
-            // offline (see the stop-at-first-failure test).
+            // offline (see the carries-past-a-failure test).
             true,
             &mut |_, _| {},
             &mut |_| Ok(()),
@@ -8955,7 +9054,7 @@ mod tests {
             &prefix,
             &specs,
             // `true`: policy change keeps the diagonal gate local and
-            // offline (see the stop-at-first-failure test).
+            // offline (see the carries-past-a-failure test).
             true,
             // The cancel arrives while this member is building, once:
             // pressing `c` repeatedly is a different test, and would

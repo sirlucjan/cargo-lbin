@@ -426,11 +426,8 @@ const INSTALL_SECTIONS: &[(InstallSection, &str)] = &[
 /// member is running, what each had to say, and the summary.
 struct InstallBatch {
     runner: BatchRunner<(), InstallSection>,
-    /// Which shape of batch this is. Not decoration: a list stops at
-    /// the first member it cannot deliver, a sweep asks about all of
-    /// them, and a summary that borrowed the wrong one would contradict
-    /// its own counts — "rebuilt 2 of 3 (stopped at a failure; 0 not
-    /// attempted)" is a sentence that cannot be true.
+    /// Which shape of batch this is. It selects the vocabulary of the
+    /// summary; list and sweep share the same iteration policy.
     shape: BatchShape,
     /// The member whose lines are arriving now, if one is building.
     /// `None` before the first and between members — which is exactly
@@ -581,11 +578,10 @@ enum PendingInPlace {
 
 /// What kind of batch a panel is summarising.
 ///
-/// The worker decides whether to carry on past a failure; this decides
-/// how the summary reads about it, and the two must agree. A list of
-/// crates somebody typed stops where it cannot deliver; a sweep over
-/// what is already installed asks about every member, so a failure
-/// among them is a shortfall rather than a stop.
+/// Only the wording differs by kind now: every batch iterates the same
+/// way — a member's failure or refusal is a shortfall the run carries
+/// past, and only a cancel stops the members behind it — so the shape
+/// picks the summary's verb and nothing else.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum BatchShape {
     List,
@@ -600,11 +596,6 @@ impl BatchShape {
             Self::Rebuild => "rebuilt",
             Self::Update => "updated",
         }
-    }
-
-    /// Does a member that did not install end the run?
-    fn stops_at_a_member(self) -> bool {
-        matches!(self, Self::List)
     }
 }
 
@@ -623,10 +614,10 @@ struct BatchSection<K> {
 /// how many there are, how many are done, what each of them had to say
 /// and what is left if the batch stops early. What it deliberately does
 /// *not* hold is the meaning of any of it — which outcome belongs in
-/// which section, whether a failure ends the batch, what the summary
-/// calls the work. Those differ per operation and stay with the
-/// operation; a runner that knew them would be a runner with `if kind`
-/// in it, which is the thing this extraction exists to avoid.
+/// which section and what the summary calls the work. Those stay with
+/// the operation; a runner that knew them would be a runner with
+/// `if kind` in it, which is the thing this extraction exists to
+/// avoid.
 ///
 /// Sections are declared by the backend at construction, in the order
 /// the panel should show them, and named afterwards by the backend's
@@ -2560,10 +2551,17 @@ impl App {
         }
         let installed = runner.succeeded;
         let total = runner.total;
-        let refused = runner.recorded(InstallSection::Refused);
         let failed = runner.recorded(InstallSection::Failed);
         let cancelled = matches!(outcome, BuildOutcome::Cancelled);
         let verb = shape.verb();
+        // The stop note is derived from the worker's own outcome, never
+        // from the sections: a recorded member failure is a shortfall,
+        // not a stop — every batch carries past it, list and sweep
+        // alike — and the run ends early only when someone ended it: a
+        // cancel, a plan that could not start, or the run itself
+        // breaking mid-member (the lock, the manifest, the channel),
+        // which is the one thing that still reads "stopped at a
+        // failure".
         let stopped = if cancelled {
             Some("cancelled".to_owned())
         } else if plan_failure.is_some() {
@@ -2571,13 +2569,10 @@ impl App {
             // not load simply fails, and the summary cannot tell which
             // from here. What is true of both is where it happened.
             Some("stopped before the first member".to_owned())
-        } else if !shape.stops_at_a_member() {
-            // A sweep asked about every member; what did not install is
-            // counted, not a place where the run stopped.
-            None
-        } else if refused > 0 {
-            Some("stopped: a member was built but could not be placed".to_owned())
-        } else if failed > 0 {
+        } else if matches!(
+            outcome,
+            BuildOutcome::Failed(_) | BuildOutcome::CompletedWithWarning(_)
+        ) {
             Some("stopped at a failure".to_owned())
         } else {
             None
@@ -3799,8 +3794,9 @@ impl App {
     /// again elsewhere intact.
     ///
     /// Placement is not preauthorized here. Each member asks at its own
-    /// door, and a refusal there stops the batch with what came before
-    /// it committed — see `tui_install_batch`. After this, the worker
+    /// door; a refusal belongs to that member and the batch carries on.
+    /// Only an explicit cancel stops the remaining members — see
+    /// `tui_install_batch`. After this, the worker
     /// owns the lock, the manifest and the order; the interface owns
     /// the screen and the cancel.
     fn start_install_batch(
@@ -5793,8 +5789,7 @@ mod tests {
     /// Three scopes, kept apart. A warning spoken before any member
     /// started belongs to the plan and must not be pinned on the first
     /// crate; a member that built and could not be placed is not a
-    /// member that failed to build; and what nobody attempted is
-    /// counted from the attempts, not from the failures.
+    /// member that failed to build, and stops nobody behind it.
     #[test]
     fn a_batch_reports_the_plan_the_member_and_the_refusal_apart() {
         let root = std::env::temp_dir().join("cargo-lbin-test-tui-batch-scopes");
@@ -5831,16 +5826,22 @@ mod tests {
             &VecDeque::new(),
         );
         assert_eq!(batch.attempted, 2, "counted as they started");
+        // The refusal stops nobody: the member behind it still runs.
+        batch.begin_member("baz", Vec::new());
+        batch.finish_member(
+            "baz",
+            &crate::MemberOutcome::Installed,
+            Vec::new(),
+            &VecDeque::new(),
+        );
         app.install_batch = Some(batch);
 
         app.finish_install_batch(&BuildOutcome::Success, &VecDeque::new(), Vec::new());
 
         let said = &app.message.as_ref().expect("a summary").text;
         assert!(
-            said.contains("installed 1 of 3")
-                && said.contains("could not be placed")
-                && said.contains("1 not attempted"),
-            "{said}"
+            said.contains("installed 2 of 3") && !said.contains("not attempted"),
+            "a refusal is a shortfall, not a stop: {said}"
         );
         let report = app.build_report.as_ref().expect("a panel");
         assert!(
@@ -5864,6 +5865,69 @@ mod tests {
         assert!(
             foo_line.is_none(),
             "the first crate is not blamed for it: {foo_line:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A member that fails does not stop the list: the sweeps' policy
+    /// is the batch model's. The failure is the member's section, the
+    /// panel is red, the summary counts — and nothing reads "stopped",
+    /// because nothing did.
+    #[test]
+    fn a_member_failure_does_not_stop_the_list() {
+        let root = std::env::temp_dir().join("cargo-lbin-test-tui-batch-carries-on");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("bin")).unwrap();
+        std::fs::create_dir_all(root.join("share/cargo-lbin")).unwrap();
+        Manifest::default().store(&root).unwrap();
+        let mut app = App::new(&root).unwrap();
+        let mut runner: BatchRunner<(), InstallSection> =
+            BatchRunner::new(std::collections::VecDeque::new(), INSTALL_SECTIONS);
+        runner.total = 3;
+        let mut batch = InstallBatch {
+            runner,
+            shape: BatchShape::List,
+            current: None,
+            attempted: 0,
+            plan_warnings: Vec::new(),
+        };
+        batch.begin_member("foo", Vec::new());
+        batch.finish_member(
+            "foo",
+            &crate::MemberOutcome::Installed,
+            Vec::new(),
+            &VecDeque::new(),
+        );
+        batch.begin_member("bar", Vec::new());
+        batch.finish_member(
+            "bar",
+            &crate::MemberOutcome::Failed(anyhow::anyhow!("boom")),
+            Vec::new(),
+            &VecDeque::new(),
+        );
+        batch.begin_member("baz", Vec::new());
+        batch.finish_member(
+            "baz",
+            &crate::MemberOutcome::Installed,
+            Vec::new(),
+            &VecDeque::new(),
+        );
+        app.install_batch = Some(batch);
+
+        app.finish_install_batch(&BuildOutcome::Success, &VecDeque::new(), Vec::new());
+
+        let said = &app.message.as_ref().expect("a summary").text;
+        assert!(said.contains("installed 2 of 3"), "{said}");
+        assert!(
+            !said.contains("stopped") && !said.contains("not attempted"),
+            "a member failure is not a stop: {said}"
+        );
+        let report = app.build_report.as_ref().expect("shortfalls are shown");
+        assert!(report.failed, "a failed member marks the report");
+        assert!(
+            report.lines.join("\n").contains("boom"),
+            "the failure has its lines: {:?}",
+            report.lines
         );
         let _ = std::fs::remove_dir_all(&root);
     }
