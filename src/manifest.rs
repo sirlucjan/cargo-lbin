@@ -38,6 +38,18 @@ pub struct Entry {
     /// Absent in older manifests, which reads as "not pinned".
     #[serde(default)]
     pub pinned: bool,
+    /// The `rustc` value Cargo recorded for this install — copied
+    /// verbatim (the full multi-line `rustc -vV` report) from the
+    /// stage's `.crates2.json`: the invocation's own testimony, after
+    /// its own toolchain resolution. The artefact and this record come
+    /// from the same build and pass through the same commit path.
+    /// Recorded, never interpreted — no comparison against the current
+    /// toolchain, no policy; the consequence rule lives with the user.
+    /// Absent when no record is available — an entry predating
+    /// 0.18.0, or a cargo that wrote none — which reads as unknown,
+    /// with the cause deliberately not guessed at.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub built_with_rustc: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -135,6 +147,7 @@ mod tests {
     fn entry(bins: &[&str]) -> Entry {
         Entry {
             pinned: false,
+            built_with_rustc: None,
             version: "1.0.0".to_owned(),
             bins: bins.iter().map(|s| (*s).to_owned()).collect(),
             locked: false,

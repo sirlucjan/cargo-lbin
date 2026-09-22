@@ -42,6 +42,11 @@ pub struct ListCrate {
     pub bins: Vec<String>,
     pub locked: bool,
     pub pinned: bool,
+    /// The `rustc` value cargo recorded for the install that produced
+    /// this binary — the full report, verbatim; `null` when no rustc
+    /// record is available, including entries predating 0.18.0:
+    /// absent knowledge, not an empty report.
+    pub built_with_rustc: Option<String>,
     pub status: ListStatus,
     /// The newest version the last check found; `null` when `status` is
     /// `unknown` — absent knowledge, not an empty version.
@@ -169,6 +174,7 @@ impl ListCrate {
             bins: entry.bins.clone(),
             locked: entry.locked,
             pinned: entry.pinned,
+            built_with_rustc: entry.built_with_rustc.clone(),
             status,
             latest,
             checked_at,
@@ -321,6 +327,7 @@ mod tests {
                     bins: bins.into_iter().map(str::to_owned).collect(),
                     locked,
                     pinned,
+                    built_with_rustc: None,
                 },
             );
         }
@@ -464,6 +471,7 @@ mod tests {
             bins: vec!["fd".to_owned()],
             locked: false,
             pinned: false,
+            built_with_rustc: None,
         };
 
         let updated = ListCrate::annotated("fd", &entry, Some(&report));
@@ -509,6 +517,7 @@ mod tests {
       ],
       "locked": false,
       "pinned": true,
+      "built_with_rustc": null,
       "status": "outdated",
       "latest": "0.26.1",
       "checked_at": 1756761600
@@ -521,6 +530,7 @@ mod tests {
       ],
       "locked": true,
       "pinned": false,
+      "built_with_rustc": null,
       "status": "up_to_date",
       "latest": "10.3.0",
       "checked_at": 1756761600
@@ -533,6 +543,7 @@ mod tests {
       ],
       "locked": false,
       "pinned": false,
+      "built_with_rustc": null,
       "status": "up_to_date",
       "latest": "14.1.0",
       "checked_at": 1756761600
@@ -623,6 +634,7 @@ mod tests {
       ],
       "locked": false,
       "pinned": true,
+      "built_with_rustc": null,
       "status": "outdated",
       "latest": "0.26.1",
       "checked_at": 1756761600

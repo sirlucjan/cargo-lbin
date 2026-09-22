@@ -818,6 +818,7 @@ mod tests {
             bins: vec![name.to_owned()],
             locked: false,
             pinned: false,
+            built_with_rustc: None,
             also: Vec::new(),
             status: RowStatus::Unknown,
         }

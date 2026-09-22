@@ -1155,6 +1155,9 @@ fn place_and_commit(
             bins: built.bins,
             locked,
             pinned,
+            // The build's own testimony rides the same commit as its
+            // bytes.
+            built_with_rustc: built.rustc,
         },
     )?;
     // Announced only after the commit — an "installed" before `store`
@@ -3615,6 +3618,9 @@ fn reinstall_plan(manifest: &Manifest, name: &str) -> Result<ReinstallPlan> {
         bins: _,
         locked,
         pinned,
+        // Like `bins`: the rebuild recomputes it — the new build files
+        // its own testimony.
+        built_with_rustc: _,
     } = entry;
     let version = Version::parse(version).with_context(|| {
         format!("`{name}` records an unparsable version ({version}); verify says more")
@@ -4333,6 +4339,17 @@ fn describe_info(
     let _ = writeln!(out, "  pinned:      {}", flag(entry.pinned));
     let _ = writeln!(out, "  locked:      {}", flag(entry.locked));
     let _ = writeln!(out, "  binaries:    {}", entry.bins.join(", "));
+    match &entry.built_with_rustc {
+        // Cargo's own record for this install; shown at its first
+        // line — the full report lives in the manifest and in JSON.
+        Some(report) => {
+            // Subprocess text (a wrapper can shape it): stored
+            // verbatim, spoken sanitized.
+            let first = text::sanitize(report.lines().next().unwrap_or(""));
+            let _ = writeln!(out, "  built with:  {first}");
+        }
+        None => out.push_str("  built with:  unknown\n"),
+    }
     out.push_str(&also_lines);
     out
 }
@@ -4903,6 +4920,7 @@ pub(crate) struct MigrationSnapshot {
     bins: Vec<String>,
     locked: bool,
     pinned: bool,
+    built_with_rustc: Option<String>,
 }
 
 impl MigrationSnapshot {
@@ -4917,11 +4935,13 @@ impl MigrationSnapshot {
         bins: Vec<String>,
         locked: bool,
         pinned: bool,
+        built_with_rustc: Option<String>,
     ) -> Result<Self> {
         Ok(Self {
             version: Version::parse(version)
                 .with_context(|| format!("`{name}` has an unparseable version `{version}`"))?,
             bins,
+            built_with_rustc,
             locked,
             pinned,
         })
@@ -4933,6 +4953,7 @@ impl MigrationSnapshot {
             bins,
             locked,
             pinned,
+            built_with_rustc,
         } = entry;
         Ok(Self {
             version: Version::parse(version)
@@ -4940,6 +4961,7 @@ impl MigrationSnapshot {
             bins: bins.clone(),
             locked: *locked,
             pinned: *pinned,
+            built_with_rustc: built_with_rustc.clone(),
         })
     }
 
@@ -4952,11 +4974,16 @@ impl MigrationSnapshot {
             bins,
             locked,
             pinned,
+            built_with_rustc,
         } = entry;
         Version::parse(version).is_ok_and(|v| v == self.version)
             && *bins == self.bins
             && *locked == self.locked
             && *pinned == self.pinned
+            // A same-version rebuild under a new toolchain changes the
+            // bytes while changing nothing else on this list — the
+            // testimony is what notices it.
+            && *built_with_rustc == self.built_with_rustc
     }
 }
 
@@ -5507,6 +5534,7 @@ mod tests {
                     bins: vec![(*n).to_owned()],
                     locked: false,
                     pinned: false,
+                    built_with_rustc: None,
                 },
             );
         }
@@ -6119,6 +6147,7 @@ mod tests {
             bins: vec!["foo".to_owned()],
             locked: false,
             pinned: false,
+            built_with_rustc: None,
         };
         // Update of an existing crate: the old entry must come back.
         let mut m = manifest_with(&["foo"]);
@@ -6180,6 +6209,7 @@ mod tests {
                 bins: vec!["foo".to_owned()],
                 locked: false,
                 pinned: false,
+                built_with_rustc: None,
             },
         );
         let new_bins = vec!["foo".to_owned(), "fooctl".to_owned(), "fooadmin".to_owned()];
@@ -6217,6 +6247,7 @@ mod tests {
                 bins: vec!["shared".to_owned()],
                 locked: false,
                 pinned: false,
+                built_with_rustc: None,
             },
         );
 
@@ -6685,6 +6716,42 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    /// The built-with line speaks cargo's record at its first line,
+    /// sanitized — subprocess text never steers the terminal — and
+    /// `None` says exactly `unknown`, its cause deliberately unguessed.
+    #[test]
+    fn describe_info_speaks_the_rustc_record_sanitized_or_unknown() {
+        let releases = vec![index::Release {
+            version: Version::parse("0.1.0").unwrap(),
+            yanked: false,
+        }];
+        let mut entry = Entry {
+            version: "0.1.0".to_owned(),
+            bins: vec!["okcrate".to_owned()],
+            locked: false,
+            pinned: false,
+            built_with_rustc: Some(
+                "rustc 1.90.0 (abc 2025-01-01)\u{1b}[31m\nrelease: 1.90.0\n".to_owned(),
+            ),
+        };
+        let shown = describe_info("okcrate", &releases, Some(&entry), &[]);
+        assert!(
+            shown.contains("built with:  rustc 1.90.0 (abc 2025-01-01)"),
+            "the first line is spoken: {shown}"
+        );
+        assert!(
+            !shown.contains('\u{1b}'),
+            "and never a control byte from the record: {shown}"
+        );
+
+        entry.built_with_rustc = None;
+        let shown = describe_info("okcrate", &releases, Some(&entry), &[]);
+        assert!(
+            shown.contains("built with:  unknown\n"),
+            "None says unknown and no more: {shown}"
+        );
+    }
+
     #[test]
     fn migration_snapshot_protects_every_entry_field() {
         let base = Entry {
@@ -6692,6 +6759,7 @@ mod tests {
             bins: vec!["foo".into()],
             locked: true,
             pinned: true,
+            built_with_rustc: None,
         };
         let snap = MigrationSnapshot::capture("foo", &base).unwrap();
         assert!(snap.still_matches(&base));
@@ -6714,6 +6782,13 @@ mod tests {
         let mut changed = base.clone();
         changed.pinned = false;
         assert!(!snap.still_matches(&changed), "the pin is protected");
+
+        let mut changed = base.clone();
+        changed.built_with_rustc = Some("rustc 1.98.0 (feedface 2026-06-01)\n".into());
+        assert!(
+            !snap.still_matches(&changed),
+            "the rustc provenance is protected"
+        );
     }
 
     /// Shared scaffolding for the migrate tests: a prefix with a
@@ -6738,6 +6813,7 @@ mod tests {
                 bins: vec![name.to_owned()],
                 locked,
                 pinned,
+                built_with_rustc: None,
             },
         );
         manifest.store(&prefix).unwrap();
@@ -6758,6 +6834,29 @@ mod tests {
                  printf '#!/bin/sh\\ntrue\\n' > \"$4/bin/{name}\"\n\
                  chmod 755 \"$4/bin/{name}\"\n\
                  printf '%s' '{{\"installs\":{{\"{name} 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)\":{{\"bins\":[\"{name}\"]}}}}}}' > \"$4/.crates2.json\"\n\
+                 exit 0\n"
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        script
+    }
+
+    /// `staging_fake` plus cargo's `rustc` record: `rustc_json` is the
+    /// already-JSON-encoded report string.
+    fn provenance_fake(root: &Path, name: &str, rustc_json: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let fake_bin = root.join("fakebin");
+        fs::create_dir_all(&fake_bin).unwrap();
+        let script = fake_bin.join("cargo");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\n\
+                 mkdir -p \"$4/bin\"\n\
+                 printf '#!/bin/sh\\ntrue\\n' > \"$4/bin/{name}\"\n\
+                 chmod 755 \"$4/bin/{name}\"\n\
+                 printf '%s' '{{\"installs\":{{\"{name} 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)\":{{\"bins\":[\"{name}\"],\"rustc\":{rustc_json}}}}}}}' > \"$4/.crates2.json\"\n\
                  exit 0\n"
             ),
         )
@@ -7117,12 +7216,89 @@ mod tests {
         let entry = &dest_manifest.crates["okcrate"];
         assert_eq!(entry.version, "0.1.0");
         assert!(entry.pinned, "the pin bit travels with the crate");
+        assert!(
+            entry.built_with_rustc.is_none(),
+            "a stage without the record reads as unknown"
+        );
         assert!(entry.locked, "the --locked flag travels with the crate");
         assert!(dest.join("bin/okcrate").is_file(), "rebuilt and placed");
 
         let src_manifest = Manifest::load(&source).unwrap();
         assert!(!src_manifest.crates.contains_key("okcrate"), "retired");
         assert!(!source.join("bin/okcrate").exists(), "binary removed");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The destination records the destination build's own testimony —
+    /// provenance is never copied from the source entry, and it lands
+    /// byte-for-byte.
+    #[test]
+    fn migrate_files_the_destination_builds_rustc_not_the_sources() {
+        let root = std::env::temp_dir().join("cargo-lbin-test-migrate-provenance");
+        let _ = fs::remove_dir_all(&root);
+        let source = seeded_prefix(&root, "source", "okcrate", true, true);
+        let seeded = "rustc 0.0.1 (seeded 2020-01-01)\n";
+        let mut m = Manifest::load(&source).unwrap();
+        m.crates.get_mut("okcrate").unwrap().built_with_rustc = Some(seeded.into());
+        m.store(&source).unwrap();
+        let dest = root.join("dest");
+        fs::create_dir_all(dest.join("bin")).unwrap();
+        fs::create_dir_all(dest.join("share/cargo-lbin")).unwrap();
+        let report = "rustc 1.90.0 (abc 2025-01-01)\nbinary: rustc\nrelease: 1.90.0\n";
+        let _fake = crate::stage::FakeCargo::install(&provenance_fake(
+            &root,
+            "okcrate",
+            &serde_json::to_string(report).unwrap(),
+        ));
+
+        let snap = MigrationSnapshot::capture(
+            "okcrate",
+            &Manifest::load(&source).unwrap().crates["okcrate"],
+        )
+        .unwrap();
+        let outcome = migrate_one(
+            &source,
+            &dest,
+            &root.join("cache"),
+            "okcrate",
+            &snap,
+            &mut MigrateFrontend::Terminal,
+        )
+        .unwrap();
+        assert!(matches!(outcome, MigrateOutcome::Moved { .. }));
+
+        let dest_rustc = Manifest::load(&dest).unwrap().crates["okcrate"]
+            .built_with_rustc
+            .clone();
+        assert_eq!(
+            dest_rustc.as_deref(),
+            Some(report),
+            "the destination build's own record, verbatim"
+        );
+        assert_ne!(dest_rustc.as_deref(), Some(seeded), "never the source's");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// `pin`/`unpin` move no bytes, so they touch no provenance.
+    #[test]
+    fn pin_and_unpin_leave_built_with_rustc_untouched() {
+        let root = std::env::temp_dir().join("cargo-lbin-test-pin-provenance");
+        let _ = fs::remove_dir_all(&root);
+        let prefix = seeded_prefix(&root, "prefix", "okcrate", false, false);
+        let report = "rustc 1.90.0 (abc 2025-01-01)\nrelease: 1.90.0\n";
+        let mut m = Manifest::load(&prefix).unwrap();
+        m.crates.get_mut("okcrate").unwrap().built_with_rustc = Some(report.into());
+        m.store(&prefix).unwrap();
+
+        let recorded = || {
+            Manifest::load(&prefix).unwrap().crates["okcrate"]
+                .built_with_rustc
+                .clone()
+        };
+        cmd_set_pinned(&prefix, &["okcrate".into()], true).unwrap();
+        assert_eq!(recorded().as_deref(), Some(report), "pin moves no bytes");
+        cmd_set_pinned(&prefix, &["okcrate".into()], false).unwrap();
+        assert_eq!(recorded().as_deref(), Some(report), "unpin moves no bytes");
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -7258,6 +7434,7 @@ mod tests {
                 bins: vec!["okcrate".into()],
                 locked: false,
                 pinned: false,
+                built_with_rustc: None,
             },
         );
         let (errors, _) = verify_entries(&prefix, &dup);
@@ -7455,6 +7632,7 @@ mod tests {
                 bins: vec!["tool".into()],
                 locked: false,
                 pinned: false,
+                built_with_rustc: None,
             },
         );
         let (errors, _) = verify_entries(&prefix, &manifest);
@@ -7552,6 +7730,7 @@ mod tests {
                 bins: vec!["poison".into()],
                 locked: false,
                 pinned: false,
+                built_with_rustc: None,
             },
         );
         let (errors, _) = verify_entries(&prefix, &manifest);
@@ -7597,6 +7776,7 @@ mod tests {
                 bins: Vec::new(),
                 locked: false,
                 pinned: false,
+                built_with_rustc: None,
             },
         );
         manifest.crates.insert(
@@ -7606,6 +7786,7 @@ mod tests {
                 bins: vec!["../outside".into(), "good".into(), "good".into()],
                 locked: false,
                 pinned: false,
+                built_with_rustc: None,
             },
         );
         let (errors, checkable) = verify_entries(&prefix, &manifest);
@@ -8095,6 +8276,7 @@ mod tests {
             bins: vec!["x".into()],
             locked: false,
             pinned: false,
+            built_with_rustc: None,
         };
         let name = "anything".to_owned();
         let result = check_versions([(&name, &entry)], || true).unwrap();
@@ -8353,6 +8535,7 @@ mod tests {
                     bins: vec!["othercrate".to_owned()],
                     locked: false,
                     pinned: false,
+                    built_with_rustc: None,
                 },
             );
             m.store(&prefix).unwrap();
@@ -8400,6 +8583,7 @@ mod tests {
                     bins: vec!["okcrate".to_owned()],
                     locked: false,
                     pinned: false,
+                    built_with_rustc: None,
                 },
             );
             m.store(&prefix).unwrap();
@@ -8444,6 +8628,7 @@ mod tests {
                     bins: vec!["okcrate".to_owned()],
                     locked: false,
                     pinned: false,
+                    built_with_rustc: None,
                 },
             );
             m.store(&prefix).unwrap();
@@ -9197,6 +9382,7 @@ mod tests {
                         bins: vec![name.to_owned()],
                         locked: false,
                         pinned: false,
+                        built_with_rustc: None,
                     },
                 );
             }
@@ -9272,6 +9458,7 @@ mod tests {
                         bins: vec![name.to_owned()],
                         locked: false,
                         pinned: false,
+                        built_with_rustc: None,
                     },
                 );
             }
@@ -9739,9 +9926,15 @@ mod tests {
         let _fake = crate::stage::FakeCargo::install(&staging_fake(&root, "okcrate"));
 
         // Frozen from the state the person saw…
-        let snap =
-            MigrationSnapshot::from_parts("okcrate", "0.1.0", vec!["okcrate".into()], false, false)
-                .unwrap();
+        let snap = MigrationSnapshot::from_parts(
+            "okcrate",
+            "0.1.0",
+            vec!["okcrate".into()],
+            false,
+            false,
+            None,
+        )
+        .unwrap();
         // …then the world moves on before the worker starts.
         let mut m = Manifest::load(&source).unwrap();
         m.crates.get_mut("okcrate").unwrap().version = "0.2.0".into();

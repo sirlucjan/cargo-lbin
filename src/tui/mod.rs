@@ -62,6 +62,9 @@ pub struct Row {
     pub bins: Vec<String>,
     pub locked: bool,
     pub pinned: bool,
+    /// Cargo's recorded `rustc` for the installed artefact — carried
+    /// so a frozen migration plan snapshots the whole entry identity.
+    pub built_with_rustc: Option<String>,
     /// The other prefixes carrying this crate, as facts rather than as
     /// presentation: the list suffix renders them through the shared
     /// `prefixes::describe` the CLI listing uses, the details panel
@@ -3230,6 +3233,7 @@ impl App {
                         row.bins.clone(),
                         row.locked,
                         row.pinned,
+                        row.built_with_rustc.clone(),
                     ) {
                         Ok(snap) => snap,
                         Err(e) => {
@@ -3310,6 +3314,7 @@ impl App {
                 row.bins.clone(),
                 row.locked,
                 row.pinned,
+                row.built_with_rustc.clone(),
             ) {
                 Ok(snap) => plan.push(PendingMigrate {
                     name: row.name.clone(),
@@ -3842,6 +3847,9 @@ impl App {
                         bins: r.bins.clone(),
                         locked: r.locked,
                         pinned: r.pinned,
+                        // Check input only: provenance plays no part
+                        // in an index lookup.
+                        built_with_rustc: None,
                     },
                 )
             })
@@ -5065,6 +5073,7 @@ fn rows_from(
                 bins: entry.bins.clone(),
                 locked: entry.locked,
                 pinned: entry.pinned,
+                built_with_rustc: entry.built_with_rustc.clone(),
                 also: also.get(name).cloned().unwrap_or_default(),
                 status,
             }
@@ -5138,6 +5147,7 @@ mod tests {
                     bins: vec![(*name).to_owned()],
                     locked: false,
                     pinned: false,
+                    built_with_rustc: None,
                 },
             );
         }
@@ -5271,6 +5281,7 @@ mod tests {
             bins: vec!["x".into()],
             locked: false,
             pinned,
+            built_with_rustc: None,
             also: Vec::new(),
             status,
         };
@@ -5391,6 +5402,7 @@ mod tests {
                         bins: vec![name.to_owned()],
                         locked: false,
                         pinned,
+                        built_with_rustc: None,
                     },
                 );
             }
@@ -6991,6 +7003,7 @@ mod tests {
                     bins: vec![name.to_owned()],
                     locked: false,
                     pinned: false,
+                    built_with_rustc: None,
                 },
             );
         }
@@ -7104,6 +7117,7 @@ mod tests {
                 bins: vec!["foo".into()],
                 locked: false,
                 pinned: false,
+                built_with_rustc: None,
             },
         );
         manifest.store(&prefix).unwrap();
@@ -7228,6 +7242,7 @@ mod tests {
                 vec![name.into()],
                 false,
                 false,
+                None,
             )
             .unwrap(),
         };
@@ -7331,6 +7346,7 @@ mod tests {
                 vec![name.into()],
                 false,
                 false,
+                None,
             )
             .unwrap(),
         };
@@ -7389,6 +7405,7 @@ mod tests {
                 vec![name.into()],
                 false,
                 false,
+                None,
             )
             .unwrap(),
         };
@@ -7476,6 +7493,7 @@ mod tests {
                 vec![name.into()],
                 false,
                 false,
+                None,
             )
             .unwrap(),
         };
@@ -7548,6 +7566,7 @@ mod tests {
                 vec!["baz".into()],
                 false,
                 false,
+                None,
             )
             .unwrap(),
         });

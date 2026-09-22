@@ -418,6 +418,10 @@ pub struct Built {
     pub version: Version,
     pub bins: Vec<String>,
     pub bin_paths: Vec<PathBuf>,
+    /// The `rustc` cargo recorded for this install in the stage's
+    /// `.crates2.json` — the invocation's own testimony, taken
+    /// verbatim; `None` when cargo wrote none.
+    pub rustc: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -428,6 +432,11 @@ struct Crates2 {
 #[derive(Deserialize)]
 struct InstallInfo {
     bins: Vec<String>,
+    /// Cargo's own record of the `rustc` it used for this install —
+    /// the full `rustc -vV` report, verbatim. Optional: absent under
+    /// the test fakes and any cargo that stops writing it.
+    #[serde(default)]
+    rustc: Option<String>,
 }
 
 /// What tests may substitute for `cargo`: a synchronized value, not a
@@ -1187,6 +1196,7 @@ fn staged_info(name: &str, stage: &Path) -> Result<Built> {
                 bin_paths: info.bins.iter().map(|b| bin_dir.join(b)).collect(),
                 bins: info.bins.clone(),
                 version,
+                rustc: info.rustc.clone(),
             });
         }
     }
@@ -1425,6 +1435,40 @@ mod tests {
             envs.iter().all(|(k, _)| k != "CARGO_TARGET_DIR"),
             "CARGO_TARGET_DIR is neither set nor cleared"
         );
+    }
+
+    /// Cargo's `rustc` record rides `.crates2.json` byte-for-byte —
+    /// the full multi-line report, trailing newline included — and
+    /// its absence reads as `None`, never as an error.
+    #[test]
+    fn staged_info_carries_cargos_rustc_verbatim_or_none() {
+        let report = "rustc 1.90.0 (abc 2025-01-01)\nbinary: rustc\nrelease: 1.90.0\n";
+        let dir = std::env::temp_dir().join("cargo-lbin-test-stage-rustc");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join(".crates2.json"),
+            format!(
+                "{{\"installs\":{{\"foo 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)\":{{\"bins\":[\"foo\"],\"rustc\":{}}}}}}}",
+                serde_json::to_string(report).unwrap()
+            ),
+        )
+        .unwrap();
+        let built = staged_info("foo", &dir).unwrap();
+        assert_eq!(
+            built.rustc.as_deref(),
+            Some(report),
+            "verbatim, trailing newline included"
+        );
+
+        fs::write(
+            dir.join(".crates2.json"),
+            "{\"installs\":{\"foo 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)\":{\"bins\":[\"foo\"]}}}",
+        )
+        .unwrap();
+        let built = staged_info("foo", &dir).unwrap();
+        assert!(built.rustc.is_none(), "absent field reads as None");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
