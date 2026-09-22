@@ -64,9 +64,26 @@ expected, `cargo +toolchain lbin` still selects the toolchain it names,
 and `cargo-lbin` deliberately does not clear the variable — second-guessing
 rustup's environment is not its job.
 
-Do **not** run `cargo-lbin` itself with `sudo`. Build scripts and proc macros must run as your normal user; `cargo-lbin` requests `sudo` itself only when placement under the canonical `/usr/local` prefix requires it.
+Do **not** run `cargo-lbin` itself with `sudo`. Builds, build scripts and
+proc macros always run as your normal user. `cargo-lbin` requests `sudo`
+itself only for filesystem operations that require privileges under the
+canonical `/usr/local` prefix.
 
-Where `cargo-lbin` asks for those credentials itself — placement, and a migration's retirement of the source — it names the reason first, because `sudo` prompts for a user and never for a purpose: `administrative privileges are required to install under /usr/local`, or `… to retire the source installation from /usr/local`. One sentence for both surfaces: the CLI prints it, and the TUI prints it on the terminal it steps off before suspending. (In the interface a `remove` or a pin flip goes through the same authorization door as everything else; the terminal is handed over only when `sudo` cannot retain credentials.)
+Most credentials are requested only when the privileged operation is
+reached — placement, removal, a pin-state write, or a migration's
+retirement of the source. The one earlier touch is initialization of a
+prefix's lock file: when a protected `/usr/local` prefix has no state
+lock yet, creating that lock may require `sudo` before any build starts.
+
+Whenever `cargo-lbin` asks for credentials, it names the reason first,
+because `sudo` prompts for a user and never for a purpose:
+`administrative privileges are required to install under /usr/local`,
+`… to retire the source installation from /usr/local`, `… to change
+what is installed under /usr/local` (a removal or a pin-state write) —
+and lock initialization announces itself as `initializing state for
+/usr/local: creating /usr/local/share/cargo-lbin/lock`. One sentence for both surfaces: the
+CLI prints it, and the TUI prints it on the terminal it steps off before
+suspending. (In the interface a `remove` or a pin flip goes through the same authorization door as everything else; the terminal is handed over only when `sudo` cannot retain credentials.)
 
 ## Quick start
 
@@ -716,7 +733,7 @@ pinned crates are behind. The same split shapes the `r` result line:
 
 Every build runs inside the interface, in its own framed Build panel: a single install, an update, a downgrade, a reinstall, a migration, and the batches and sweeps over them. Each has `c` to cancel, keeps its warnings on the record, and leaves its last lines and log path behind if it fails.
 
-`sudo` is asked for where it is spent — at placement, after the build — and the interface steps aside for that one prompt. A migration out of a privileged prefix into a writable one escalates only after the build, because the privileged half is retiring the source; it says so before the build starts, so a prompt arriving then is expected rather than startling. Whether `sudo` asks at all depends on its own timestamp, so the notice promises the escalation, not the prompt. The CLI says the same before each crate's build.
+`sudo` is asked for where it is spent — at the privileged operation, normally after the build; the one earlier touch, first-use initialization of the prefix's lock file, is described below — and the interface steps aside for that one prompt. A migration out of a privileged prefix into a writable one escalates only after the build, because the privileged half is retiring the source; it says so before the build starts, so a prompt arriving then is expected rather than startling. Whether `sudo` asks at all depends on its own timestamp, so the notice promises the escalation, not the prompt. The CLI says the same before each crate's build.
 
 Where placement under the prefix will need `sudo`, a run of builds says so once before the first one starts: the builds themselves are unprivileged, and placement needs `sudo` after each of them. It promises the escalation, not the prompt — `sudo`'s own timestamp decides whether it asks, and after the first member it usually does not. The same notice a migration gives, for the same reason: a prompt three minutes into a build is expected rather than alarming only if something said it was coming.
 
@@ -912,23 +929,35 @@ It does **not** sandbox Cargo. Installing a crate means trusting code that Cargo
 
 ### Builds never run through sudo
 
-Crates are built first, as the invoking user, in an isolated staging root. Only placement into a protected `/usr/local` destination may trigger `sudo`.
+Crates are always built as the invoking user in an isolated staging
+root. Privilege escalation is limited to protected filesystem
+operations under the canonical `/usr/local` prefix; Cargo, rustc,
+build scripts and proc macros never run through `sudo`.
 
-Credentials are collected where they are spent: at the placement door,
-after the build. A build is unprivileged work, so paying for it in
-advance would mean paying for builds that fail — and holding a warm
-credential for the whole length of every build that does not. `sudo -n
--v` checks the timestamp silently there, and only when sudo would
-prompt does `cargo-lbin` announce why and run `sudo -v`. The TUI steps
-off its screen for that prompt; the CLI asks in place.
+Once the prefix state lock exists, build-backed operations collect
+credentials where they are spent: at the authorization door, after
+the build. A build is
+unprivileged work, so paying for it in advance would mean paying for
+builds that fail — and holding a warm credential for the whole length
+of every build that does not. `sudo -n -v` checks the timestamp
+silently there, and only when sudo would prompt does `cargo-lbin`
+announce why and run `sudo -v`. The TUI steps off its screen for that
+prompt; the CLI asks in place.
 
-One thing cannot wait: preparing a prefix's lock file the first time
-anything is installed there. That is the first privileged touch and it
-happens before the build, so a cold sudo is asked then — once per
-prefix, since the lock file is world-readable once made. On a sudo
-configured not to cache credentials at all, the refusal now arrives
-after the build instead of before it; that is the cost of not holding
-a password across work that does not need one.
+The exception is first-use state initialization: preparing the
+prefix's lock file must happen before the operation can take its
+lock, so a cold `sudo` may be asked before the build when that
+protected prefix has no state lock yet. Once created, the lock is
+world-readable, so ordinary later operations can open it without
+privilege. The initialization announcement is unconditional: the
+write is the event, and it is named whether or not `sudo`'s timestamp
+spares the prompt. With a non-caching sudo, the TUI handles the two doors differently:
+discovered while preparing a missing state lock, the whole operation
+is handed to the CLI before any build starts (a migration instead
+names the CLI command); discovered later at placement, the
+already-built member is refused rather than rebuilt through `sudo`.
+Once the lock exists, each operation authorizes only at the protected
+mutation it actually performs.
 `cargo-lbin` never reads, buffers or forwards the password itself: the
 prompt, echo, retries, PAM and the credential cache are `sudo`'s business
 alone. This is a design rule, not an implementation detail — a password
@@ -1021,7 +1050,7 @@ supported.
 - A working Cargo setup.
 - Network access to crates.io for installs, searches, exact info lookups and update checks.
 - `/proc` mounted and available for descriptor-based placement.
-- `sudo` when the canonical `/usr/local` destination is not writable by the invoking user.
+- `sudo` when the canonical `/usr/local` prefix is not writable by the invoking user — its `bin/` for placement, or its state under `share/cargo-lbin/`, whose lock file is initialized when absent.
 - Standard GNU/Linux userland tools in their conventional trusted locations (`sudo`, `install`, `rm`, `mkdir`, `touch`, `mv`, `chmod`).
 
 The implementation is developed with conventional Arch Linux and Fedora-style layouts in mind.

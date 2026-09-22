@@ -365,7 +365,10 @@ fn main() -> ExitCode {
         && std::env::var_os("CARGO_LBIN_ALLOW_ROOT").is_none_or(|v| v != "1")
     {
         eprintln!("error: cargo-lbin must not be run as root");
-        eprintln!("run it as your normal user; sudo is requested only when required for placement");
+        eprintln!(
+            "run it as your normal user; sudo is requested only for the privileged \
+             filesystem operations that need it"
+        );
         eprintln!("(set CARGO_LBIN_ALLOW_ROOT=1 only in environments where root is the only user)");
         return ExitCode::from(EXIT_ERROR);
     }

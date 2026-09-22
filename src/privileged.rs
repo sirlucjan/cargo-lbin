@@ -1,7 +1,9 @@
-//! Privilege handling: build as the user, escalate only for file
-//! placement — sudo is prepended only when the actual destination
-//! directory is not writable, decided per destination, not per
-//! prefix.
+//! Privilege handling: build as the user, escalate only for protected
+//! filesystem mutations under the canonical prefix — placement,
+//! retirement, a mutation of what is installed, and state-lock
+//! initialization. Sudo is prepended only when the filesystem
+//! operation actually being performed requires it, decided per
+//! destination, not per prefix — and never around Cargo or the build.
 //!
 //! Two hardening rules throughout, because build scripts run as the
 //! user first and must not steer this:
