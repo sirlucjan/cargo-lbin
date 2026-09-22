@@ -29,7 +29,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 clap = { version = "4", features = ["derive", "env"] }
 clap_complete = "4"
-ureq = { version = "2", features = ["tls", "native-certs"] }
+ureq = { version = "3", features = ["platform-verifier"] }
 # unstable-rendered-line-info: Paragraph::line_count — the report panel's
 # scroll clamp must count rows the way the wrapper breaks them. "Unstable"
 # is ratatui's API-stability marker; a rename fails this build loudly.

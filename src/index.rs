@@ -29,10 +29,20 @@ pub(crate) fn agent() -> &'static ureq::Agent {
 /// The constructor the shared agent uses, split out so a test can build
 /// one with a short limit and prove the limit actually binds.
 fn agent_with(connect: std::time::Duration, overall: std::time::Duration) -> ureq::Agent {
-    ureq::AgentBuilder::new()
-        .timeout_connect(connect)
-        .timeout(overall)
+    ureq::Agent::config_builder()
+        // 2.x chose the system trust store (`native-certs`) over the
+        // bundled roots; 3.x flips that default, so the choice is now
+        // explicit — the platform verifier keeps the distro's CA
+        // policy in charge of who crates.io is.
+        .tls_config(
+            ureq::tls::TlsConfig::builder()
+                .root_certs(ureq::tls::RootCerts::PlatformVerifier)
+                .build(),
+        )
+        .timeout_connect(Some(connect))
+        .timeout_global(Some(overall))
         .build()
+        .new_agent()
 }
 
 pub(crate) const USER_AGENT: &str = concat!(
@@ -95,13 +105,14 @@ pub fn not_found(name: &str) -> anyhow::Error {
 /// crate — an answer, distinct from a failed request.
 pub fn releases(name: &str) -> Result<Option<Vec<Release>>> {
     let url = format!("{INDEX_BASE}/{}", index_path(name));
-    let response = match agent().get(&url).set("User-Agent", USER_AGENT).call() {
+    let mut response = match agent().get(&url).header("User-Agent", USER_AGENT).call() {
         Ok(response) => response,
-        Err(ureq::Error::Status(404, _)) => return Ok(None),
+        Err(ureq::Error::StatusCode(404)) => return Ok(None),
         Err(other) => bail!("index request for `{name}` failed: {other}"),
     };
     let body = response
-        .into_string()
+        .body_mut()
+        .read_to_string()
         .with_context(|| format!("reading index response for `{name}`"))?;
     parse_index_body(name, &body).map(Some)
 }

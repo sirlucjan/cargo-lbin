@@ -103,15 +103,16 @@ pub fn search(query: &str, limit: usize) -> Result<Vec<Hit>> {
         bail!("empty search query");
     }
     throttle();
-    let response = crate::index::agent()
+    let mut response = crate::index::agent()
         .get(API_BASE)
-        .set("User-Agent", USER_AGENT)
+        .header("User-Agent", USER_AGENT)
         .query("q", query)
-        .query("per_page", &limit.to_string())
+        .query("per_page", limit.to_string())
         .call()
         .map_err(|e| anyhow::anyhow!("crates.io search for `{query}` failed: {e}"))?;
     let body = response
-        .into_string()
+        .body_mut()
+        .read_to_string()
         .context("reading crates.io search response")?;
     let mut hits = parse_search_body(&body)?;
     hits.truncate(limit);
