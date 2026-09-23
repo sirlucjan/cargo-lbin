@@ -1,6 +1,8 @@
 //! Shared test fixtures.
 
 use crate::manifest::{Entry, Manifest};
+#[cfg(feature = "tui")]
+use semver::Version;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -162,4 +164,27 @@ pub(crate) fn failing_fake(root: &Path, failing: &str) -> PathBuf {
     .unwrap();
     fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
     script
+}
+
+#[cfg(feature = "tui")]
+pub(crate) fn v(s: &str) -> Version {
+    Version::parse(s).unwrap()
+}
+
+#[cfg(feature = "tui")]
+pub(crate) fn manifest(entries: &[(&str, &str)]) -> Manifest {
+    let mut m = Manifest::default();
+    for (name, version) in entries {
+        m.crates.insert(
+            (*name).to_owned(),
+            Entry {
+                version: (*version).to_owned(),
+                bins: vec![(*name).to_owned()],
+                locked: false,
+                pinned: false,
+                built_with_rustc: None,
+            },
+        );
+    }
+    m
 }

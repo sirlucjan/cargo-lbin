@@ -5119,10 +5119,7 @@ fn parse_search_input(buffer: &str) -> Result<String> {
 mod tests {
     use super::*;
     use crate::report::Checked;
-
-    fn v(s: &str) -> Version {
-        Version::parse(s).unwrap()
-    }
+    use crate::test_support::{manifest, v};
 
     /// A migrate runner mid-flight: `total` planned, `succeeded`
     /// already done, the rest still queued.
@@ -5135,23 +5132,6 @@ mod tests {
         runner.total = total;
         runner.succeeded = succeeded;
         runner
-    }
-
-    fn manifest(entries: &[(&str, &str)]) -> Manifest {
-        let mut m = Manifest::default();
-        for (name, version) in entries {
-            m.crates.insert(
-                (*name).to_owned(),
-                Entry {
-                    version: (*version).to_owned(),
-                    bins: vec![(*name).to_owned()],
-                    locked: false,
-                    pinned: false,
-                    built_with_rustc: None,
-                },
-            );
-        }
-        m
     }
 
     #[test]
