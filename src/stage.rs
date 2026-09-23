@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Piotr Gorski <piotrgorski@cachyos.org>
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Stage builds.
 //!
 //! `cargo install --root <stage>` runs as the invoking user: registry cache,

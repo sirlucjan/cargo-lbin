@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Piotr Gorski <piotrgorski@cachyos.org>
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Persisted knowledge from update checks. Full sweeps (`checkupdate`
 //! from the command line, `r` in the interface, `U`'s plan) re-stamp
 //! the baseline; every partial question — `update NAME`, a bare

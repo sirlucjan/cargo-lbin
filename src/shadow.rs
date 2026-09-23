@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Piotr Gorski <piotrgorski@cachyos.org>
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Warn when a binary about to be installed shares its name with one
 //! already on `PATH` outside the prefix — typically a distro package.
 //!

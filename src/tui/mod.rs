@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Piotr Gorski <piotrgorski@cachyos.org>
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Interactive front end over the same commands the CLI runs.
 //!
 //! The TUI adds no logic of its own: `r` is `checkupdate`, `u`/`U` are

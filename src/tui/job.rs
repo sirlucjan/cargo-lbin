@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Piotr Gorski <piotrgorski@cachyos.org>
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! The TUI's worker boundary: messages sent back from spawned work,
 //! the UI-side `Job` state that owns their receivers, and pending build
 //! intents waiting to cross that boundary. Polling and the collector -

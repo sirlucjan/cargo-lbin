@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Piotr Gorski <piotrgorski@cachyos.org>
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Read-only state audit (`verify`) and opt-in cache cleaning (`clean`).
 //!
 //! The two share the stale-stage scan; cleaning is always opt-in, and

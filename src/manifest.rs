@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Piotr Gorski <piotrgorski@cachyos.org>
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Installation manifest.
 //!
 //! Lives at `<prefix>/share/cargo-lbin/manifest.json` so state travels with the

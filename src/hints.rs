@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Piotr Gorski <piotrgorski@cachyos.org>
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Pasteable command primitives and shared hint construction.
 //!
 //! Commands lbin invites a human to paste follow one doctrine from

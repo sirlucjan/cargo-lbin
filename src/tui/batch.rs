@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Piotr Gorski <piotrgorski@cachyos.org>
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! The TUI's batch machinery: shared tally and reporting state, the
 //! per-verb sections that classify member outcomes, and migration's
 //! queue and stopping state. The crate stays the unit of execution

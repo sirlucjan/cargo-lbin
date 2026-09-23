@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Piotr Gorski <piotrgorski@cachyos.org>
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! The TUI's operation adapters: the same mechanisms and contracts the
 //! CLI uses, shaped for a screen-owning frontend. Outcomes cross the
 //! boundary as typed values or callbacks, and privileged work uses the

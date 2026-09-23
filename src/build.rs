@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Piotr Gorski <piotrgorski@cachyos.org>
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! The build and placement pipeline.
 //!
 //! One crate from an unprivileged stage build to its manifest commit:

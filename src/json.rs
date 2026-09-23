@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Piotr Gorski <piotrgorski@cachyos.org>
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Machine-readable command output (`--json`).
 //!
 //! A contract: every document carries `schema`; existing fields are

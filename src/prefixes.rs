@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Piotr Gorski <piotrgorski@cachyos.org>
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Cross-prefix awareness: which *other* lbin prefixes carry a crate
 //! installed here. The set is finite and closed (`/usr/local`,
 //! `~/.local`) and only lbin's own manifests are consulted — a

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Piotr Gorski <piotrgorski@cachyos.org>
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Prefix-scoped state lock: mutations take exclusive for their whole
 //! duration, builds included; readers take shared. The lock lives next
 //! to the state (`<prefix>/share/cargo-lbin/lock`), so it protects the

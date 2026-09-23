@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Piotr Gorski <piotrgorski@cachyos.org>
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Minimal crates.io *API* client — the search endpoint only. The
 //! sparse index answers "what versions does X have"; "what is there
 //! like X" is the API's, for `search` alone — a preview for choosing a

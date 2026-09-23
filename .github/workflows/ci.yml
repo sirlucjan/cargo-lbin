@@ -87,3 +87,35 @@ jobs:
           toolchain: stable
           components: rustfmt
       - run: cargo fmt --all -- --check
+
+  spdx:
+    name: SPDX headers
+    needs: pre_ci
+    if: needs.pre_ci.outputs.continue
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: every source file opens with its SPDX header
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          failed=0
+
+          while IFS= read -r -d '' file; do
+              first=$(sed -n '1p' -- "$file")
+              second=$(sed -n '2p' -- "$file")
+
+              prefix='// SPDX-FileCopyrightText: '
+              holder=${first#"$prefix"}
+
+              if [[ "$first" != "$prefix"* ]] ||
+                 [[ -z "${holder//[[:space:]]/}" ]] ||
+                 [[ "$second" != '// SPDX-License-Identifier: MIT OR Apache-2.0' ]]; then
+                  echo "missing or malformed SPDX header: $file"
+                  failed=1
+              fi
+          done < <(git ls-files -z '*.rs')
+
+          exit "$failed"

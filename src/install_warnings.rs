@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Piotr Gorski <piotrgorski@cachyos.org>
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Pre-build install warnings for cross-prefix duplicates.
 //!
 //! Double installation is legal, so this is warning-only. A warning is

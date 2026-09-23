@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Piotr Gorski <piotrgorski@cachyos.org>
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Minimal crates.io sparse index client.
 //!
 //! The sparse index is plain HTTPS: one file per crate, JSON-lines, one line

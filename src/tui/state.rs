@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Piotr Gorski <piotrgorski@cachyos.org>
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! The TUI's model and dialog state: rows and filters, confirmations
 //! and pending intents. State owned by the event loop, with the row
 //! and confirmation model shared with the renderer.

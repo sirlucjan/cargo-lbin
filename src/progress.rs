@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Piotr Gorski <piotrgorski@cachyos.org>
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Parsing of cargo's line-oriented stderr into progress events a
 //! frontend can render. With stderr piped (not a tty), cargo drops its
 //! own progress bar and usually its colors too — and the captured build

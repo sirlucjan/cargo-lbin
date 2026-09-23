@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Piotr Gorski <piotrgorski@cachyos.org>
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! External text headed for a `Span` is data, never terminal control —
 //! one rule for registry metadata, build output and subprocess stderr
 //! alike. The plain CLI mostly still prints paths raw, as it always
