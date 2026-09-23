@@ -487,7 +487,7 @@ fn shadow_warnings(prefix: &Path, bins: &[String]) -> Vec<String> {
     // Install frontends print these raw, so the severity word travels in
     // the string; `verify` takes the bare notes and frames its own — no
     // "warning: warning:".
-    shadow_notes(prefix, bins)
+    shadow::notes(prefix, bins)
         .into_iter()
         .map(|n| format!("warning: {n}"))
         .collect()
@@ -519,30 +519,6 @@ fn shadow_findings(prefix: &Path, bins: &[String]) -> Vec<Finding> {
                     shadow::describe(s, &prefix_bin, owner.as_deref()),
                 )
             }
-        })
-        .collect()
-}
-
-/// `shadow_warnings` without the severity word: the raw
-/// `shadow::describe` lines, for callers that add their own framing.
-fn shadow_notes(prefix: &Path, bins: &[String]) -> Vec<String> {
-    if bins.is_empty() {
-        return Vec::new();
-    }
-    let Some(path_var) = std::env::var_os("PATH") else {
-        return Vec::new();
-    };
-    // The cwd only anchors relative PATH entries; unreadable means those
-    // cannot be judged, and a possibly-wrong warning is worse than none.
-    let Ok(cwd) = std::env::current_dir() else {
-        return Vec::new();
-    };
-    let prefix_bin = prefix.join("bin");
-    shadow::find_shadows(&path_var, &prefix_bin, bins, &cwd, shadow::is_executable)
-        .iter()
-        .map(|s| {
-            let owner = shadow::owner_of(&s.existing);
-            shadow::describe(s, &prefix_bin, owner.as_deref())
         })
         .collect()
 }
@@ -2671,7 +2647,7 @@ fn rebuild_at_destination(
 /// produced, since a note already ends with that verdict when it
 /// applies.
 fn migration_shadow_notes(dest: &Path, bins: &[String]) -> Vec<String> {
-    let notes = shadow_notes(dest, bins);
+    let notes = shadow::notes(dest, bins);
     if !notes.is_empty() || bins.is_empty() {
         return notes;
     }

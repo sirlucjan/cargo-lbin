@@ -1,22 +1,22 @@
 // SPDX-FileCopyrightText: Piotr Gorski <piotrgorski@cachyos.org>
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Warn when a binary about to be installed shares its name with one
-//! already on `PATH` outside the prefix — typically a distro package.
+//! Discover same-named executables on `PATH` outside a managed prefix
+//! and describe how they stand relative to `<prefix>/bin`.
 //!
-//! A warning, never a refusal: the person may know exactly what they
-//! are doing; what they may not know is where the two copies stand in
-//! `PATH`, which — not freshness — decides what a bare name reaches.
-//! The warning claims directory order and nothing more: no `access(2)`
-//! simulation, no shell.
+//! A shadow is an observation, never a refusal. What matters is PATH
+//! order — not freshness — because that decides what a bare name
+//! reaches. The scan claims directory order and nothing more: no
+//! `access(2)` simulation, no shell.
 //!
 //! Ownership is asked of whichever package manager is present, by
-//! absolute path — never `PATH` lookup, or a managed crate named
+//! absolute path — never PATH lookup, or a managed crate named
 //! `pacman` would be the thing asked. Any failure degrades to "owner
 //! unknown".
 //!
-//! Everything printed here came from outside and goes to a terminal:
-//! control characters are replaced before anything reaches stderr.
+//! Text produced by `describe` sanitizes external values before they
+//! cross a presentation boundary; callers choose whether that text
+//! becomes an install warning, a migration report, or a verify finding.
 
 use std::ffi::OsStr;
 use std::os::unix::fs::PermissionsExt;
@@ -193,6 +193,33 @@ pub fn describe(shadow: &Shadow, prefix_bin: &Path, owner: Option<&str>) -> Stri
         terminal_text(&shadow.bin),
         terminal_text(&shadow.existing.to_string_lossy())
     )
+}
+
+/// Live PATH-shadow descriptions for `bins` under `prefix`.
+///
+/// Reads the process PATH and current directory, runs the shared shadow
+/// scan, enriches each hit with ownership when available, and returns
+/// raw `describe` lines. Callers own their framing and severity.
+pub(crate) fn notes(prefix: &Path, bins: &[String]) -> Vec<String> {
+    if bins.is_empty() {
+        return Vec::new();
+    }
+    let Some(path_var) = std::env::var_os("PATH") else {
+        return Vec::new();
+    };
+    // The cwd only anchors relative PATH entries; unreadable means those
+    // cannot be judged, and a possibly-wrong warning is worse than none.
+    let Ok(cwd) = std::env::current_dir() else {
+        return Vec::new();
+    };
+    let prefix_bin = prefix.join("bin");
+    find_shadows(&path_var, &prefix_bin, bins, &cwd, is_executable)
+        .iter()
+        .map(|s| {
+            let owner = owner_of(&s.existing);
+            describe(s, &prefix_bin, owner.as_deref())
+        })
+        .collect()
 }
 
 #[cfg(test)]
