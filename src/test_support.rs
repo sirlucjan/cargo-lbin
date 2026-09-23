@@ -6,9 +6,8 @@ use semver::Version;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// Shared scaffolding for the migrate tests: a prefix with a
-/// manifest entry and a placed binary, as a finished install leaves
-/// them.
+/// Shared scaffolding: a prefix with a manifest entry and a placed
+/// binary, as a finished install leaves them.
 pub(crate) fn seeded_prefix(
     root: &Path,
     dir: &str,
