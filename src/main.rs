@@ -478,36 +478,6 @@ fn cache_dir() -> Result<PathBuf> {
     Ok(PathBuf::from(home).join(".cache/cargo-lbin"))
 }
 
-/// The verify-side sibling of `shadow_notes`: the same scan, but each
-/// shadow keeps its subjects as data — `bin` and the shadowing `path` —
-/// so a `--json` consumer reads fields, not `message`.
-fn shadow_findings(prefix: &Path, bins: &[String]) -> Vec<Finding> {
-    if bins.is_empty() {
-        return Vec::new();
-    }
-    let Some(path_var) = std::env::var_os("PATH") else {
-        return Vec::new();
-    };
-    let Ok(cwd) = std::env::current_dir() else {
-        return Vec::new();
-    };
-    let prefix_bin = prefix.join("bin");
-    shadow::find_shadows(&path_var, &prefix_bin, bins, &cwd, shadow::is_executable)
-        .iter()
-        .map(|s| {
-            let owner = shadow::owner_of(&s.existing);
-            Finding {
-                bin: Some(s.bin.clone()),
-                path: Some(s.existing.clone()),
-                ..Finding::plain(
-                    "path-shadow",
-                    shadow::describe(s, &prefix_bin, owner.as_deref()),
-                )
-            }
-        })
-        .collect()
-}
-
 /// Will an install into `prefix` need privileged writes? The union of
 /// bin and the state directory — either alone can be the one needing
 /// sudo. One answer for the pipeline checkpoint and (composed) the TUI

@@ -12,7 +12,7 @@ use crate::hints::reinstall_hint;
 use crate::lock::StateLock;
 use crate::manifest::{Entry, Manifest};
 use crate::validate::validate_name;
-use crate::{cache_dir, prefixes, shadow_findings, stage, text, validate};
+use crate::{cache_dir, prefixes, shadow, stage, text, validate};
 use anyhow::{Context, Result, bail};
 use semver::Version;
 use std::collections::{BTreeMap, BTreeSet};
@@ -40,7 +40,7 @@ pub(crate) struct Finding {
 }
 
 impl Finding {
-    pub(crate) fn plain(kind: &'static str, message: String) -> Self {
+    fn plain(kind: &'static str, message: String) -> Self {
         Self {
             kind,
             message,
@@ -329,6 +329,36 @@ fn disk_finding(
         }),
         Ok(_) => None,
     }
+}
+
+/// The verify-side sibling of `shadow::notes`: the same scan, but each
+/// shadow keeps its subjects as data — `bin` and the shadowing `path` —
+/// so a `--json` consumer reads fields, not `message`.
+fn shadow_findings(prefix: &Path, bins: &[String]) -> Vec<Finding> {
+    if bins.is_empty() {
+        return Vec::new();
+    }
+    let Some(path_var) = std::env::var_os("PATH") else {
+        return Vec::new();
+    };
+    let Ok(cwd) = std::env::current_dir() else {
+        return Vec::new();
+    };
+    let prefix_bin = prefix.join("bin");
+    shadow::find_shadows(&path_var, &prefix_bin, bins, &cwd, shadow::is_executable)
+        .iter()
+        .map(|s| {
+            let owner = shadow::owner_of(&s.existing);
+            Finding {
+                bin: Some(s.bin.clone()),
+                path: Some(s.existing.clone()),
+                ..Finding::plain(
+                    "path-shadow",
+                    shadow::describe(s, &prefix_bin, owner.as_deref()),
+                )
+            }
+        })
+        .collect()
 }
 
 /// The hard invariants — `Manifest::validate`'s exact set, one finding
