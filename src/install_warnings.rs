@@ -9,7 +9,7 @@ use crate::manifest::Manifest;
 use crate::{prefixes, text};
 use std::path::{Path, PathBuf};
 
-/// Pre-build warnings for an install batch about to create another
+/// Pre-build warnings for an install request about to create another
 /// cross-prefix copy: one block per foreign managed copy of a
 /// requested crate that is absent from this prefix's manifest.
 /// Absent-here on purpose — the plan's word is "before creating the
@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 /// migrate is named — as a genuinely pasteable command when both
 /// prefixes have an honest shell spelling, and not at all otherwise —
 /// for the person who meant to move, not copy. Emitted before the
-/// first build, so the whole batch can still be abandoned before any
+/// first build, so the request can still be abandoned before any
 /// minutes are invested.
 pub(crate) fn duplicate_install_warnings<'a>(
     prefix: &Path,
