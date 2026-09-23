@@ -13,7 +13,7 @@ use crate::PinPolicy;
 use crate::hints::pasteable_prefix;
 use crate::manifest::{Entry, Manifest};
 use crate::validate::validate_name;
-use crate::{install_needs_privilege, privileged, shadow_warnings, stage};
+use crate::{install_needs_privilege, privileged, shadow, stage};
 use anyhow::{Context, Result, bail};
 use semver::Version;
 use std::path::{Path, PathBuf};
@@ -664,6 +664,21 @@ pub(crate) fn install_and_commit(
     // just a later clean's.
     stage::release_and_remove_run(lease, &run_dir);
     Ok(installed)
+}
+
+/// One warning per binary that a PATH entry outside the prefix already
+/// provides, naming file, owner (if the package manager says) and PATH
+/// order. Warning, not refusal (see `shadow`); only for names new to
+/// this crate — shadowing that arises later is external drift, and
+/// re-warning on every update would be the price of catching it.
+fn shadow_warnings(prefix: &Path, bins: &[String]) -> Vec<String> {
+    // Install frontends print these raw, so the severity word travels in
+    // the string; the verify-side adapter owns its Finding framing — no
+    // "warning: warning:".
+    shadow::notes(prefix, bins)
+        .into_iter()
+        .map(|n| format!("warning: {n}"))
+        .collect()
 }
 
 /// Everything between first privileged placement and manifest commit,

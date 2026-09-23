@@ -478,21 +478,6 @@ fn cache_dir() -> Result<PathBuf> {
     Ok(PathBuf::from(home).join(".cache/cargo-lbin"))
 }
 
-/// One warning per binary that a PATH entry outside the prefix already
-/// provides, naming file, owner (if the package manager says) and PATH
-/// order. Warning, not refusal (see `shadow`); only for names new to
-/// this crate — shadowing that arises later is external drift, and
-/// re-warning on every update would be the price of catching it.
-fn shadow_warnings(prefix: &Path, bins: &[String]) -> Vec<String> {
-    // Install frontends print these raw, so the severity word travels in
-    // the string; `verify` takes the bare notes and frames its own — no
-    // "warning: warning:".
-    shadow::notes(prefix, bins)
-        .into_iter()
-        .map(|n| format!("warning: {n}"))
-        .collect()
-}
-
 /// The verify-side sibling of `shadow_notes`: the same scan, but each
 /// shadow keeps its subjects as data — `bin` and the shadowing `path` —
 /// so a `--json` consumer reads fields, not `message`.
