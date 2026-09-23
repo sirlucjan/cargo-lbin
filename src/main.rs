@@ -11,6 +11,8 @@ mod progress;
 mod report;
 mod shadow;
 mod stage;
+#[cfg(test)]
+mod test_support;
 mod text;
 #[cfg(feature = "tui")]
 mod tui;
@@ -5462,6 +5464,7 @@ fn retire_source(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::seeded_prefix;
 
     fn manifest_with(names: &[&str]) -> Manifest {
         let mut m = Manifest::default();
@@ -6728,35 +6731,6 @@ mod tests {
             !snap.still_matches(&changed),
             "the rustc provenance is protected"
         );
-    }
-
-    /// Shared scaffolding for the migrate tests: a prefix with a
-    /// manifest entry and a placed binary, as a finished install leaves
-    /// them.
-    fn seeded_prefix(root: &Path, dir: &str, name: &str, locked: bool, pinned: bool) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt;
-        let prefix = root.join(dir);
-        fs::create_dir_all(prefix.join("bin")).unwrap();
-        fs::create_dir_all(prefix.join("share/cargo-lbin")).unwrap();
-        fs::write(prefix.join("bin").join(name), "#!/bin/sh\ntrue\n").unwrap();
-        fs::set_permissions(
-            prefix.join("bin").join(name),
-            fs::Permissions::from_mode(0o755),
-        )
-        .unwrap();
-        let mut manifest = Manifest::default();
-        manifest.crates.insert(
-            name.to_owned(),
-            Entry {
-                version: "0.1.0".into(),
-                bins: vec![name.to_owned()],
-                locked,
-                pinned,
-                built_with_rustc: None,
-            },
-        );
-        manifest.store(&prefix).unwrap();
-        prefix
     }
 
     /// A fake cargo staging `name` 0.1.0, the migrate tests' build.
