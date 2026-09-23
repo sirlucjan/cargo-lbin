@@ -330,8 +330,8 @@ pub(super) fn auth_gate(
 
 /// A build the run loop still has to start, because starting one needs
 /// the terminal: the escalation preflight may have to ask for a
-/// password. `intent` says which of the three builds this is — see
-/// [`BuildIntent`] — and travels with the request to the worker.
+/// password. `intent` says which build this is — see [`BuildIntent`] —
+/// and travels with the request to the worker.
 pub(super) struct PendingBuild {
     pub(super) spec: String,
     pub(super) locked: bool,
@@ -341,10 +341,12 @@ pub(super) struct PendingBuild {
 /// What the queued build is, which decides both the worker it reaches
 /// and the word the record uses.
 ///
-/// The three differ only in where the version and the pin come from:
-/// an install takes both from the line the person typed, a downgrade
+/// They differ only in where the version and the pin come from: an
+/// install takes both from the line the person typed, a downgrade
 /// takes the version from a keypress against a premise, a reinstall
-/// takes everything from the manifest entry and changes none of it.
+/// takes everything from the manifest entry and changes none of it,
+/// and an update carries the observed version only as a premise and
+/// asks for the newest again.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub(super) enum BuildIntent {
     Install,
