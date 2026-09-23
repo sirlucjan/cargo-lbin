@@ -9,7 +9,7 @@ use crate::manifest::Manifest;
 use crate::{prefixes, text};
 use std::path::{Path, PathBuf};
 
-/// Pre-build warnings for an install batch about to create a second
+/// Pre-build warnings for an install batch about to create another
 /// cross-prefix copy: one block per foreign managed copy of a
 /// requested crate that is absent from this prefix's manifest.
 /// Absent-here on purpose — the plan's word is "before creating the
@@ -149,7 +149,7 @@ mod tests {
     use crate::test_support::manifest_with;
 
     /// The duplicate-install warning fires exactly when this install
-    /// would create the second copy: the crate is absent here and
+    /// would create another managed copy: the crate is absent here and
     /// managed over there. Both prefixes are environment-borne, so the
     /// lines are sanitized; the migrate hint is pasteable as printed.
     #[test]
