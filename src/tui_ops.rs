@@ -5,6 +5,7 @@
 
 use crate::build::{BuildCancelled, CancelOutcome};
 use crate::build::{BuildControl, Frontend, LineKind, ShadowReport, install_and_commit};
+use crate::install_warnings::duplicate_install_warnings;
 use crate::lock::{Mode, StateLock};
 use crate::manifest::Manifest;
 use crate::report::Checked;
@@ -12,8 +13,8 @@ use crate::report::Report;
 use crate::validate::InstallSpec;
 use crate::{
     MigrateFrontend, MigrateOutcome, MigrationSnapshot, PinPolicy, ReinstallPlan, cache_dir,
-    check_versions, duplicate_install_warnings, migrate_one, privileged, record_knowledge,
-    refuse_diagonal, refuse_pinned, reinstall_plan,
+    check_versions, migrate_one, privileged, record_knowledge, refuse_diagonal, refuse_pinned,
+    reinstall_plan,
 };
 use anyhow::{Context, Result, bail};
 use semver::Version;
