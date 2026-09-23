@@ -38,3 +38,20 @@ pub(crate) fn seeded_prefix(
     manifest.store(&prefix).unwrap();
     prefix
 }
+
+pub(crate) fn manifest_with(names: &[&str]) -> Manifest {
+    let mut m = Manifest::default();
+    for n in names {
+        m.crates.insert(
+            (*n).to_owned(),
+            Entry {
+                version: "1.0.0".to_owned(),
+                bins: vec![(*n).to_owned()],
+                locked: false,
+                pinned: false,
+                built_with_rustc: None,
+            },
+        );
+    }
+    m
+}

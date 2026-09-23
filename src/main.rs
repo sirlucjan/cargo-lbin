@@ -4675,25 +4675,8 @@ fn retire_source(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::seeded_prefix;
+    use crate::test_support::{manifest_with, seeded_prefix};
     use crate::verify::{clean_cache, scan_stale_stages, verify_entries};
-
-    fn manifest_with(names: &[&str]) -> Manifest {
-        let mut m = Manifest::default();
-        for n in names {
-            m.crates.insert(
-                (*n).to_owned(),
-                Entry {
-                    version: "1.0.0".to_owned(),
-                    bins: vec![(*n).to_owned()],
-                    locked: false,
-                    pinned: false,
-                    built_with_rustc: None,
-                },
-            );
-        }
-        m
-    }
 
     /// The other prefix's copy is named whether or not this prefix has
     /// one: skew is the point when both exist, and "not here, but over
