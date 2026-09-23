@@ -3927,7 +3927,9 @@ mod tests {
     use super::*;
     #[cfg(feature = "tui")]
     use crate::build::BuildPhase;
-    use crate::test_support::{manifest_with, seeded_prefix};
+    use crate::test_support::{
+        any_crate_fake, failing_fake, manifest_with, seeded_prefix, staging_fake, versioned_fake,
+    };
     use crate::verify::{clean_cache, scan_stale_stages, verify_entries};
 
     /// The other prefix's copy is named whether or not this prefix has
@@ -4596,28 +4598,6 @@ mod tests {
         );
     }
 
-    /// A fake cargo staging `name` 0.1.0, the migrate tests' build.
-    fn staging_fake(root: &Path, name: &str) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt;
-        let fake_bin = root.join("fakebin");
-        fs::create_dir_all(&fake_bin).unwrap();
-        let script = fake_bin.join("cargo");
-        fs::write(
-            &script,
-            format!(
-                "#!/bin/sh\n\
-                 mkdir -p \"$4/bin\"\n\
-                 printf '#!/bin/sh\\ntrue\\n' > \"$4/bin/{name}\"\n\
-                 chmod 755 \"$4/bin/{name}\"\n\
-                 printf '%s' '{{\"installs\":{{\"{name} 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)\":{{\"bins\":[\"{name}\"]}}}}}}' > \"$4/.crates2.json\"\n\
-                 exit 0\n"
-            ),
-        )
-        .unwrap();
-        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
-        script
-    }
-
     /// `staging_fake` plus cargo's `rustc` record: `rustc_json` is the
     /// already-JSON-encoded report string.
     fn provenance_fake(root: &Path, name: &str, rustc_json: &str) -> PathBuf {
@@ -4633,36 +4613,6 @@ mod tests {
                  printf '#!/bin/sh\\ntrue\\n' > \"$4/bin/{name}\"\n\
                  chmod 755 \"$4/bin/{name}\"\n\
                  printf '%s' '{{\"installs\":{{\"{name} 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)\":{{\"bins\":[\"{name}\"],\"rustc\":{rustc_json}}}}}}}' > \"$4/.crates2.json\"\n\
-                 exit 0\n"
-            ),
-        )
-        .unwrap();
-        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
-        script
-    }
-
-    /// A fake cargo with a registry: `--version =X` stages exactly X,
-    /// no version request stages 0.2.0 — the fake's "latest". This is
-    /// the fake for tests about *which* version a pipeline asks for;
-    /// `staging_fake` above, blind to the request, cannot tell an
-    /// exact rebuild from a latest install.
-    fn versioned_fake(root: &Path, name: &str) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt;
-        let fake_bin = root.join("fakebin");
-        fs::create_dir_all(&fake_bin).unwrap();
-        let script = fake_bin.join("cargo");
-        fs::write(
-            &script,
-            format!(
-                "#!/bin/sh\n\
-                 ver=0.2.0\n\
-                 for a in \"$@\"; do\n\
-                 case \"$a\" in =*) ver=${{a#=}};; esac\n\
-                 done\n\
-                 mkdir -p \"$4/bin\"\n\
-                 printf '#!/bin/sh\\ntrue\\n' > \"$4/bin/{name}\"\n\
-                 chmod 755 \"$4/bin/{name}\"\n\
-                 printf '%s' \"{{\\\"installs\\\":{{\\\"{name} $ver (registry+https://github.com/rust-lang/crates.io-index)\\\":{{\\\"bins\\\":[\\\"{name}\\\"]}}}}}}\" > \"$4/.crates2.json\"\n\
                  exit 0\n"
             ),
         )
@@ -5456,62 +5406,6 @@ mod tests {
             );
         }
         let _ = fs::remove_dir_all(&root);
-    }
-
-    /// A fake cargo that builds whatever crate it is asked for: `$2` is
-    /// the name, `$4` the stage root. The sweep needs it, because a
-    /// sweep by definition names more than one crate.
-    fn any_crate_fake(root: &Path) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt;
-        let fake_bin = root.join("fakebin");
-        fs::create_dir_all(&fake_bin).unwrap();
-        let script = fake_bin.join("cargo");
-        fs::write(
-            &script,
-            "#!/bin/sh\n\
-             name=$2\n\
-             ver=0.2.0\n\
-             for a in \"$@\"; do\n\
-             case \"$a\" in =*) ver=${a#=};; esac\n\
-             done\n\
-             mkdir -p \"$4/bin\"\n\
-             printf '#!/bin/sh\\ntrue\\n' > \"$4/bin/$name\"\n\
-             chmod 755 \"$4/bin/$name\"\n\
-             printf '%s' \"{\\\"installs\\\":{\\\"$name $ver (registry+https://github.com/rust-lang/crates.io-index)\\\":{\\\"bins\\\":[\\\"$name\\\"]}}}\" > \"$4/.crates2.json\"\n\
-             exit 0\n",
-        )
-        .unwrap();
-        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
-        script
-    }
-
-    /// A fake cargo that refuses one crate by name and builds every
-    /// other, for testing what a sweep does around a failure.
-    fn failing_fake(root: &Path, failing: &str) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt;
-        let fake_bin = root.join("fakebin");
-        fs::create_dir_all(&fake_bin).unwrap();
-        let script = fake_bin.join("cargo");
-        fs::write(
-            &script,
-            format!(
-                "#!/bin/sh\n\
-                 name=$2\n\
-                 [ \"$name\" = \"{failing}\" ] && {{ echo 'error: could not compile' >&2; exit 101; }}\n\
-                 ver=0.2.0\n\
-                 for a in \"$@\"; do\n\
-                 case \"$a\" in =*) ver=${{a#=}};; esac\n\
-                 done\n\
-                 mkdir -p \"$4/bin\"\n\
-                 printf '#!/bin/sh\\ntrue\\n' > \"$4/bin/$name\"\n\
-                 chmod 755 \"$4/bin/$name\"\n\
-                 printf '%s' \"{{\\\"installs\\\":{{\\\"$name $ver (registry+https://github.com/rust-lang/crates.io-index)\\\":{{\\\"bins\\\":[\\\"$name\\\"]}}}}}}\" > \"$4/.crates2.json\"\n\
-                 exit 0\n"
-            ),
-        )
-        .unwrap();
-        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
-        script
     }
 
     /// The sweep is the same operation, wider: every entry keeps its own
