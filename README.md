@@ -50,6 +50,7 @@ Distribution packaging:
 - Arch Linux (AUR): [`cargo-lbin`](https://aur.archlinux.org/packages/cargo-lbin)
 - Fedora (COPR): [`sirlucjan/scx-scheds-cargo`](https://copr.fedorainfracloud.org/coprs/sirlucjan/scx-scheds-cargo/package/cargo-lbin/)
 - openSUSE (COPR): [`sirlucjan/scx-scheds-suse`](https://copr.fedorainfracloud.org/coprs/sirlucjan/scx-scheds-suse/package/cargo-lbin/)
+- Seafoam Labs: [`cargo-lbin`](https://repo.seafoam-labs.org/package/default/x86_64/cargo-lbin/)
 
 The terminal UI is enabled by the default `tui` feature. To build only the CLI, without Ratatui/Crossterm dependencies:
 
